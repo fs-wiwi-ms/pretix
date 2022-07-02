@@ -24,10 +24,13 @@ from django.conf import settings
 from django.contrib.auth.hashers import (
     check_password, is_password_usable, make_password,
 )
+from django.core.validators import RegexValidator
 from django.db import models
+from django.db.models import F, Q
 from django.utils.crypto import get_random_string, salted_hmac
 from django.utils.translation import gettext_lazy as _, pgettext_lazy
 from django_scopes import ScopedManager, scopes_disabled
+from phonenumber_field.modelfields import PhoneNumberField
 
 from pretix.base.banlist import banned
 from pretix.base.models.base import LoggedModel
@@ -42,8 +45,20 @@ class Customer(LoggedModel):
     """
     id = models.BigAutoField(primary_key=True)
     organizer = models.ForeignKey(Organizer, related_name='customers', on_delete=models.CASCADE)
-    identifier = models.CharField(max_length=190, db_index=True, unique=True)
+    identifier = models.CharField(
+        max_length=190,
+        db_index=True,
+        help_text=_('You can enter any value here to make it easier to match the data with other sources. If you do '
+                    'not input one, we will generate one automatically.'),
+        validators=[
+            RegexValidator(
+                regex=r"^[a-zA-Z0-9]([a-zA-Z0-9.\-_]*[a-zA-Z0-9])?$",
+                message=_("The identifier may only contain letters, numbers, dots, dashes, and underscores. It must start and end with a letter or number."),
+            ),
+        ],
+    )
     email = models.EmailField(db_index=True, null=True, blank=False, verbose_name=_('E-mail'), max_length=190)
+    phone = PhoneNumberField(null=True, blank=True, verbose_name=_('Phone number'))
     password = models.CharField(verbose_name=_('Password'), max_length=128)
     name_cached = models.CharField(max_length=255, verbose_name=_('Full name'), blank=True)
     name_parts = models.JSONField(default=dict)
@@ -56,11 +71,13 @@ class Customer(LoggedModel):
                               default=settings.LANGUAGE_CODE,
                               verbose_name=_('Language'))
     last_modified = models.DateTimeField(auto_now=True)
+    external_identifier = models.CharField(max_length=255, verbose_name=_('External identifier'), null=True, blank=True)
+    notes = models.TextField(verbose_name=_('Notes'), null=True, blank=True)
 
     objects = ScopedManager(organizer='organizer')
 
     class Meta:
-        unique_together = [['organizer', 'email']]
+        unique_together = [['organizer', 'email'], ['organizer', 'identifier']]
         ordering = ('email',)
 
     def get_email_field_name(self):
@@ -86,6 +103,9 @@ class Customer(LoggedModel):
         self.name_parts = {}
         self.name_cached = ''
         self.email = None
+        self.phone = None
+        self.external_identifier = None
+        self.notes = None
         self.save()
         self.all_logentries().update(data={}, shredded=True)
         self.orders.all().update(customer=None)
@@ -168,6 +188,7 @@ class Customer(LoggedModel):
         return salted_hmac(key_salt, payload).hexdigest()
 
     def get_email_context(self):
+        from pretix.base.email import get_name_parts_localized
         ctx = {
             'name': self.name,
             'organizer': self.organizer.name,
@@ -176,12 +197,24 @@ class Customer(LoggedModel):
         for f, l, w in name_scheme['fields']:
             if f == 'full_name':
                 continue
-            ctx['name_%s' % f] = self.name_parts.get(f, '')
+            ctx['name_%s' % f] = get_name_parts_localized(self.name_parts, f)
+
+        if "concatenation_for_salutation" in name_scheme:
+            ctx['name_for_salutation'] = name_scheme["concatenation_for_salutation"](self.name_parts)
+        else:
+            ctx['name_for_salutation'] = name_scheme["concatenation"](self.name_parts)
+
         return ctx
 
     @property
     def stored_addresses(self):
         return self.invoice_addresses(manager='profiles')
+
+    def usable_memberships(self, for_event, testmode=False):
+        return self.memberships.active(for_event).with_usages().filter(
+            Q(membership_type__max_usages__isnull=True) | Q(usages__lt=F('membership_type__max_usages')),
+            testmode=testmode,
+        )
 
 
 class AttendeeProfile(models.Model):

@@ -54,6 +54,7 @@ class WaitingView(EventViewMixin, FormView):
             subevent=self.subevent
         )
         kwargs['channel'] = self.request.sales_channel.identifier
+        kwargs['customer'] = getattr(self.request, 'customer', None)
         kwargs.setdefault('initial', {})
         if 'var' in self.request.GET:
             kwargs['initial']['itemvar'] = f'{self.request.GET.get("item")}-{self.request.GET.get("var")}'
@@ -125,7 +126,7 @@ class WaitingView(EventViewMixin, FormView):
 
         form.save()
         messages.success(self.request, _("We've added you to the waiting list. You will receive "
-                                         "an email as soon as tickets get available again."))
+                                         "an email as soon as this product gets available again."))
         return super().form_valid(form)
 
     def get_success_url(self):

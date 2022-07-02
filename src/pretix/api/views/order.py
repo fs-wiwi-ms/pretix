@@ -27,7 +27,9 @@ from decimal import Decimal
 import django_filters
 import pytz
 from django.db import transaction
-from django.db.models import Exists, F, OuterRef, Prefetch, Q, Subquery
+from django.db.models import (
+    Exists, F, OuterRef, Prefetch, Q, Subquery, prefetch_related_objects,
+)
 from django.db.models.functions import Coalesce, Concat
 from django.http import FileResponse, HttpResponse
 from django.shortcuts import get_object_or_404
@@ -36,7 +38,7 @@ from django.utils.translation import gettext as _
 from django_filters.rest_framework import DjangoFilterBackend, FilterSet
 from django_scopes import scopes_disabled
 from PIL import Image
-from rest_framework import mixins, serializers, status, viewsets
+from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import (
     APIException, NotFound, PermissionDenied, ValidationError,
@@ -52,6 +54,12 @@ from pretix.api.serializers.order import (
     OrderRefundCreateSerializer, OrderRefundSerializer, OrderSerializer,
     PriceCalcSerializer, RevokedTicketSecretSerializer,
     SimulatedOrderSerializer,
+)
+from pretix.api.serializers.orderchange import (
+    OrderChangeOperationSerializer, OrderFeeChangeSerializer,
+    OrderPositionChangeSerializer,
+    OrderPositionCreateForExistingOrderSerializer,
+    OrderPositionInfoPatchSerializer,
 )
 from pretix.base.i18n import language
 from pretix.base.models import (
@@ -94,6 +102,7 @@ with scopes_disabled():
         search = django_filters.CharFilter(method='search_qs')
         item = django_filters.CharFilter(field_name='all_positions', lookup_expr='item_id')
         variation = django_filters.CharFilter(field_name='all_positions', lookup_expr='variation_id')
+        subevent = django_filters.CharFilter(field_name='all_positions', lookup_expr='subevent_id')
 
         class Meta:
             model = Order
@@ -143,7 +152,8 @@ with scopes_disabled():
             matching_positions = OrderPosition.objects.filter(
                 Q(order=OuterRef('pk')) & Q(
                     Q(attendee_name_cached__icontains=u) | Q(attendee_email__icontains=u)
-                    | Q(secret__istartswith=u) | Q(voucher__code__icontains=u)
+                    | Q(secret__istartswith=u)
+                    # | Q(voucher__code__icontains=u)  # temporarily removed since it caused bad query performance on postgres
                 )
             ).values('id')
 
@@ -194,34 +204,34 @@ class OrderViewSet(viewsets.ModelViewSet):
         if 'invoice_address' not in self.request.GET.getlist('exclude'):
             qs = qs.select_related('invoice_address')
 
-        if self.request.query_params.get('include_canceled_positions', 'false') == 'true':
+        qs = qs.prefetch_related(self._positions_prefetch(self.request))
+        return qs
+
+    def _positions_prefetch(self, request):
+        if request.query_params.get('include_canceled_positions', 'false') == 'true':
             opq = OrderPosition.all
         else:
             opq = OrderPosition.objects
-        if self.request.query_params.get('pdf_data', 'false') == 'true':
-            qs = qs.prefetch_related(
-                Prefetch(
-                    'positions',
-                    opq.all().prefetch_related(
-                        Prefetch('checkins', queryset=Checkin.objects.all()),
-                        'item', 'variation', 'answers', 'answers__options', 'answers__question',
-                        'item__category', 'addon_to', 'seat',
-                        Prefetch('addons', opq.select_related('item', 'variation', 'seat'))
-                    )
+        if request.query_params.get('pdf_data', 'false') == 'true':
+            return Prefetch(
+                'positions',
+                opq.all().prefetch_related(
+                    Prefetch('checkins', queryset=Checkin.objects.all()),
+                    'item', 'variation', 'answers', 'answers__options', 'answers__question',
+                    'item__category', 'addon_to', 'seat',
+                    Prefetch('addons', opq.select_related('item', 'variation', 'seat'))
                 )
             )
         else:
-            qs = qs.prefetch_related(
-                Prefetch(
-                    'positions',
-                    opq.all().prefetch_related(
-                        Prefetch('checkins', queryset=Checkin.objects.all()),
-                        'item', 'variation', 'answers', 'answers__options', 'answers__question', 'seat',
-                    )
+            return Prefetch(
+                'positions',
+                opq.all().prefetch_related(
+                    Prefetch('checkins', queryset=Checkin.objects.all()),
+                    'item', 'variation',
+                    Prefetch('answers', queryset=QuestionAnswer.objects.prefetch_related('options', 'question').order_by('question__position')),
+                    'seat',
                 )
             )
-
-        return qs
 
     def _get_output_provider(self, identifier):
         responses = register_ticket_outputs.send(self.request.event)
@@ -251,8 +261,11 @@ class OrderViewSet(viewsets.ModelViewSet):
         provider = self._get_output_provider(output)
         order = self.get_object()
 
-        if order.status != Order.STATUS_PAID:
-            raise PermissionDenied("Downloads are not available for unpaid orders.")
+        if order.status in (Order.STATUS_CANCELED, Order.STATUS_EXPIRED):
+            raise PermissionDenied("Downloads are not available for canceled or expired orders.")
+
+        if order.status == Order.STATUS_PENDING and not request.event.settings.ticket_download_pending:
+            raise PermissionDenied("Downloads are not available for pending orders.")
 
         ct = CachedCombinedTicket.objects.filter(
             order=order, provider=provider.identifier, file__isnull=False
@@ -335,6 +348,7 @@ class OrderViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['POST'])
     def mark_canceled(self, request, **kwargs):
         send_mail = request.data.get('send_email', True)
+        comment = request.data.get('comment', None)
         cancellation_fee = request.data.get('cancellation_fee', None)
         if cancellation_fee:
             try:
@@ -357,6 +371,7 @@ class OrderViewSet(viewsets.ModelViewSet):
                 device=request.auth if isinstance(request.auth, Device) else None,
                 oauth_application=request.auth.application if isinstance(request.auth, OAuthAccessToken) else None,
                 send_mail=send_mail,
+                email_comment=comment,
                 cancellation_fee=cancellation_fee
             )
         except OrderError as e:
@@ -604,6 +619,7 @@ class OrderViewSet(viewsets.ModelViewSet):
                 serializer = SimulatedOrderSerializer(order, context=serializer.context)
                 return Response(serializer.data, status=status.HTTP_201_CREATED)
             else:
+                prefetch_related_objects([order], self._positions_prefetch(request))
                 serializer = OrderSerializer(order, context=serializer.context)
 
             order.log_action(
@@ -641,9 +657,13 @@ class OrderViewSet(viewsets.ModelViewSet):
             if send_mail:
                 free_flow = (
                     payment and order.total == Decimal('0.00') and order.status == Order.STATUS_PAID and
-                    not order.require_approval and payment.provider == "free"
+                    not order.require_approval and payment.provider in ("free", "boxoffice")
                 )
-                if free_flow:
+                if order.require_approval:
+                    email_template = request.event.settings.mail_text_order_placed_require_approval
+                    log_entry = 'pretix.event.order.email.order_placed_require_approval'
+                    email_attendees = False
+                elif free_flow:
                     email_template = request.event.settings.mail_text_order_free
                     log_entry = 'pretix.event.order.email.order_free'
                     email_attendees = request.event.settings.mail_send_order_free_attendee
@@ -656,12 +676,13 @@ class OrderViewSet(viewsets.ModelViewSet):
 
                 _order_placed_email(
                     request.event, order, payment.payment_provider if payment else None, email_template,
-                    log_entry, invoice, payment
+                    log_entry, invoice, payment, is_free=free_flow
                 )
                 if email_attendees:
                     for p in order.positions.all():
                         if p.addon_to_id is None and p.attendee_email and p.attendee_email != order.email:
-                            _order_placed_email_attendee(request.event, order, p, email_attendees_template, log_entry)
+                            _order_placed_email_attendee(request.event, order, p, email_attendees_template, log_entry,
+                                                         is_free=free_flow)
 
                 if not free_flow and order.status == Order.STATUS_PAID and payment:
                     payment._send_paid_mail(invoice, None, '')
@@ -774,6 +795,79 @@ class OrderViewSet(viewsets.ModelViewSet):
         with transaction.atomic():
             self.get_object().gracefully_delete(user=self.request.user if self.request.user.is_authenticated else None, auth=self.request.auth)
 
+    @action(detail=True, methods=['POST'])
+    def change(self, request, **kwargs):
+        order = self.get_object()
+
+        serializer = OrderChangeOperationSerializer(
+            context={'order': order, **self.get_serializer_context()},
+            data=request.data,
+        )
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            ocm = OrderChangeManager(
+                order=order,
+                user=self.request.user if self.request.user.is_authenticated else None,
+                auth=request.auth,
+                notify=serializer.validated_data.get('send_email', False),
+                reissue_invoice=serializer.validated_data.get('reissue_invoice', True),
+            )
+
+            canceled_positions = set()
+            for r in serializer.validated_data.get('cancel_positions', []):
+                ocm.cancel(r['position'])
+                canceled_positions.add(r['position'])
+
+            for r in serializer.validated_data.get('patch_positions', []):
+                if r['position'] in canceled_positions:
+                    continue
+                pos_serializer = OrderPositionChangeSerializer(
+                    context={'ocm': ocm, 'commit': False, 'event': request.event, **self.get_serializer_context()},
+                    partial=True,
+                )
+                pos_serializer.update(r['position'], r['body'])
+
+            for r in serializer.validated_data.get('split_positions', []):
+                if r['position'] in canceled_positions:
+                    continue
+                ocm.split(r['position'])
+
+            for r in serializer.validated_data.get('create_positions', []):
+                pos_serializer = OrderPositionCreateForExistingOrderSerializer(
+                    context={'ocm': ocm, 'commit': False, 'event': request.event, **self.get_serializer_context()},
+                )
+                pos_serializer.create(r)
+
+            canceled_fees = set()
+            for r in serializer.validated_data.get('cancel_fees', []):
+                ocm.cancel_fee(r['fee'])
+                canceled_fees.add(r['fee'])
+
+            for r in serializer.validated_data.get('patch_fees', []):
+                if r['fee'] in canceled_fees:
+                    continue
+                pos_serializer = OrderFeeChangeSerializer(
+                    context={'ocm': ocm, 'commit': False, 'event': request.event, **self.get_serializer_context()},
+                )
+                pos_serializer.update(r['fee'], r['body'])
+
+            if serializer.validated_data.get('recalculate_taxes') == 'keep_net':
+                ocm.recalculate_taxes(keep='net')
+            elif serializer.validated_data.get('recalculate_taxes') == 'keep_gross':
+                ocm.recalculate_taxes(keep='gross')
+
+            ocm.commit()
+        except OrderError as e:
+            raise ValidationError(str(e))
+
+        order.refresh_from_db()
+        serializer = OrderSerializer(
+            instance=order,
+            context=self.get_serializer_context(),
+        )
+        return Response(serializer.data)
+
 
 with scopes_disabled():
     class OrderPositionFilter(FilterSet):
@@ -815,7 +909,7 @@ with scopes_disabled():
             }
 
 
-class OrderPositionViewSet(mixins.DestroyModelMixin, mixins.UpdateModelMixin, viewsets.ReadOnlyModelViewSet):
+class OrderPositionViewSet(viewsets.ModelViewSet):
     serializer_class = OrderPositionSerializer
     queryset = OrderPosition.all.none()
     filter_backends = (DjangoFilterBackend, OrderingFilter)
@@ -1029,8 +1123,11 @@ class OrderPositionViewSet(mixins.DestroyModelMixin, mixins.UpdateModelMixin, vi
         provider = self._get_output_provider(output)
         pos = self.get_object()
 
-        if pos.order.status != Order.STATUS_PAID:
-            raise PermissionDenied("Downloads are not available for unpaid orders.")
+        if pos.order.status in (Order.STATUS_CANCELED, Order.STATUS_EXPIRED):
+            raise PermissionDenied("Downloads are not available for canceled or expired orders.")
+
+        if pos.order.status == Order.STATUS_PENDING and not request.event.settings.ticket_download_pending:
+            raise PermissionDenied("Downloads are not available for pending orders.")
         if not pos.generate_ticket:
             raise PermissionDenied("Downloads are not enabled for this product.")
 
@@ -1052,6 +1149,25 @@ class OrderPositionViewSet(mixins.DestroyModelMixin, mixins.UpdateModelMixin, vi
                 )
                 return resp
 
+    @action(detail=True, methods=['POST'])
+    def regenerate_secrets(self, request, **kwargs):
+        instance = self.get_object()
+        try:
+            ocm = OrderChangeManager(
+                instance.order,
+                user=self.request.user if self.request.user.is_authenticated else None,
+                auth=self.request.auth,
+                notify=False,
+                reissue_invoice=False,
+            )
+            ocm.regenerate_secret(instance)
+            ocm.commit()
+        except OrderError as e:
+            raise ValidationError(str(e))
+        except Quota.QuotaExceededException as e:
+            raise ValidationError(str(e))
+        return self.retrieve(request, [], **kwargs)
+
     def perform_destroy(self, instance):
         try:
             ocm = OrderChangeManager(
@@ -1067,18 +1183,33 @@ class OrderPositionViewSet(mixins.DestroyModelMixin, mixins.UpdateModelMixin, vi
         except Quota.QuotaExceededException as e:
             raise ValidationError(str(e))
 
-    def update(self, request, *args, **kwargs):
-        partial = kwargs.get('partial', False)
-        if not partial:
-            return Response(
-                {"detail": "Method \"PUT\" not allowed."},
-                status=status.HTTP_405_METHOD_NOT_ALLOWED,
-            )
-        return super().update(request, *args, **kwargs)
-
-    def perform_update(self, serializer):
+    def create(self, request, *args, **kwargs):
         with transaction.atomic():
-            old_data = self.get_serializer_class()(instance=serializer.instance, context=self.get_serializer_context()).data
+            serializer = OrderPositionCreateForExistingOrderSerializer(
+                data=request.data,
+                context=self.get_serializer_context(),
+            )
+            serializer.is_valid(raise_exception=True)
+            order = serializer.validated_data['order']
+            ocm = OrderChangeManager(
+                order=order,
+                user=self.request.user if self.request.user.is_authenticated else None,
+                auth=request.auth,
+                notify=False,
+                reissue_invoice=False,
+            )
+            serializer.context['ocm'] = ocm
+            serializer.save()
+
+            # Fields that can be easily patched after the position was added
+            old_data = OrderPositionInfoPatchSerializer(instance=serializer.instance, context=self.get_serializer_context()).data
+            serializer = OrderPositionInfoPatchSerializer(
+                instance=serializer.instance,
+                context=self.get_serializer_context(),
+                partial=True,
+                data=request.data
+            )
+            serializer.is_valid(raise_exception=True)
             serializer.save()
             new_data = serializer.data
 
@@ -1101,9 +1232,77 @@ class OrderPositionViewSet(mixins.DestroyModelMixin, mixins.UpdateModelMixin, vi
                         ]
                     }
                 )
+                tickets.invalidate_cache.apply_async(
+                    kwargs={'event': serializer.instance.order.event.pk, 'order': serializer.instance.order.pk})
+                order_modified.send(sender=serializer.instance.order.event, order=serializer.instance.order)
+        return Response(
+            OrderPositionSerializer(serializer.instance, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
 
-        tickets.invalidate_cache.apply_async(kwargs={'event': serializer.instance.order.event.pk, 'order': serializer.instance.order.pk})
-        order_modified.send(sender=serializer.instance.order.event, order=serializer.instance.order)
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.get('partial', False)
+        if not partial:
+            return Response(
+                {"detail": "Method \"PUT\" not allowed."},
+                status=status.HTTP_405_METHOD_NOT_ALLOWED,
+            )
+
+        with transaction.atomic():
+            instance = self.get_object()
+            ocm = OrderChangeManager(
+                order=instance.order,
+                user=self.request.user if self.request.user.is_authenticated else None,
+                auth=request.auth,
+                notify=False,
+                reissue_invoice=False,
+            )
+
+            # Field that need to go through OrderChangeManager
+            serializer = OrderPositionChangeSerializer(
+                instance=instance,
+                context={'ocm': ocm, **self.get_serializer_context()},
+                partial=True,
+                data=request.data
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+
+            # Fields that can be easily patched
+            old_data = OrderPositionInfoPatchSerializer(instance=instance, context=self.get_serializer_context()).data
+            serializer = OrderPositionInfoPatchSerializer(
+                instance=instance,
+                context=self.get_serializer_context(),
+                partial=True,
+                data=request.data
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            new_data = serializer.data
+
+            if old_data != new_data:
+                log_data = self.request.data
+                if 'answers' in log_data:
+                    for a in new_data['answers']:
+                        log_data[f'question_{a["question"]}'] = a["answer"]
+                    log_data.pop('answers', None)
+                serializer.instance.order.log_action(
+                    'pretix.event.order.modified',
+                    user=self.request.user,
+                    auth=self.request.auth,
+                    data={
+                        'data': [
+                            dict(
+                                position=serializer.instance.pk,
+                                **log_data
+                            )
+                        ]
+                    }
+                )
+                tickets.invalidate_cache.apply_async(kwargs={'event': serializer.instance.order.event.pk, 'order': serializer.instance.order.pk})
+                order_modified.send(sender=serializer.instance.order.event, order=serializer.instance.order)
+
+        return Response(self.get_serializer_class()(instance=serializer.instance, context=self.get_serializer_context()).data)
 
 
 class PaymentViewSet(CreateModelMixin, viewsets.ReadOnlyModelViewSet):

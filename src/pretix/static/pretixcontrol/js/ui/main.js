@@ -14,6 +14,43 @@ function ngettext(singular, plural, count) {
     return plural;
 }
 
+function formatPrice(price, currency, locale) {
+    if (!window.Intl || !Intl.NumberFormat) return price;
+    var priceToFormat = price
+    if (currency === undefined) {
+        currency = $("[data-currency]").data("currency")
+    }
+    if (locale === undefined) {
+        locale = $("[data-locale]").data("locale") || $("[data-pretixlocale]").data("pretixlocale");
+    }
+
+    var opt = currency ? {style: "currency", currency: currency} : null;
+    var nf = new Intl.NumberFormat(locale, opt)
+
+    if (isNaN(priceToFormat) && priceToFormat.replaceAll) {
+        // price is not a number, try to reformat based on locale/currency-format
+        var replacements = {
+            group: "",
+            decimal: "."
+        }
+        // format a dummy number to get parts of formatting and
+        // replace group and decimal according to replacements
+        // to hopefully get a parsable number
+        nf.formatToParts(1234.567).forEach(function(part) {
+            if (replacements.hasOwnProperty(part.type)) {
+                priceToFormat = priceToFormat.replaceAll(part.value, replacements[part.type])
+            }
+        });
+        if (isNaN(priceToFormat)) return price
+    }
+
+    try {
+        return nf.format(priceToFormat)
+    } catch (error) {
+        return price
+    }
+}
+
 var waitingDialog = {
     show: function (message) {
         "use strict";
@@ -113,8 +150,8 @@ var form_handlers = function (el) {
                 date: 'fa fa-calendar',
                 up: 'fa fa-chevron-up',
                 down: 'fa fa-chevron-down',
-                previous: 'fa fa-chevron-left',
-                next: 'fa fa-chevron-right',
+                previous: $("html").hasClass("rtl") ? 'fa fa-chevron-right' : 'fa fa-chevron-left',
+                next: $("html").hasClass("rtl") ? 'fa fa-chevron-left' : 'fa fa-chevron-right',
                 today: 'fa fa-screenshot',
                 clear: 'fa fa-trash',
                 close: 'fa fa-remove'
@@ -136,8 +173,8 @@ var form_handlers = function (el) {
                 date: 'fa fa-calendar',
                 up: 'fa fa-chevron-up',
                 down: 'fa fa-chevron-down',
-                previous: 'fa fa-chevron-left',
-                next: 'fa fa-chevron-right',
+                previous: $("html").hasClass("rtl") ? 'fa fa-chevron-right' : 'fa fa-chevron-left',
+                next: $("html").hasClass("rtl") ? 'fa fa-chevron-left' : 'fa fa-chevron-right',
                 today: 'fa fa-screenshot',
                 clear: 'fa fa-trash',
                 close: 'fa fa-remove'
@@ -180,8 +217,8 @@ var form_handlers = function (el) {
                 date: 'fa fa-calendar',
                 up: 'fa fa-chevron-up',
                 down: 'fa fa-chevron-down',
-                previous: 'fa fa-chevron-left',
-                next: 'fa fa-chevron-right',
+                previous: $("html").hasClass("rtl") ? 'fa fa-chevron-right' : 'fa fa-chevron-left',
+                next: $("html").hasClass("rtl") ? 'fa fa-chevron-left' : 'fa fa-chevron-right',
                 today: 'fa fa-screenshot',
                 clear: 'fa fa-trash',
                 close: 'fa fa-remove'
@@ -318,7 +355,7 @@ var form_handlers = function (el) {
         var dependent = $(this),
             dependency = $($(this).attr("data-display-dependency")),
             update = function (ev) {
-                var enabled = dependency.toArray().some(function(d) {return (d.type === 'checkbox' || d.type === 'radio') ? d.checked : !!d.value;});
+                var enabled = dependency.toArray().some(function(d) {return (d.type === 'checkbox' || d.type === 'radio') ? d.checked : (!!d.value && !d.value.match(/^0\.?0*$/g))});
                 if (dependent.is("[data-inverse]")) {
                     enabled = !enabled;
                 }
@@ -355,14 +392,14 @@ var form_handlers = function (el) {
         dependency.closest('.form-group').find('input[name=' + dependency.attr("name") + ']').on("dp.change", update);
     });
 
-    $("input[name$=vat_id][data-countries-in-eu]").each(function () {
+    $("input[name$=vat_id][data-countries-with-vat-id]").each(function () {
         var dependent = $(this),
             dependency_country = $(this).closest(".panel-body, form").find('select[name$=country]'),
             dependency_id_is_business_1 = $(this).closest(".panel-body, form").find('input[id$=id_is_business_1]'),
             update = function (ev) {
                 if (dependency_id_is_business_1.length && !dependency_id_is_business_1.prop("checked")) {
                     dependent.closest(".form-group").hide();
-                } else if (dependent.attr('data-countries-in-eu').split(',').includes(dependency_country.val())) {
+                } else if (dependent.attr('data-countries-with-vat-id').split(',').includes(dependency_country.val())) {
                     dependent.closest(".form-group").show();
                 } else {
                     dependent.closest(".form-group").hide();
@@ -675,7 +712,21 @@ $(function () {
 
     $('[data-toggle="tooltip"]').tooltip();
     $('[data-toggle="tooltip_html"]').tooltip({
-        'html': true
+        'html': true,
+        'whiteList': {
+            // Global attributes allowed on any supplied element below.
+            '*': ['class', 'dir', 'id', 'lang', 'role'],
+            b: [],
+            br: [],
+            code: [],
+            div: [],  // required for template
+            h3: ['class', 'role'],  // required for template
+            i: [],
+            small: [],
+            span: [],
+            strong: [],
+            u: [],
+        }
     });
 
     var url = document.location.toString();
@@ -714,6 +765,7 @@ $(function () {
 
     $(".propagated-settings-box button[data-action=unlink]").click(function (ev) {
         var $box = $(this).closest(".propagated-settings-box");
+        $box.find("input[name=decouple]").val($(this).val());
         $box.find("[data-propagated-locked]").prop("readonly", false);
         $box.removeClass("locked").addClass("unlocked");
         ev.preventDefault();
@@ -866,7 +918,7 @@ $(function () {
                 height: 196
             }
         );
-        $div.append($(this).attr("data-qrcode").slice(0, 10) + "…<br>");
+        $div.append($("<div>").text($(this).attr("data-qrcode").slice(0, 10)).get(0).innerHTML + "…<br>");
         $div.append(gettext("Click to close"));
         $div.slideDown(200);
         $div.click(function (e) {

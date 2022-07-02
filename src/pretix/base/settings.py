@@ -48,10 +48,12 @@ from django.core.validators import (
     MaxValueValidator, MinValueValidator, RegexValidator,
 )
 from django.db.models import Model
+from django.utils.functional import lazy
 from django.utils.text import format_lazy
 from django.utils.translation import (
-    gettext_lazy as _, gettext_noop, pgettext, pgettext_lazy,
+    gettext, gettext_lazy as _, gettext_noop, pgettext, pgettext_lazy,
 )
+from django_countries.fields import Country
 from hierarkey.models import GlobalSettingsBase, Hierarkey
 from i18nfield.forms import I18nFormField, I18nTextarea, I18nTextInput
 from i18nfield.strings import LazyI18nString
@@ -61,7 +63,7 @@ from pretix.api.serializers.fields import (
     ListMultipleChoiceField, UploadedFileField,
 )
 from pretix.api.serializers.i18n import I18nField
-from pretix.base.models.tax import TaxRule
+from pretix.base.models.tax import VAT_ID_COUNTRIES, TaxRule
 from pretix.base.reldate import (
     RelativeDateField, RelativeDateTimeField, RelativeDateWrapper,
     SerializerRelativeDateField, SerializerRelativeDateTimeField,
@@ -84,11 +86,29 @@ def primary_font_kwargs():
     from pretix.presale.style import get_fonts
 
     choices = [('Open Sans', 'Open Sans')]
-    choices += [
-        (a, {"title": a, "data": v}) for a, v in get_fonts().items()
-    ]
+    choices += sorted([
+        (a, {"title": a, "data": v}) for a, v in get_fonts().items() if not v.get('pdf_only', False)
+    ], key=lambda a: a[0])
     return {
         'choices': choices,
+    }
+
+
+def restricted_plugin_kwargs():
+    from pretix.base.plugins import get_all_plugins
+
+    plugins_available = [
+        (p.module, p.name) for p in get_all_plugins(None)
+        if (
+            not p.name.startswith('.') and
+            getattr(p, 'restricted', False) and
+            not hasattr(p, 'is_available')  # this means you should not really use restricted and is_available
+        )
+    ]
+    return {
+        'widget': forms.CheckboxSelectMultiple,
+        'label': _("Allow usage of restricted plugins"),
+        'choices': plugins_available,
     }
 
 
@@ -107,6 +127,13 @@ class LazyI18nStringList(UserList):
 
 
 DEFAULTS = {
+    'allowed_restricted_plugins': {
+        'default': [],
+        'type': list,
+        'form_class': forms.MultipleChoiceField,
+        'serializer_class': serializers.MultipleChoiceField,
+        'form_kwargs': lambda: restricted_plugin_kwargs(),
+    },
     'customer_accounts': {
         'default': 'False',
         'type': bool,
@@ -134,11 +161,15 @@ DEFAULTS = {
         'type': int,
         'form_class': forms.IntegerField,
         'serializer_class': serializers.IntegerField,
+        'serializer_kwargs': dict(
+            min_value=1,
+        ),
         'form_kwargs': dict(
             min_value=1,
+            required=True,
             label=_("Maximum number of items per order"),
             help_text=_("Add-on products will not be counted.")
-        )
+        ),
     },
     'display_net_prices': {
         'default': 'False',
@@ -308,6 +339,17 @@ DEFAULTS = {
             label=_("Show attendee names on invoices"),
         )
     },
+    'invoice_event_location': {
+        'default': 'False',
+        'type': bool,
+        'form_class': forms.BooleanField,
+        'serializer_class': serializers.BooleanField,
+        'form_kwargs': dict(
+            label=_("Show event location on invoices"),
+            help_text=_("The event location will be shown below the list of products if it is the same for all "
+                        "lines. It will be shown on every line if there are different locations.")
+        )
+    },
     'invoice_eu_currencies': {
         'default': 'True',
         'type': bool,
@@ -355,11 +397,12 @@ DEFAULTS = {
         'form_class': I18nFormField,
         'serializer_class': I18nField,
         'form_kwargs': dict(
-            label=_("Custom address field"),
+            label=_("Custom recipient field"),
             widget=I18nTextInput,
             help_text=_("If you want to add a custom text field, e.g. for a country-specific registration number, to "
                         "your invoice address form, please fill in the label here. This label will both be used for "
-                        "asking the user to input their details as well as for displaying the value on the invoice. "
+                        "asking the user to input their details as well as for displaying the value on the invoice. It will "
+                        "be shown on the invoice below the headline. "
                         "The field will not be required.")
         )
     },
@@ -370,7 +413,11 @@ DEFAULTS = {
         'serializer_class': serializers.BooleanField,
         'form_kwargs': dict(
             label=_("Ask for VAT ID"),
-            help_text=_("Does only work if an invoice address is asked for. VAT ID is not required."),
+            help_text=format_lazy(
+                _("Only works if an invoice address is asked for. VAT ID is never required and only requested from "
+                  "business customers in the following countries: {countries}"),
+                countries=lazy(lambda *args: ', '.join(sorted(gettext(Country(cc).name) for cc in VAT_ID_COUNTRIES)), str)()
+            ),
             widget=forms.CheckboxInput(attrs={'data-checkbox-dependency': '#id_invoice_address_asked'}),
         )
     },
@@ -409,7 +456,7 @@ DEFAULTS = {
         )
     },
     'invoice_include_expire_date': {
-        'default': 'False',
+        'default': 'False',  # default for new events is True
         'type': bool,
         'form_class': forms.BooleanField,
         'serializer_class': serializers.BooleanField,
@@ -423,9 +470,11 @@ DEFAULTS = {
         'type': int,
         'form_class': forms.IntegerField,
         'serializer_class': serializers.IntegerField,
+        'serializer_kwargs': dict(),
         'form_kwargs': dict(
             label=_("Minimum length of invoice number after prefix"),
             help_text=_("The part of your invoice number after your prefix will be filled up with leading zeros up to this length, e.g. INV-001 or INV-00001."),
+            required=True,
         )
     },
     'invoice_numbers_consecutive': {
@@ -465,7 +514,7 @@ DEFAULTS = {
         )
     },
     'invoice_renderer': {
-        'default': 'classic',
+        'default': 'classic',  # default for new events is 'modern1'
         'type': str,
     },
     'ticket_secret_generator': {
@@ -489,6 +538,7 @@ DEFAULTS = {
                 MinValueValidator(12),
                 MaxValueValidator(64),
             ],
+            required=True,
             widget=forms.NumberInput(
                 attrs={
                     'min': '12',
@@ -503,9 +553,15 @@ DEFAULTS = {
         'type': int,
         'form_class': forms.IntegerField,
         'serializer_class': serializers.IntegerField,
+        'serializer_kwargs': dict(
+            min_value=0,
+            max_value=60 * 24 * 7,
+        ),
         'form_kwargs': dict(
             min_value=0,
+            max_value=60 * 24 * 7,
             label=_("Reservation period"),
+            required=True,
             help_text=_("The number of minutes the items in a user's cart are reserved for this user."),
         )
     },
@@ -560,6 +616,7 @@ DEFAULTS = {
         'form_kwargs': dict(
             label=_("Set payment term"),
             widget=forms.RadioSelect,
+            required=True,
             choices=(
                 ('days', _("in days")),
                 ('minutes', _("in minutes"))
@@ -891,7 +948,7 @@ DEFAULTS = {
         'type': str
     },
     'invoice_email_attachment': {
-        'default': 'False',
+        'default': 'False',  # default for new events is True
         'type': bool,
         'form_class': forms.BooleanField,
         'serializer_class': serializers.BooleanField,
@@ -1074,9 +1131,13 @@ DEFAULTS = {
         'type': int,
         'serializer_class': serializers.IntegerField,
         'form_class': forms.IntegerField,
+        'serializer_kwargs': dict(
+            min_value=1,
+        ),
         'form_kwargs': dict(
             label=_("Waiting list response time"),
             min_value=1,
+            required=True,
             help_text=_("If a ticket voucher is sent to a person on the waiting list, it has to be redeemed within this "
                         "number of hours until it expires and can be re-assigned to the next person on the list."),
             widget=forms.NumberInput(),
@@ -1136,7 +1197,20 @@ DEFAULTS = {
             help_text=_("If you ask for a phone number, explain why you do so and what you will use the phone number for.")
         )
     },
-
+    'show_checkin_number_user': {
+        'default': 'False',
+        'type': bool,
+        'serializer_class': serializers.BooleanField,
+        'form_class': forms.BooleanField,
+        'form_kwargs': dict(
+            label=_("Show number of check-ins to customer"),
+            help_text=_('With this option enabled, your customers will be able how many times they entered '
+                        'the event. This is usually not necessary, but might be useful in combination with tickets '
+                        'that are usable a specific number of times, so customers can see how many times they have '
+                        'already been used. Exits or failed scans will not be counted, and the user will not see '
+                        'the different check-in lists.'),
+        )
+    },
     'ticket_download': {
         'default': 'False',
         'type': bool,
@@ -1224,7 +1298,7 @@ DEFAULTS = {
         )
     },
     'event_list_type': {
-        'default': 'list',
+        'default': 'list',  # default for new events is 'calendar'
         'type': str,
         'form_class': forms.ChoiceField,
         'serializer_class': serializers.ChoiceField,
@@ -1282,6 +1356,15 @@ DEFAULTS = {
         'serializer_class': serializers.BooleanField,
         'form_kwargs': dict(
             label=_("Customers can change the variation of the products they purchased"),
+        )
+    },
+    'change_allow_user_addons': {
+        'default': 'False',
+        'type': bool,
+        'form_class': forms.BooleanField,
+        'serializer_class': serializers.BooleanField,
+        'form_kwargs': dict(
+            label=_("Customers can change their selected add-on products"),
         )
     },
     'change_allow_user_price': {
@@ -1486,6 +1569,17 @@ DEFAULTS = {
         ),
         'serializer_class': serializers.URLField,
     },
+    'privacy_url': {
+        'default': None,
+        'type': str,
+        'form_class': forms.URLField,
+        'form_kwargs': dict(
+            label=_("Privacy Policy URL"),
+            help_text=_("This should point e.g. to a part of your website that explains how you use data gathered in "
+                        "your ticket shop."),
+        ),
+        'serializer_class': serializers.URLField,
+    },
     'confirm_texts': {
         'default': LazyI18nStringList(),
         'type': LazyI18nStringList,
@@ -1519,6 +1613,32 @@ DEFAULTS = {
             help_text=_("If enabled, we will attach an .ics calendar file to order confirmation emails."),
         )
     },
+    'mail_attach_ical_paid_only': {
+        'default': 'False',
+        'type': bool,
+        'form_class': forms.BooleanField,
+        'serializer_class': serializers.BooleanField,
+        'form_kwargs': dict(
+            label=_("Attach calendar files only after order has been paid"),
+            help_text=_("Use this if you e.g. put a private access link into the calendar file to make sure people only "
+                        "receive it after their payment was confirmed."),
+        )
+    },
+    'mail_attach_ical_description': {
+        'default': '',
+        'type': LazyI18nString,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(
+            label=_("Event description"),
+            widget=I18nTextarea,
+            help_text=_(
+                "You can use this to share information with your attendees, such as travel information or the link to a digital event. "
+                "If you keep it empty, we will put a link to the event shop, the admission time, and your organizer name in there. "
+                "We do not allow using placeholders with sensitive person-specific data as calendar entries are often shared with an "
+                "unspecified number of people."
+            ),
+        )
+    },
     'mail_prefix': {
         'default': None,
         'type': str,
@@ -1535,7 +1655,7 @@ DEFAULTS = {
         'type': str
     },
     'mail_from': {
-        'default': settings.MAIL_FROM,
+        'default': settings.MAIL_FROM_ORGANIZERS,
         'type': str,
         'form_class': forms.EmailField,
         'serializer_class': serializers.EmailField,
@@ -1650,6 +1770,30 @@ You can change your order details and view the status of your order at
 Best regards,
 Your {event} team"""))
     },
+    'mail_attachment_new_order': {
+        'default': None,
+        'type': File,
+        'form_class': ExtFileField,
+        'form_kwargs': dict(
+            label=_('Attachment for new orders'),
+            ext_whitelist=(".pdf",),
+            max_size=settings.FILE_UPLOAD_MAX_SIZE_EMAIL_AUTO_ATTACHMENT,
+            help_text=_('This file will be attached to the first email that we send for every new order. Therefore it will be '
+                        'combined with the "Placed order", "Free order", or "Received order" texts from above. It will be sent '
+                        'to both order contacts and attendees. You can use this e.g. to send your terms of service. Do not use '
+                        'it to send non-public information as this file might be sent before payment is confirmed or the order '
+                        'is approved. To avoid this vital email going to spam, you can only upload PDF files of up to {size} MB.').format(
+                size=settings.FILE_UPLOAD_MAX_SIZE_EMAIL_AUTO_ATTACHMENT // (1024 * 1024),
+            )
+        ),
+        'serializer_class': UploadedFileField,
+        'serializer_kwargs': dict(
+            allowed_types=[
+                'application/pdf'
+            ],
+            max_size=settings.FILE_UPLOAD_MAX_SIZE_EMAIL_AUTO_ATTACHMENT,
+        )
+    },
     'mail_send_order_placed_attendee': {
         'type': bool,
         'default': 'False'
@@ -1709,6 +1853,17 @@ Best regards,
 Your {event} team"""))
     },
     'mail_days_order_expire_warning': {
+        'form_class': forms.IntegerField,
+        'serializer_class': serializers.IntegerField,
+        'serializer_kwargs': dict(
+            min_value=0,
+        ),
+        'form_kwargs': dict(
+            label=_("Number of days"),
+            min_value=0,
+            help_text=_("This email will be sent out this many days before the order expires. If the "
+                        "value is 0, the mail will never be sent.")
+        ),
         'type': int,
         'default': '3'
     },
@@ -1760,6 +1915,8 @@ Your {event} team"""))
         'default': LazyI18nString.from_gettext(gettext_noop("""Hello,
 
 your order {code} for {event} has been canceled.
+
+{comment}
 
 You can view the details of your order at
 {url}
@@ -1957,7 +2114,7 @@ Your {organizer} team"""))
         ),
     },
     'theme_color_success': {
-        'default': '#50A167',
+        'default': '#50a167',
         'type': str,
         'form_class': forms.CharField,
         'serializer_class': serializers.CharField,
@@ -1979,7 +2136,7 @@ Your {organizer} team"""))
         ),
     },
     'theme_color_danger': {
-        'default': '#C44F4F',
+        'default': '#c44f4f',
         'type': str,
         'form_class': forms.CharField,
         'serializer_class': serializers.CharField,
@@ -2001,7 +2158,7 @@ Your {organizer} team"""))
         ),
     },
     'theme_color_background': {
-        'default': '#FFFFFF',
+        'default': '#f5f5f5',
         'type': str,
         'form_class': forms.CharField,
         'serializer_class': serializers.CharField,
@@ -2427,7 +2584,7 @@ Your {organizer} team"""))
         )
     },
     'name_scheme': {
-        'default': 'full',
+        'default': 'full',  # default for new events is 'given_family'
         'type': str
     },
     'giftcard_length': {
@@ -2450,6 +2607,77 @@ Your {organizer} team"""))
             label=_('Validity of gift card codes in years'),
             help_text=_('If you set a number here, gift cards will by default expire at the end of the year after this '
                         'many years. If you keep it empty, gift cards do not have an explicit expiry date.'),
+        )
+    },
+    'cookie_consent': {
+        'default': 'False',
+        'form_class': forms.BooleanField,
+        'serializer_class': serializers.BooleanField,
+        'form_kwargs': dict(
+            label=_("Enable cookie consent management features"),
+        ),
+        'type': bool,
+    },
+    'cookie_consent_dialog_text': {
+        'default': LazyI18nString.from_gettext(gettext_noop(
+            'By clicking "Accept all cookies", you agree to the storing of cookies and use of similar technologies on '
+            'your device.'
+        )),
+        'type': LazyI18nString,
+        'serializer_class': I18nField,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(
+            label=_("Dialog text"),
+            widget=I18nTextarea,
+            widget_kwargs={'attrs': {'rows': '3', 'data-display-dependency': '#id_settings-cookie_consent'}},
+        )
+    },
+    'cookie_consent_dialog_text_secondary': {
+        'default': LazyI18nString.from_gettext(gettext_noop(
+            'We use cookies and similar technologies to gather data that allows us to improve this website and our '
+            'offerings. If you do not agree, we will only use cookies if they are essential to providing the services '
+            'this website offers.'
+        )),
+        'type': LazyI18nString,
+        'serializer_class': I18nField,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(
+            label=_("Secondary dialog text"),
+            widget=I18nTextarea,
+            widget_kwargs={'attrs': {'rows': '3', 'data-display-dependency': '#id_settings-cookie_consent'}},
+        )
+    },
+    'cookie_consent_dialog_title': {
+        'default': LazyI18nString.from_gettext(gettext_noop('Privacy settings')),
+        'type': LazyI18nString,
+        'serializer_class': I18nField,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(
+            label=_('Dialog title'),
+            widget=I18nTextInput,
+            widget_kwargs={'attrs': {'data-display-dependency': '#id_settings-cookie_consent'}},
+        )
+    },
+    'cookie_consent_dialog_button_yes': {
+        'default': LazyI18nString.from_gettext(gettext_noop('Accept all cookies')),
+        'type': LazyI18nString,
+        'serializer_class': I18nField,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(
+            label=_('"Accept" button description'),
+            widget=I18nTextInput,
+            widget_kwargs={'attrs': {'data-display-dependency': '#id_settings-cookie_consent'}},
+        )
+    },
+    'cookie_consent_dialog_button_no': {
+        'default': LazyI18nString.from_gettext(gettext_noop('Required cookies only')),
+        'type': LazyI18nString,
+        'serializer_class': I18nField,
+        'form_class': I18nFormField,
+        'form_kwargs': dict(
+            label=_('"Reject" button description'),
+            widget=I18nTextInput,
+            widget_kwargs={'attrs': {'data-display-dependency': '#id_settings-cookie_consent'}},
         )
     },
     'seating_choice': {

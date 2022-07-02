@@ -36,6 +36,7 @@ import string
 from datetime import date, datetime, time
 
 import pytz
+from django.conf import settings
 from django.core.mail import get_connection
 from django.core.validators import MinLengthValidator, RegexValidator
 from django.db import models
@@ -45,6 +46,7 @@ from django.utils.crypto import get_random_string
 from django.utils.functional import cached_property
 from django.utils.timezone import get_current_timezone, make_aware, now
 from django.utils.translation import gettext_lazy as _
+from i18nfield.fields import I18nCharField
 
 from pretix.base.models.base import LoggedModel
 from pretix.base.validators import OrganizerSlugBanlistValidator
@@ -97,9 +99,20 @@ class Organizer(LoggedModel):
         return self.name
 
     def save(self, *args, **kwargs):
+        is_new = not self.pk
         obj = super().save(*args, **kwargs)
-        self.get_cache().clear()
+        if is_new:
+            self.set_defaults()
+        else:
+            self.get_cache().clear()
         return obj
+
+    def set_defaults(self):
+        """
+        This will be called after organizer creation.
+        This way, we can use this to introduce new default settings to pretix that do not affect existing organizers.
+        """
+        self.settings.cookie_consent = True
 
     def get_cache(self):
         """
@@ -179,21 +192,20 @@ class Organizer(LoggedModel):
             e.delete()
         self.teams.all().delete()
 
-    def get_mail_backend(self, timeout=None, force_custom=False):
+    def get_mail_backend(self, timeout=None):
         """
         Returns an email server connection, either by using the system-wide connection
         or by returning a custom one based on the organizer's settings.
         """
-        from pretix.base.email import CustomSMTPBackend
-
-        if self.settings.smtp_use_custom or force_custom:
-            return CustomSMTPBackend(host=self.settings.smtp_host,
-                                     port=self.settings.smtp_port,
-                                     username=self.settings.smtp_username,
-                                     password=self.settings.smtp_password,
-                                     use_tls=self.settings.smtp_use_tls,
-                                     use_ssl=self.settings.smtp_use_ssl,
-                                     fail_silently=False, timeout=timeout)
+        if self.settings.smtp_use_custom:
+            return get_connection(backend=settings.EMAIL_CUSTOM_SMTP_BACKEND,
+                                  host=self.settings.smtp_host,
+                                  port=self.settings.smtp_port,
+                                  username=self.settings.smtp_username,
+                                  password=self.settings.smtp_password,
+                                  use_tls=self.settings.smtp_use_tls,
+                                  use_ssl=self.settings.smtp_use_ssl,
+                                  fail_silently=False, timeout=timeout)
         else:
             return get_connection(fail_silently=False)
 
@@ -453,3 +465,25 @@ class TeamAPIToken(models.Model):
             return self.get_events_with_any_permission()
         else:
             return self.team.organizer.events.none()
+
+
+class OrganizerFooterLink(models.Model):
+    """
+    A footer link assigned to an organizer.
+    """
+    organizer = models.ForeignKey('Organizer', on_delete=models.CASCADE, related_name='footer_links')
+    label = I18nCharField(
+        max_length=200,
+        verbose_name=_("Link text"),
+    )
+    url = models.URLField(
+        verbose_name=_("Link URL"),
+    )
+
+    def delete(self, *args, **kwargs):
+        super().delete(*args, **kwargs)
+        self.organizer.cache.clear()
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        self.organizer.cache.clear()

@@ -32,9 +32,10 @@
 # Unless required by applicable law or agreed to in writing, software distributed under the Apache License 2.0 is
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under the License.
-
+import hashlib
 import inspect
 import logging
+import mimetypes
 import os
 import re
 import smtplib
@@ -51,13 +52,14 @@ from bs4 import BeautifulSoup
 from celery import chain
 from celery.exceptions import MaxRetriesExceededError
 from django.conf import settings
+from django.core.files.storage import default_storage
 from django.core.mail import (
     EmailMultiAlternatives, SafeMIMEMultipart, get_connection,
 )
 from django.core.mail.message import SafeMIMEText
 from django.db import transaction
 from django.template.loader import get_template
-from django.utils.timezone import override
+from django.utils.timezone import now, override
 from django.utils.translation import gettext as _, pgettext
 from django_scopes import scope, scopes_disabled
 from i18nfield.strings import LazyI18nString
@@ -73,8 +75,9 @@ from pretix.base.services.tasks import TransactionAwareTask
 from pretix.base.services.tickets import get_tickets_for_order
 from pretix.base.signals import email_filter, global_email_filter
 from pretix.celery_app import app
+from pretix.helpers.hierarkey import clean_filename
 from pretix.multidomain.urlreverse import build_absolute_uri
-from pretix.presale.ical import get_ical
+from pretix.presale.ical import get_private_icals
 
 logger = logging.getLogger('pretix.base.mail')
 INVALID_ADDRESS = 'invalid-pretix-mail-address'
@@ -94,7 +97,7 @@ def mail(email: Union[str, Sequence[str]], subject: str, template: Union[str, La
          context: Dict[str, Any] = None, event: Event = None, locale: str = None, order: Order = None,
          position: OrderPosition = None, *, headers: dict = None, sender: str = None, organizer: Organizer = None,
          customer: Customer = None, invoices: Sequence = None, attach_tickets=False, auto_email=True, user=None,
-         attach_ical=False, attach_cached_files: Sequence = None):
+         attach_ical=False, attach_cached_files: Sequence = None, attach_other_files: list=None):
     """
     Sends out an email to a user. The mail will be sent synchronously or asynchronously depending on the installation.
 
@@ -141,6 +144,8 @@ def mail(email: Union[str, Sequence[str]], subject: str, template: Union[str, La
     :param customer: The user this email is sent to
 
     :param attach_cached_files: A list of cached file to attach to this email.
+
+    :param attach_other_files: A list of file paths on our storage to attach.
 
     :raises MailOrderException: on obvious, immediate failures. Not raising an exception does not necessarily mean
         that the email has been sent, just that it has been queued by the email backend.
@@ -212,7 +217,8 @@ def mail(email: Union[str, Sequence[str]], subject: str, template: Union[str, La
                 for bcc_mail in settings_holder.settings.mail_bcc.split(','):
                     bcc.append(bcc_mail.strip())
 
-            if settings_holder.settings.mail_from == settings.DEFAULT_FROM_EMAIL and settings_holder.settings.contact_mail and not headers.get('Reply-To'):
+            if settings_holder.settings.mail_from in (settings.DEFAULT_FROM_EMAIL, settings.MAIL_FROM_ORGANIZERS) \
+                    and settings_holder.settings.contact_mail and not headers.get('Reply-To'):
                 headers['Reply-To'] = settings_holder.settings.contact_mail
 
             prefix = settings_holder.settings.get('mail_prefix')
@@ -301,6 +307,7 @@ def mail(email: Union[str, Sequence[str]], subject: str, template: Union[str, La
             organizer=organizer.pk if organizer else None,
             customer=customer.pk if customer else None,
             attach_cached_files=[(cf.id if isinstance(cf, CachedFile) else cf) for cf in attach_cached_files] if attach_cached_files else [],
+            attach_other_files=attach_other_files,
         )
 
         if invoices:
@@ -338,7 +345,8 @@ class CustomEmail(EmailMultiAlternatives):
 def mail_send_task(self, *args, to: List[str], subject: str, body: str, html: str, sender: str,
                    event: int = None, position: int = None, headers: dict = None, bcc: List[str] = None,
                    invoices: List[int] = None, order: int = None, attach_tickets=False, user=None,
-                   organizer=None, customer=None, attach_ical=False, attach_cached_files: List[int] = None) -> bool:
+                   organizer=None, customer=None, attach_ical=False, attach_cached_files: List[int] = None,
+                   attach_other_files: List[str] = None) -> bool:
     email = CustomEmail(subject, body, sender, to=to, bcc=bcc, headers=headers)
     if html is not None:
         html_message = SafeMIMEMultipart(_subtype='related', encoding=settings.DEFAULT_CHARSET)
@@ -404,8 +412,9 @@ def mail_send_task(self, *args, to: List[str], subject: str, body: str, html: st
                                         logger.exception('Could not attach invoice to email')
                                         pass
 
-                            if attach_size < settings.FILE_UPLOAD_MAX_SIZE_EMAIL_ATTACHMENT:
-                                # Do not attach more than 4MB, it will bounce way to often.
+                            if attach_size < settings.FILE_UPLOAD_MAX_SIZE_EMAIL_ATTACHMENT - 1:
+                                # Do not attach more than (limit - 1 MB) in tickets (1MB space for invoice, email itself, …),
+                                # it will bounce way to often.
                                 for a in args:
                                     try:
                                         email.attach(*a)
@@ -422,22 +431,12 @@ def mail_send_task(self, *args, to: List[str], subject: str, body: str, html: st
                                     }
                                 )
                         if attach_ical:
-                            ical_events = set()
-                            if event.has_subevents:
-                                if position:
-                                    ical_events.add(position.subevent)
-                                else:
-                                    for p in order.positions.all():
-                                        ical_events.add(p.subevent)
-                            else:
-                                ical_events.add(order.event)
-
-                            for i, e in enumerate(ical_events):
-                                cal = get_ical([e])
+                            for i, cal in enumerate(get_private_icals(event, [position] if position else order.positions.all())):
                                 email.attach('event-{}.ics'.format(i), cal.serialize(), 'text/calendar')
 
             email = email_filter.send_chained(event, 'message', message=email, order=order, user=user)
 
+        invoices_sent = []
         if invoices:
             invoices = Invoice.objects.filter(pk__in=invoices)
             for inv in invoices:
@@ -449,9 +448,24 @@ def mail_send_task(self, *args, to: List[str], subject: str, body: str, html: st
                                 inv.file.file.read(),
                                 'application/pdf'
                             )
+                        invoices_sent.append(inv)
                     except:
                         logger.exception('Could not attach invoice to email')
                         pass
+
+        if attach_other_files:
+            for fname in attach_other_files:
+                ftype, _ = mimetypes.guess_type(fname)
+                data = default_storage.open(fname).read()
+                try:
+                    email.attach(
+                        clean_filename(os.path.basename(fname)),
+                        data,
+                        ftype
+                    )
+                except:
+                    logger.exception('Could not attach file to email')
+                    pass
 
         if attach_cached_files:
             for cf in CachedFile.objects.filter(id__in=attach_cached_files):
@@ -472,10 +486,30 @@ def mail_send_task(self, *args, to: List[str], subject: str, body: str, html: st
         try:
             backend.send_messages([email])
         except (smtplib.SMTPResponseException, smtplib.SMTPSenderRefused) as e:
-            if e.smtp_code in (101, 111, 421, 422, 431, 442, 447, 452):
-                # Most likely temporary, retry again (but pretty soon)
+            if e.smtp_code in (101, 111, 421, 422, 431, 432, 442, 447, 452):
+                if e.smtp_code == 432 and settings.HAS_REDIS:
+                    # This is likely Microsoft Exchange Online which has a pretty bad rate limit of max. 3 concurrent
+                    # SMTP connections which is *easily* exceeded with many celery threads. Just retrying with exponential
+                    # backoff won't be good enough if we have a lot of emails, instead we'll need to make sure our retry
+                    # intervals scatter such that the email won't all be retried at the same time again and cause the
+                    # same problem.
+                    # See also https://docs.microsoft.com/en-us/exchange/troubleshoot/send-emails/smtp-submission-improvements
+                    from django_redis import get_redis_connection
+
+                    redis_key = "pretix_mail_retry_" + hashlib.sha1(f"{getattr(backend, 'username', '_')}@{getattr(backend, 'host', '_')}".encode()).hexdigest()
+                    rc = get_redis_connection("redis")
+                    cnt = rc.incr(redis_key)
+                    rc.expire(redis_key, 300)
+
+                    max_retries = 10
+                    retry_after = 30 + cnt * 10
+                else:
+                    # Most likely some other kind of temporary failure, retry again (but pretty soon)
+                    max_retries = 5
+                    retry_after = 2 ** (self.request.retries * 3)  # max is 2 ** (4*3) = 4096 seconds = 68 minutes
+
                 try:
-                    self.retry(max_retries=5, countdown=2 ** (self.request.retries * 3))  # max is 2 ** (4*3) = 4096 seconds = 68 minutes
+                    self.retry(max_retries=max_retries, countdown=retry_after)
                 except MaxRetriesExceededError:
                     if log_target:
                         log_target.log_action(
@@ -546,7 +580,7 @@ def mail_send_task(self, *args, to: List[str], subject: str, body: str, html: st
                             }
                         )
                     raise e
-            if logger:
+            if log_target:
                 log_target.log_action(
                     'pretix.email.error',
                     data={
@@ -558,6 +592,10 @@ def mail_send_task(self, *args, to: List[str], subject: str, body: str, html: st
                 )
             logger.exception('Error sending email')
             raise SendMailException('Failed to send an email to {}.'.format(to))
+        else:
+            for i in invoices_sent:
+                i.sent_to_customer = now()
+                i.save(update_fields=['sent_to_customer'])
 
 
 def mail_send(*args, **kwargs):

@@ -52,6 +52,7 @@ Variable                            Description
 ``order_email``                     E-mail address of the ticket purchaser
 ``product_id``                      Internal ID of the purchased product
 ``product_variation``               Internal ID of the purchased product variation (or empty)
+``secret``                          The secret ticket code, would be used as the QR code for physical tickets
 ``attendee_name``                   Full name of the ticket holder (or empty)
 ``attendee_name_*``                 Name parts of the ticket holder, depending on configuration, e.g. ``attendee_name_given_name`` or ``attendee_name_family_name``
 ``attendee_email``                  E-mail address of the ticket holder (or empty)
@@ -61,7 +62,7 @@ Variable                            Description
 ``attendee_city``                   City of the ticket holder's address (or empty)
 ``attendee_country``                Country code of the ticket holder's address (or empty)
 ``attendee_state``                  State of the ticket holder's address (or empty)
-``answer[XYZ]``                     Answer to the custom question with identifier ``XYZ``
+``answers[XYZ]``                    Answer to the custom question with identifier ``XYZ``
 ``invoice_name``                    Full name of the invoice address (or empty)
 ``invoice_name_*``                  Name parts of the invoice address, depending on configuration, e.g. ``invoice_name_given_name`` or ``invoice_name_family_name``
 ``invoice_company``                 Company of the invoice address (or empty)

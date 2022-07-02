@@ -42,14 +42,14 @@ from django.conf import settings
 from django.contrib import messages
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.core.files import File
-from django.db import transaction
+from django.db import connections, transaction
 from django.db.models import (
     Count, Exists, IntegerField, Max, Min, OuterRef, Prefetch, ProtectedError,
     Q, Subquery, Sum,
 )
 from django.db.models.functions import Coalesce, Greatest
 from django.forms import DecimalField
-from django.http import HttpResponseBadRequest, JsonResponse
+from django.http import HttpResponse, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import reverse
 from django.utils.functional import cached_property
@@ -89,11 +89,11 @@ from pretix.control.forms.filter import (
 )
 from pretix.control.forms.orders import ExporterForm
 from pretix.control.forms.organizer import (
-    CustomerUpdateForm, DeviceForm, EventMetaPropertyForm, GateForm,
-    GiftCardCreateForm, GiftCardUpdateForm, MailSettingsForm,
-    MembershipTypeForm, MembershipUpdateForm, OrganizerDeleteForm,
-    OrganizerForm, OrganizerSettingsForm, OrganizerUpdateForm, TeamForm,
-    WebHookForm,
+    CustomerCreateForm, CustomerUpdateForm, DeviceBulkEditForm, DeviceForm,
+    EventMetaPropertyForm, GateForm, GiftCardCreateForm, GiftCardUpdateForm,
+    MailSettingsForm, MembershipTypeForm, MembershipUpdateForm,
+    OrganizerDeleteForm, OrganizerFooterLinkFormset, OrganizerForm,
+    OrganizerSettingsForm, OrganizerUpdateForm, TeamForm, WebHookForm,
 )
 from pretix.control.logdisplay import OVERVIEW_BANLIST
 from pretix.control.permissions import (
@@ -101,6 +101,8 @@ from pretix.control.permissions import (
 )
 from pretix.control.signals import nav_organizer
 from pretix.control.views import PaginationMixin
+from pretix.control.views.mailsetup import MailSettingsSetupView
+from pretix.helpers import GroupConcat
 from pretix.helpers.dicts import merge_dicts
 from pretix.helpers.urls import build_absolute_uri as build_global_uri
 from pretix.multidomain.urlreverse import build_absolute_uri
@@ -261,27 +263,26 @@ class OrganizerMailSettings(OrganizerSettingsFormView):
                         k: form.cleaned_data.get(k) for k in form.changed_data
                     }
                 )
-
-            if request.POST.get('test', '0').strip() == '1':
-                backend = self.request.organizer.get_mail_backend(force_custom=True, timeout=10)
-                try:
-                    backend.test(self.request.organizer.settings.mail_from)
-                except Exception as e:
-                    messages.warning(self.request, _('An error occurred while contacting the SMTP server: %s') % str(e))
-                else:
-                    if form.cleaned_data.get('smtp_use_custom'):
-                        messages.success(self.request, _('Your changes have been saved and the connection attempt to '
-                                                         'your SMTP server was successful.'))
-                    else:
-                        messages.success(self.request, _('We\'ve been able to contact the SMTP server you configured. '
-                                                         'Remember to check the "use custom SMTP server" checkbox, '
-                                                         'otherwise your SMTP server will not be used.'))
-            else:
                 messages.success(self.request, _('Your changes have been saved.'))
             return redirect(self.get_success_url())
         else:
             messages.error(self.request, _('We could not save your changes. See below for details.'))
             return self.get(request)
+
+
+class MailSettingsSetup(OrganizerPermissionRequiredMixin, MailSettingsSetupView):
+    permission = 'can_change_organizer_settings'
+    basetpl = 'pretixcontrol/base.html'
+
+    def get_success_url(self):
+        return reverse('control:organizer.settings.mail', kwargs={
+            'organizer': self.request.organizer.slug,
+        })
+
+    def log_action(self, data):
+        self.request.organizer.log_action(
+            'pretix.organizer.settings', user=self.request.user, data=data
+        )
 
 
 class MailSettingsPreview(OrganizerPermissionRequiredMixin, View):
@@ -407,6 +408,7 @@ class OrganizerUpdate(OrganizerPermissionRequiredMixin, UpdateView):
         return OrganizerSettingsForm(
             obj=self.object,
             prefix='settings',
+            is_admin=self.request.user.has_active_staff_session(self.request.session.session_key),
             data=self.request.POST if self.request.method == 'POST' else None,
             files=self.request.FILES if self.request.method == 'POST' else None
         )
@@ -414,11 +416,13 @@ class OrganizerUpdate(OrganizerPermissionRequiredMixin, UpdateView):
     def get_context_data(self, *args, **kwargs) -> dict:
         context = super().get_context_data(*args, **kwargs)
         context['sform'] = self.sform
+        context['footer_links_formset'] = self.footer_links_formset
         return context
 
     @transaction.atomic
     def form_valid(self, form):
         self.sform.save()
+        self.save_footer_links_formset(self.object)
         change_css = False
         if self.sform.has_changed():
             self.request.organizer.log_action(
@@ -433,6 +437,10 @@ class OrganizerUpdate(OrganizerPermissionRequiredMixin, UpdateView):
             )
             if any(p in self.sform.changed_data for p in SETTINGS_AFFECTING_CSS):
                 change_css = True
+        if self.footer_links_formset.has_changed():
+            self.request.organizer.log_action('pretix.organizer.footerlinks.changed', user=self.request.user, data={
+                'data': self.footer_links_formset.cleaned_data
+            })
         if form.has_changed():
             self.request.organizer.log_action(
                 'pretix.organizer.changed',
@@ -464,10 +472,18 @@ class OrganizerUpdate(OrganizerPermissionRequiredMixin, UpdateView):
     def post(self, request, *args, **kwargs):
         self.object = self.get_object()
         form = self.get_form()
-        if form.is_valid() and self.sform.is_valid():
+        if form.is_valid() and self.sform.is_valid() and self.footer_links_formset.is_valid():
             return self.form_valid(form)
         else:
             return self.form_invalid(form)
+
+    @cached_property
+    def footer_links_formset(self):
+        return OrganizerFooterLinkFormset(self.request.POST if self.request.method == "POST" else None, organizer=self.object,
+                                          prefix="footer-links", instance=self.object)
+
+    def save_footer_links_formset(self, obj):
+        self.footer_links_formset.save()
 
 
 class OrganizerCreate(CreateView):
@@ -489,6 +505,7 @@ class OrganizerCreate(CreateView):
             organizer=form.instance, name=_('Administrators'),
             all_events=True, can_create_events=True, can_change_teams=True, can_manage_gift_cards=True,
             can_change_organizer_settings=True, can_change_event_settings=True, can_change_items=True,
+            can_manage_customers=True,
             can_view_orders=True, can_change_orders=True, can_view_vouchers=True, can_change_vouchers=True
         )
         t.members.add(self.request.user)
@@ -625,14 +642,25 @@ class TeamDeleteView(OrganizerDetailViewMixin, OrganizerPermissionRequiredMixin,
     def delete(self, request, *args, **kwargs):
         success_url = self.get_success_url()
         self.object = self.get_object()
-        if self.is_allowed():
-            self.object.log_action('pretix.team.deleted', user=self.request.user)
-            self.object.delete()
-            messages.success(request, _('The selected team has been deleted.'))
-            return redirect(success_url)
-        else:
+        if not self.is_allowed():
             messages.error(request, _('The selected team cannot be deleted.'))
             return redirect(success_url)
+
+        try:
+            self.object.log_action('pretix.team.deleted', user=self.request.user)
+            self.object.delete()
+        except ProtectedError:
+            messages.error(
+                self.request,
+                _(
+                    'The team could not be deleted as some constraints (e.g. data created by '
+                    'plug-ins) do not allow it.'
+                )
+            )
+            return redirect(success_url)
+
+        messages.success(request, _('The selected team has been deleted.'))
+        return redirect(success_url)
 
 
 class TeamMemberView(OrganizerDetailViewMixin, OrganizerPermissionRequiredMixin, DetailView):
@@ -817,11 +845,17 @@ class TeamMemberView(OrganizerDetailViewMixin, OrganizerPermissionRequiredMixin,
         })
 
 
-class DeviceListView(OrganizerDetailViewMixin, OrganizerPermissionRequiredMixin, ListView):
-    model = Device
-    template_name = 'pretixcontrol/organizers/devices.html'
-    permission = 'can_change_organizer_settings'
-    context_object_name = 'devices'
+class DeviceQueryMixin:
+
+    @cached_property
+    def request_data(self):
+        if self.request.method == "POST":
+            return self.request.POST
+        return self.request.GET
+
+    @cached_property
+    def filter_form(self):
+        return DeviceFilterForm(data=self.request_data, request=self.request)
 
     def get_queryset(self):
         qs = self.request.organizer.devices.prefetch_related(
@@ -829,16 +863,26 @@ class DeviceListView(OrganizerDetailViewMixin, OrganizerPermissionRequiredMixin,
         ).order_by('revoked', '-device_id')
         if self.filter_form.is_valid():
             qs = self.filter_form.filter_qs(qs)
+
+        if 'device' in self.request_data and '__ALL' not in self.request_data:
+            qs = qs.filter(
+                id__in=self.request_data.getlist('device')
+            )
+
         return qs
+
+
+class DeviceListView(DeviceQueryMixin, OrganizerDetailViewMixin, OrganizerPermissionRequiredMixin, ListView):
+    model = Device
+    template_name = 'pretixcontrol/organizers/devices.html'
+    permission = 'can_change_organizer_settings'
+    context_object_name = 'devices'
+    paginate_by = 100
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
         ctx['filter_form'] = self.filter_form
         return ctx
-
-    @cached_property
-    def filter_form(self):
-        return DeviceFilterForm(data=self.request.GET, request=self.request)
 
 
 class DeviceCreateView(OrganizerDetailViewMixin, OrganizerPermissionRequiredMixin, CreateView):
@@ -931,6 +975,125 @@ class DeviceUpdateView(OrganizerDetailViewMixin, OrganizerPermissionRequiredMixi
     def form_invalid(self, form):
         messages.error(self.request, _('Your changes could not be saved.'))
         return super().form_invalid(form)
+
+
+class DeviceBulkUpdateView(DeviceQueryMixin, OrganizerDetailViewMixin, OrganizerPermissionRequiredMixin, FormView):
+    template_name = 'pretixcontrol/organizers/device_bulk_edit.html'
+    permission = 'can_change_organizer_settings'
+    context_object_name = 'device'
+    form_class = DeviceBulkEditForm
+
+    def get_queryset(self):
+        return super().get_queryset().prefetch_related(None).order_by()
+
+    def get(self, request, *args, **kwargs):
+        return HttpResponse(status=405)
+
+    @cached_property
+    def is_submitted(self):
+        # Usually, django considers a form "bound" / "submitted" on every POST request. However, this view is always
+        # called with POST method, even if just to pass the selection of objects to work on, so we want to modify
+        # that behaviour
+        return '_bulk' in self.request.POST
+
+    def get_form_kwargs(self):
+        initial = {}
+        mixed_values = set()
+        qs = self.get_queryset().annotate(
+            limit_events_list=Subquery(
+                Device.limit_events.through.objects.filter(
+                    device_id=OuterRef('pk')
+                ).order_by('device_id', 'event_id').values('device_id').annotate(
+                    g=GroupConcat('event_id', separator=',')
+                ).values('g')
+            )
+        )
+
+        fields = {
+            'all_events': 'all_events',
+            'limit_events': 'limit_events_list',
+            'security_profile': 'security_profile',
+            'gate': 'gate',
+        }
+        for k, f in fields.items():
+            existing_values = list(qs.order_by(f).values(f).annotate(c=Count('*')))
+            if len(existing_values) == 1:
+                if k == 'limit_events':
+                    if existing_values[0][f]:
+                        initial[k] = self.request.organizer.events.filter(id__in=existing_values[0][f].split(","))
+                    else:
+                        initial[k] = []
+                else:
+                    initial[k] = existing_values[0][f]
+            elif len(existing_values) > 1:
+                mixed_values.add(k)
+                initial[k] = None
+
+        kwargs = super().get_form_kwargs()
+        kwargs['organizer'] = self.request.organizer
+        kwargs['prefix'] = 'bulkedit'
+        kwargs['initial'] = initial
+        kwargs['queryset'] = self.get_queryset()
+        kwargs['mixed_values'] = mixed_values
+        if not self.is_submitted:
+            kwargs['data'] = None
+            kwargs['files'] = None
+        return kwargs
+
+    def get_object(self, queryset=None):
+        return get_object_or_404(Device, organizer=self.request.organizer, pk=self.kwargs.get('device'))
+
+    def get_success_url(self):
+        return reverse('control:organizer.devices', kwargs={
+            'organizer': self.request.organizer.slug,
+        })
+
+    @transaction.atomic()
+    def form_valid(self, form):
+        log_entries = []
+
+        # Main form
+        form.save()
+        data = {
+            k: (v if k != 'limit_events' else [e.id for e in v])
+            for k, v in form.cleaned_data.items()
+            if k in form.changed_data
+        }
+        data['_raw_bulk_data'] = self.request.POST.dict()
+        for obj in self.get_queryset():
+            log_entries.append(
+                obj.log_action('pretix.device.changed', data=data, user=self.request.user, save=False)
+            )
+
+        if connections['default'].features.can_return_rows_from_bulk_insert:
+            LogEntry.objects.bulk_create(log_entries, batch_size=200)
+            LogEntry.bulk_postprocess(log_entries)
+        else:
+            for le in log_entries:
+                le.save()
+            LogEntry.bulk_postprocess(log_entries)
+
+        messages.success(self.request, _('Your changes have been saved.'))
+        return super().form_valid(form)
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        ctx['devices'] = self.get_queryset()
+        ctx['bulk_selected'] = self.request.POST.getlist("_bulk")
+        return ctx
+
+    def post(self, request, *args, **kwargs):
+        form = self.get_form()
+        is_valid = (
+            self.is_submitted and
+            form.is_valid()
+        )
+        if is_valid:
+            return self.form_valid(form)
+        else:
+            if self.is_submitted:
+                messages.error(self.request, _('We could not save your changes. See below for details.'))
+            return self.form_invalid(form)
 
 
 class DeviceConnectView(OrganizerDetailViewMixin, OrganizerPermissionRequiredMixin, DetailView):
@@ -1194,6 +1357,10 @@ class GiftCardDetailView(OrganizerDetailViewMixin, OrganizerPermissionRequiredMi
                         'retry': True,
                     })
                 )
+                t.order.log_action('pretix.event.order.payment.started', {
+                    'local_id': r.local_id,
+                    'provider': r.provider
+                }, user=request.user)
                 try:
                     r.payment_provider.execute_payment(request, r)
                 except PaymentException as e:
@@ -1618,6 +1785,8 @@ class LogView(OrganizerPermissionRequiredMixin, PaginationMixin, ListView):
             'user', 'content_type', 'api_token', 'oauth_application', 'device'
         ).order_by('-datetime')
         qs = qs.exclude(action_type__in=OVERVIEW_BANLIST)
+        if self.request.GET.get('action_type'):
+            qs = qs.filter(action_type=self.request.GET['action_type'])
         if self.request.GET.get('user'):
             qs = qs.filter(user_id=self.request.GET.get('user'))
         return qs
@@ -1861,6 +2030,35 @@ class CustomerDetailView(OrganizerDetailViewMixin, OrganizerPermissionRequiredMi
             o.sales_channel_obj = scs[o.sales_channel]
 
         return ctx
+
+
+class CustomerCreateView(OrganizerDetailViewMixin, OrganizerPermissionRequiredMixin, CreateView):
+    template_name = 'pretixcontrol/organizers/customer_edit.html'
+    permission = 'can_manage_customers'
+    context_object_name = 'customer'
+    form_class = CustomerCreateForm
+
+    def get_form_kwargs(self):
+        ctx = super().get_form_kwargs()
+        c = Customer(organizer=self.request.organizer)
+        c.assign_identifier()
+        ctx['instance'] = c
+        return ctx
+
+    def form_valid(self, form):
+        r = super().form_valid(form)
+        form.instance.log_action('pretix.customer.created', user=self.request.user, data={
+            k: getattr(form.instance, k)
+            for k in form.changed_data
+        })
+        messages.success(self.request, _('Your changes have been saved.'))
+        return r
+
+    def get_success_url(self):
+        return reverse('control:organizer.customer', kwargs={
+            'organizer': self.request.organizer.slug,
+            'customer': self.object.identifier,
+        })
 
 
 class CustomerUpdateView(OrganizerDetailViewMixin, OrganizerPermissionRequiredMixin, UpdateView):

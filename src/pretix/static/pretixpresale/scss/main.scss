@@ -1,3 +1,7 @@
+/* before variables.scss because it only affects presale, not control */
+$body-bg: #f5f5f5 !default;
+
+/* imports */
 @import "../../pretixbase/scss/_variables.scss";
 @import "../../bootstrap/scss/_bootstrap_reduced.scss";
 @import "../../pretixbase/scss/_theme.scss";
@@ -20,30 +24,84 @@
     line-height: 1.8em;
 }
 
+.order-details dt {
+    font-weight: normal;
+    float: left;
+    margin-right: .25em;
+}
+.status-dot {
+    font-size: 1.2em;
+}
+.text-warning { color: $brand-warning; }
+.text-info { color: $brand-info; }
+.text-success { color: $brand-success; }
+.text-danger { color: $brand-danger; }
+h1 a, .btn {
+    text-decoration: none;
+}
+/*
+a, .btn-link {
+    text-decoration: underline;
+}
+*/
+/* bootstrap sets outline-offset with :active:focus so we need to match specifity of selector */
+/* see line 26, pretix/static/bootstrap/scss/bootstrap/_buttons.scss */
+button:focus, a:focus, .btn:focus, summary:focus,
+/*button:active, a:active, .btn:active, summary:active,*/
+button:active:focus, a:active:focus, .btn:active:focus, summary:active:focus {
+    outline: 2px solid $link-hover-color;
+    outline-offset: 2px;
+}
+
 footer {
+    clear: both;
     padding: 10px 0;
 }
 footer nav {
     text-align: center;
     font-size: 11px;
 }
+footer nav ul {
+    display: flex;
+    justify-content: center;
+    list-style: none;
+    padding: 0;
+    flex-wrap: wrap;
+}
+footer nav li:not(:first-child):before {
+    content: "·";
+    font-weight: bold;
+    display: inline-block;
+    width: 1.5em;
+    text-align: center;
+}
+footer nav .btn-link {
+    display: inline;
+    padding: 0;
+    margin: 0;
+    font-size: 11px;
+    vertical-align: baseline;
+}
+
 .js-only {
     display: none;
 }
 .locales, .loginstatus {
     display: inline;
-    a {
-        text-decoration: none;
-    }
-    a:hover {
-        border-bottom: 2px solid $gray-light;
-    }
     a.active {
-        border-bottom: 2px solid $brand-primary;
+        /*border-bottom: 2px solid $brand-primary;*/
+        font-weight: bold;
     }
     img {
         vertical-align: baseline;
     }
+}
+.locales ul {
+    display: inline;
+    list-style: none;
+}
+.locales li {
+    display: inline;
 }
 .loginstatus a {
     margin-left: 10px;
@@ -71,6 +129,29 @@ a:hover .panel-primary > .panel-heading {
     }
 }
 
+.contains-overlay {
+    position: relative;
+}
+.overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: $gray-lightest;
+}
+.overlay-centered {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+}
+.overlay-centered .overlay-content {
+  max-width: 35em;
+  margin-left: auto;
+  margin-right: auto;
+}
+
 body.loading .container {
     -webkit-filter: blur(2px);
     -moz-filter: blur(2px);
@@ -85,7 +166,7 @@ body.loading .container {
     font-size: 120px;
     color: $brand-primary;
 }
-#loadingmodal, #ajaxerr {
+#loadingmodal, #ajaxerr, #cookie-consent-modal {
     position: fixed;
     top: 0;
     left: 0;
@@ -105,9 +186,10 @@ body.loading .container {
 
     .modal-card {
         margin: 50px auto 0;
-        top: 50px;
         width: 90%;
         max-width: 600px;
+        max-height: calc(100vh - 100px);
+        overflow-y: auto;
         background: white;
         border-radius: $border-radius-large;
         box-shadow: 0 7px 14px 0 rgba(78, 50, 92, 0.1),0 3px 6px 0 rgba(0,0,0,.07);
@@ -127,10 +209,32 @@ body.loading .container {
             }
         }
     }
+
+    &#cookie-consent-modal {
+        background: rgba(255, 255, 255, .5);
+        opacity: 1;
+        visibility: visible;
+        display: none;
+        .modal-card-content {
+            margin-left: 0;
+        }
+        details {
+            & > summary {
+                list-style: none;
+            }
+            & > summary::-webkit-details-marker,
+            & > summary::marker {
+                display: none;
+            }
+            margin-bottom: 10px;
+        }
+    }
 }
 @media (max-width: 700px) {
-    #loadingmodal, #ajaxerr {
+    #loadingmodal, #ajaxerr, #cookie-consent-modal {
         .modal-card {
+            margin: 25px auto 0;
+            max-height: calc(100vh - 50px - 20px);
             .modal-card-icon {
                 float: none;
                 width: 100%;
@@ -181,19 +285,22 @@ body.loading .container {
 @media (min-width: $screen-md-min) {
     .thank-you {
         min-height: 170px;
-        width: 70%;
-        margin: auto;
+        max-width: 59em;
+        margin-left: auto;
+        margin-right: auto;
+        margin-bottom: 3em;
 
-        .fa {
+        & > .fa {
             float: left;
             margin-right: 30px;
+            margin-left: 0;
         }
 
         h2 {
             padding-top: 35px;
         }
 
-        p {
+        & > * {
             margin-left: 158px;
         }
     }
@@ -213,8 +320,14 @@ body.loading .container {
     }
 }
 
+.blank-after {
+    margin-bottom: 1em;
+}
 .dl-horizontal dt  {
     white-space: normal;
+}
+.dl-inline dt, .dl-inline dd {
+    display: inline;
 }
 
 .collapse-indicator {
@@ -231,7 +344,7 @@ body.loading .container {
     transform: rotate(180deg);
 }
 
-.panel-title a[data-toggle="collapse"], details h3.panel-title, details h4.panel-title {
+.panel-title a[data-toggle="collapse"], details .panel-title {
     display: flex;
     padding: 10px 15px;
     margin: -10px -15px;
@@ -285,7 +398,7 @@ h2 .label {
 }
 
 .event-list {
-    margin-top: 15px;
+    margin-bottom: 15px;
     border-top: 1px solid $table-border-color;
 
     .row {

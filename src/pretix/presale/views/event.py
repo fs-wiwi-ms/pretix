@@ -39,6 +39,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from importlib import import_module
+from urllib.parse import urlencode
 
 import isoweek
 import pytz
@@ -69,14 +70,14 @@ from pretix.base.models.items import (
 from pretix.base.services.quotas import QuotaAvailability
 from pretix.helpers.compat import date_fromisocalendar
 from pretix.multidomain.urlreverse import eventreverse
-from pretix.presale.ical import get_ical
+from pretix.presale.ical import get_public_ical
 from pretix.presale.signals import item_description
 from pretix.presale.views.organizer import (
     EventListMixin, add_subevents_for_days, days_for_template,
     filter_qs_by_attr, weeks_for_template,
 )
 
-from ...helpers.formats.en.formats import WEEK_FORMAT
+from ...helpers.formats.en.formats import SHORT_MONTH_DAY_FORMAT, WEEK_FORMAT
 from . import (
     CartMixin, EventViewMixin, allow_frame_if_namespaced, get_cart,
     iframe_entry_view_wrapper,
@@ -100,7 +101,8 @@ def item_group_by_category(items):
 
 
 def get_grouped_items(event, subevent=None, voucher=None, channel='web', require_seat=0, base_qs=None, allow_addons=False,
-                      quota_cache=None, filter_items=None, filter_categories=None):
+                      quota_cache=None, filter_items=None, filter_categories=None, memberships=None,
+                      ignore_hide_sold_out_for_item_ids=None):
     base_qs_set = base_qs is not None
     base_qs = base_qs if base_qs is not None else event.items
 
@@ -120,10 +122,16 @@ def get_grouped_items(event, subevent=None, voucher=None, channel='web', require
     if not voucher or not voucher.show_hidden_items:
         variation_q &= Q(hide_without_voucher=False)
 
+    if memberships is not None:
+        prefetch_membership_types = ['require_membership_types']
+    else:
+        prefetch_membership_types = []
+
     items = base_qs.using(settings.DATABASE_REPLICA).filter_available(channel=channel, voucher=voucher, allow_addons=allow_addons).select_related(
         'category', 'tax_rule',  # for re-grouping
         'hidden_if_available',
     ).prefetch_related(
+        *prefetch_membership_types,
         Prefetch('quotas',
                  to_attr='_subevent_quotas',
                  queryset=event.quotas.using(settings.DATABASE_REPLICA).filter(subevent=subevent)),
@@ -160,6 +168,7 @@ def get_grouped_items(event, subevent=None, voucher=None, channel='web', require
                      quotas__isnull=False,
                      subevent_disabled=False
                  ).prefetch_related(
+                     *prefetch_membership_types,
                      Prefetch('quotas',
                               to_attr='_subevent_quotas',
                               queryset=event.quotas.using(settings.DATABASE_REPLICA).filter(subevent=subevent))
@@ -240,6 +249,11 @@ def get_grouped_items(event, subevent=None, voucher=None, channel='web', require
                 item._remove = True
                 continue
 
+        if item.require_membership and item.require_membership_hidden:
+            if not memberships or not any([m.membership_type in item.require_membership_types.all() for m in memberships]):
+                item._remove = True
+                continue
+
         item.description = str(item.description)
         for recv, resp in item_description.send(sender=event, item=item, variation=None):
             if resp:
@@ -260,7 +274,9 @@ def get_grouped_items(event, subevent=None, voucher=None, channel='web', require
                     item.check_quotas(subevent=subevent, _cache=quota_cache, include_bundled=True)
                 )
 
-            if event.settings.hide_sold_out and item.cached_availability[0] < Quota.AVAILABILITY_RESERVED:
+            if not (
+                    ignore_hide_sold_out_for_item_ids and item.pk in ignore_hide_sold_out_for_item_ids
+            ) and event.settings.hide_sold_out and item.cached_availability[0] < Quota.AVAILABILITY_RESERVED:
                 item._remove = True
                 continue
 
@@ -290,6 +306,11 @@ def get_grouped_items(event, subevent=None, voucher=None, channel='web', require
             display_add_to_cart = display_add_to_cart or item.order_max > 0
         else:
             for var in item.available_variations:
+                if var.require_membership and var.require_membership_hidden:
+                    if not memberships or not any([m.membership_type in var.require_membership_types.all() for m in memberships]):
+                        var._remove = True
+                        continue
+
                 var.description = str(var.description)
                 for recv, resp in item_description.send(sender=event, item=item, variation=var):
                     if resp:
@@ -338,10 +359,10 @@ def get_grouped_items(event, subevent=None, voucher=None, channel='web', require
             item.available_variations = [
                 v for v in item.available_variations if v._subevent_quotas and (
                     not voucher or not voucher.quota_id or v in restrict_vars
-                )
+                ) and not getattr(v, '_remove', False)
             ]
 
-            if event.settings.hide_sold_out:
+            if not (ignore_hide_sold_out_for_item_ids and item.pk in ignore_hide_sold_out_for_item_ids) and event.settings.hide_sold_out:
                 item.available_variations = [v for v in item.available_variations
                                              if v.cached_availability[0] >= Quota.AVAILABILITY_RESERVED]
 
@@ -371,6 +392,20 @@ class EventIndex(EventViewMixin, EventListMixin, CartMixin, TemplateView):
     template_name = "pretixpresale/event/index.html"
 
     def get(self, request, *args, **kwargs):
+        # redirect old month-year-URLs to new date-URLs
+        keys = ("month", "year")
+        if all(k in request.GET for k in keys):
+            get_params = {k: v for k, v in request.GET.items() if k not in keys}
+            get_params["date"] = "%s-%s" % (request.GET.get("year"), request.GET.get("month"))
+            return redirect(self.request.path + "?" + urlencode(get_params))
+
+        # redirect old week-year-URLs to new date-URLs
+        keys = ("week", "year")
+        if all(k in request.GET for k in keys):
+            get_params = {k: v for k, v in request.GET.items() if k not in keys}
+            get_params["date"] = "%s-W%s" % (request.GET.get("year"), request.GET.get("week"))
+            return redirect(self.request.path + "?" + urlencode(get_params))
+
         from pretix.presale.views.cart import get_or_create_cart_id
 
         self.subevent = None
@@ -439,7 +474,13 @@ class EventIndex(EventViewMixin, EventListMixin, CartMixin, TemplateView):
                 filter_items=self.request.GET.getlist('item'),
                 filter_categories=self.request.GET.getlist('category'),
                 require_seat=None,
-                channel=self.request.sales_channel.identifier
+                channel=self.request.sales_channel.identifier,
+                memberships=(
+                    self.request.customer.usable_memberships(
+                        for_event=self.subevent or self.request.event,
+                        testmode=self.request.event.testmode
+                    ) if getattr(self.request, 'customer', None) else None
+                ),
             )
 
             context['waitinglist_seated'] = False
@@ -546,9 +587,14 @@ class EventIndex(EventViewMixin, EventListMixin, CartMixin, TemplateView):
                 voucher,
             )
 
-            context['show_names'] = ebd.get('_subevents_different_names', False) or sum(
-                len(i) for i in ebd.values() if isinstance(i, list)
-            ) < 2
+            # Hide names of subevents in event series where it is always the same.  No need to show the name of the museum thousands of times
+            # in the calendar. We previously only looked at the current time range for this condition which caused weird side-effects, so we need
+            # an extra query to look at the entire series. For performance reasons, we have a limit on how many different names we look at.
+            context['show_names'] = sum(len(i) for i in ebd.values() if isinstance(i, list)) < 2 or self.request.event.cache.get_or_set(
+                'has_different_subevent_names',
+                lambda: len(set(str(n) for n in self.request.event.subevents.order_by().values_list('name', flat=True).annotate(c=Count('*'))[:250])) != 1,
+                timeout=120,
+            )
             context['weeks'] = weeks_for_template(ebd, self.year, self.month)
             context['months'] = [date(self.year, i + 1, 1) for i in range(12)]
             context['years'] = range(now().year - 2, now().year + 3)
@@ -575,18 +621,29 @@ class EventIndex(EventViewMixin, EventListMixin, CartMixin, TemplateView):
                 voucher,
             )
 
-            context['show_names'] = ebd.get('_subevents_different_names', False) or sum(
-                len(i) for i in ebd.values() if isinstance(i, list)
-            ) < 2
+            # Hide names of subevents in event series where it is always the same.  No need to show the name of the museum thousands of times
+            # in the calendar. We previously only looked at the current time range for this condition which caused weird side-effects, so we need
+            # an extra query to look at the entire series. For performance reasons, we have a limit on how many different names we look at.
+            context['show_names'] = sum(len(i) for i in ebd.values() if isinstance(i, list)) < 2 or self.request.event.cache.get_or_set(
+                'has_different_subevent_names',
+                lambda: len(set(str(n) for n in self.request.event.subevents.order_by().values_list('name', flat=True).annotate(c=Count('*'))[:250])) != 1,
+                timeout=120,
+            )
             context['days'] = days_for_template(ebd, week)
-            context['weeks'] = [
-                (date_fromisocalendar(self.year, i + 1, 1), date_fromisocalendar(self.year, i + 1, 7))
-                for i in range(53 if date(self.year, 12, 31).isocalendar()[1] == 53 else 52)
-            ]
-            context['years'] = range(now().year - 2, now().year + 3)
+            years = (self.year - 1, self.year, self.year + 1)
+            weeks = []
+            for year in years:
+                weeks += [
+                    (date_fromisocalendar(year, i + 1, 1), date_fromisocalendar(year, i + 1, 7))
+                    for i in range(53 if date(year, 12, 31).isocalendar()[1] == 53 else 52)
+                ]
+            context['weeks'] = [[w for w in weeks if w[0].year == year] for year in years]
             context['week_format'] = get_format('WEEK_FORMAT')
             if context['week_format'] == 'WEEK_FORMAT':
                 context['week_format'] = WEEK_FORMAT
+            context['short_month_day_format'] = get_format('SHORT_MONTH_DAY_FORMAT')
+            if context['short_month_day_format'] == 'SHORT_MONTH_DAY_FORMAT':
+                context['short_month_day_format'] = SHORT_MONTH_DAY_FORMAT
         else:
             context['subevent_list'] = self.request.event.subevents_sorted(
                 filter_qs_by_attr(self.request.event.subevents_annotated(self.request.sales_channel.identifier).using(settings.DATABASE_REPLICA), self.request)
@@ -643,6 +700,22 @@ class SeatingPlanView(EventViewMixin, TemplateView):
                                                 kwargs={'cart_namespace': kwargs.get('cart_namespace') or ''})
         if context['cart_redirect'].startswith('https:'):
             context['cart_redirect'] = '/' + context['cart_redirect'].split('/', 3)[3]
+
+        v = self.request.GET.get('voucher')
+        if v:
+            v = v.strip()
+            try:
+                voucher = self.request.event.vouchers.get(code__iexact=v)
+                if voucher.redeemed >= voucher.max_usages or voucher.valid_until is not None \
+                        and voucher.valid_until < now() or voucher.item is not None \
+                        and voucher.item.is_available() is False:
+                    voucher = None
+            except Voucher.DoesNotExist:
+                voucher = None
+        else:
+            voucher = None
+        context['voucher'] = voucher
+
         return context
 
 
@@ -662,7 +735,7 @@ class EventIcalDownload(EventViewMixin, View):
                 raise Http404(pgettext_lazy('subevent', 'Unknown date selected.'))
 
         event = self.request.event
-        cal = get_ical([subevent or event])
+        cal = get_public_ical([subevent or event])
 
         resp = HttpResponse(cal.serialize(), content_type='text/calendar')
         resp['Content-Disposition'] = 'attachment; filename="{}-{}-{}.ics"'.format(

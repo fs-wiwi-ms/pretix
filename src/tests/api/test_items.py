@@ -288,6 +288,7 @@ TEST_ITEM_RES = {
         "day": "Tuesday"
     },
     "require_membership": False,
+    "require_membership_hidden": False,
     "require_membership_types": [],
     "grant_membership_type": None,
     "grant_membership_duration_like_event": True,
@@ -375,7 +376,9 @@ def test_item_detail_variations(token_client, organizer, event, team, item):
         "active": True,
         "description": None,
         "position": 0,
+        "require_approval": False,
         "require_membership": False,
+        "require_membership_hidden": False,
         "require_membership_types": [],
         "sales_channels": list(get_all_sales_channels().keys()),
         "available_from": None,
@@ -431,7 +434,7 @@ def test_item_detail_bundles(token_client, organizer, event, team, item, categor
 
 
 @pytest.mark.django_db
-def test_item_create(token_client, organizer, event, item, category, taxrule):
+def test_item_create(token_client, organizer, event, item, category, taxrule, membership_type):
     resp = token_client.post(
         '/api/v1/organizers/{}/events/{}/items/'.format(organizer.slug, event.slug),
         {
@@ -459,6 +462,7 @@ def test_item_create(token_client, organizer, event, item, category, taxrule):
             "max_per_order": None,
             "checkin_attention": False,
             "has_variations": True,
+            "require_membership_types": [membership_type.pk],
             "meta_data": {
                 "day": "Wednesday"
             }
@@ -469,6 +473,7 @@ def test_item_create(token_client, organizer, event, item, category, taxrule):
     with scopes_disabled():
         assert Item.objects.get(pk=resp.data['id']).sales_channels == ["web", "pretixpos"]
         assert Item.objects.get(pk=resp.data['id']).meta_data == {'day': 'Wednesday'}
+        assert Item.objects.get(pk=resp.data['id']).require_membership_types.count() == 1
 
 
 @pytest.mark.django_db
@@ -506,7 +511,9 @@ def test_item_create_with_variation(token_client, organizer, event, item, catego
                         "en": "Comment"
                     },
                     "active": True,
+                    "require_approval": True,
                     "require_membership": False,
+                    "require_membership_hidden": False,
                     "require_membership_types": [],
                     "description": None,
                     "position": 0,
@@ -522,6 +529,7 @@ def test_item_create_with_variation(token_client, organizer, event, item, catego
         new_item = Item.objects.get(pk=resp.data['id'])
         assert new_item.variations.first().value.localize('de') == "Kommentar"
         assert new_item.variations.first().value.localize('en') == "Comment"
+        assert new_item.variations.first().require_approval is True
         assert set(new_item.variations.first().sales_channels) == set(get_all_sales_channels().keys())
 
 
@@ -1209,7 +1217,9 @@ TEST_VARIATIONS_RES = {
     "position": 0,
     "default_price": None,
     "price": "23.00",
+    "require_approval": False,
     "require_membership": False,
+    "require_membership_hidden": False,
     "require_membership_types": [],
     "sales_channels": list(get_all_sales_channels().keys()),
     "available_from": None,
@@ -1226,7 +1236,9 @@ TEST_VARIATIONS_UPDATE = {
     "description": None,
     "position": 1,
     "default_price": "20.0",
+    "require_approval": False,
     "require_membership": False,
+    "require_membership_hidden": False,
     "require_membership_types": [],
     "sales_channels": ["web"],
     "available_from": None,

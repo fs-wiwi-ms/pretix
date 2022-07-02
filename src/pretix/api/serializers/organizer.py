@@ -71,8 +71,8 @@ class CustomerSerializer(I18nAwareModelSerializer):
 
     class Meta:
         model = Customer
-        fields = ('identifier', 'email', 'name', 'name_parts', 'is_active', 'is_verified', 'last_login', 'date_joined',
-                  'locale', 'last_modified')
+        fields = ('identifier', 'external_identifier', 'email', 'name', 'name_parts', 'is_active', 'is_verified', 'last_login', 'date_joined',
+                  'locale', 'last_modified', 'notes')
 
 
 class MembershipTypeSerializer(I18nAwareModelSerializer):
@@ -296,7 +296,14 @@ class OrganizerSettingsSerializer(SettingsSerializer):
         'theme_round_borders',
         'primary_font',
         'organizer_logo_image_inherit',
-        'organizer_logo_image'
+        'organizer_logo_image',
+        'privacy_url',
+        'cookie_consent',
+        'cookie_consent_dialog_title',
+        'cookie_consent_dialog_text',
+        'cookie_consent_dialog_text_secondary',
+        'cookie_consent_dialog_button_yes',
+        'cookie_consent_dialog_button_no',
     ]
 
     def __init__(self, *args, **kwargs):

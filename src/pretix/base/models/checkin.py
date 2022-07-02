@@ -188,6 +188,7 @@ class CheckinList(LoggedModel):
         # * in pretix.helpers.jsonlogic_boolalg
         # * in checkinrules.js
         # * in libpretixsync
+        # * in pretixscan-ios (in the future)
         top_level_operators = {
             '<', '<=', '>', '>=', '==', '!=', 'inList', 'isBefore', 'isAfter', 'or', 'and'
         }
@@ -195,7 +196,8 @@ class CheckinList(LoggedModel):
             'buildTime', 'objectList', 'lookup', 'var',
         }
         allowed_vars = {
-            'product', 'variation', 'now', 'entries_number', 'entries_today', 'entries_days'
+            'product', 'variation', 'now', 'now_isoweekday', 'entries_number', 'entries_today', 'entries_days',
+            'minutes_since_last_entry', 'minutes_since_first_entry',
         }
         if not rules or not isinstance(rules, dict):
             return rules
@@ -221,7 +223,7 @@ class CheckinList(LoggedModel):
             return rules
 
         if operator in ('or', 'and') and seen_nonbool:
-            raise ValidationError(f'You cannot use OR/AND logic on a level below a comparison operator.')
+            raise ValidationError('You cannot use OR/AND logic on a level below a comparison operator.')
 
         for v in values:
             cls.validate_rules(v, seen_nonbool=seen_nonbool or operator not in ('or', 'and'), depth=depth + 1)
@@ -324,7 +326,13 @@ class Checkin(models.Model):
     type = models.CharField(max_length=100, choices=CHECKIN_TYPES, default=TYPE_ENTRY)
 
     nonce = models.CharField(max_length=190, null=True, blank=True)
+
+    # Whether or not the scan was made offline
+    force_sent = models.BooleanField(default=False, null=True, blank=True)
+
+    # Whether the scan was made offline AND would have not been possible online
     forced = models.BooleanField(default=False)
+
     device = models.ForeignKey(
         'pretixbase.Device', related_name='checkins', on_delete=models.PROTECT, null=True, blank=True
     )

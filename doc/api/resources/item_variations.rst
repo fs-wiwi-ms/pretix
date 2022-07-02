@@ -24,7 +24,12 @@ active                                boolean                    If ``false``, t
 description                           multi-lingual string       A public description of the variation. May contain
                                                                  Markdown syntax or can be ``null``.
 position                              integer                    An integer, used for sorting
+require_approval                      boolean                    If ``true``, orders with this variation will need to be
+                                                                 approved by the event organizer before they can be
+                                                                 paid.
 require_membership                    boolean                    If ``true``, booking this variation requires an active membership.
+require_membership_hidden             boolean                    If ``true`` and ``require_membership`` is set, this variation will
+                                                                 be hidden from users without a valid membership.
 require_membership_types              list of integers           Internal IDs of membership types valid if ``require_membership`` is ``true``
 sales_channels                        list of strings            Sales channels this variation is available on, such as
                                                                  ``"web"`` or ``"resellers"``. Defaults to all existing sales channels.
@@ -74,7 +79,9 @@ Endpoints
               "en": "S"
             },
             "active": true,
+            "require_approval": false,
             "require_membership": false,
+            "require_membership_hidden": false,
             "require_membership_types": [],
             "sales_channels": ["web"],
             "available_from": null,
@@ -94,7 +101,9 @@ Endpoints
               "en": "L"
             },
             "active": true,
+            "require_approval": false,
             "require_membership": false,
+            "require_membership_hidden": false,
             "require_membership_types": [],
             "description": {},
             "position": 1,
@@ -143,7 +152,9 @@ Endpoints
         "price": "10.00",
         "original_price": null,
         "active": true,
+        "require_approval": false,
         "require_membership": false,
+        "require_membership_hidden": false,
         "require_membership_types": [],
         "sales_channels": ["web"],
         "available_from": null,
@@ -178,7 +189,9 @@ Endpoints
         "value": {"en": "Student"},
         "default_price": "10.00",
         "active": true,
+        "require_approval": false,
         "require_membership": false,
+        "require_membership_hidden": false,
         "require_membership_types": [],
         "sales_channels": ["web"],
         "available_from": null,
@@ -203,7 +216,9 @@ Endpoints
         "price": "10.00",
         "original_price": null,
         "active": true,
+        "require_approval": false,
         "require_membership": false,
+        "require_membership_hidden": false,
         "require_membership_types": [],
         "sales_channels": ["web"],
         "available_from": null,
@@ -259,7 +274,9 @@ Endpoints
         "price": "10.00",
         "original_price": null,
         "active": false,
+        "require_approval": false,
         "require_membership": false,
+        "require_membership_hidden": false,
         "require_membership_types": [],
         "sales_channels": ["web"],
         "available_from": null,

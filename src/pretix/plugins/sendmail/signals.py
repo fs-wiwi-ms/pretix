@@ -63,7 +63,7 @@ def scheduled_mail_create(sender, **kwargs):
         existing_rules = ScheduledMail.objects.filter(subevent=subevent).values_list('rule_id', flat=True)
         to_create = []
         for rule in event.sendmail_rules.all():
-            if rule.pk not in existing_rules:
+            if rule.pk not in existing_rules and subevent:
                 sm = ScheduledMail(rule=rule, event=event, subevent=subevent)
                 sm.recompute()
                 to_create.append(sm)
@@ -119,6 +119,8 @@ def pretixcontrol_logentry_display(sender, logentry, **kwargs):
         'pretix.plugins.sendmail.sent': _('Email was sent'),
         'pretix.plugins.sendmail.order.email.sent': _('The order received a mass email.'),
         'pretix.plugins.sendmail.order.email.sent.attendee': _('A ticket holder of this order received a mass email.'),
+        'pretix.plugins.sendmail.rule.added': _('An email rule was created'),
+        'pretix.plugins.sendmail.rule.changed': _('An email rule was updated'),
         'pretix.plugins.sendmail.rule.order.email.sent': _('A scheduled email was sent to the order'),
         'pretix.plugins.sendmail.rule.order.position.email.sent': _('A scheduled email was sent to a ticket holder'),
         'pretix.plugins.sendmail.rule.deleted': _('An email rule was deleted'),

@@ -32,6 +32,7 @@
             <h4>{{ checkResult.position.order }}-{{ checkResult.position.positionid }} {{ checkResult.position.attendee_name }}</h4>
             <strong v-if="checkResult.reason_explanation">{{ checkResult.reason_explanation }}<br></strong>
             <span>{{ checkResultItemvar }}</span><br>
+            <span v-if="checkResultSubevent">{{ checkResultSubevent }}<br></span>
             <span class="secret">{{ checkResult.position.secret }}</span>
             <span v-if="checkResult.position.seat"><br>{{ checkResult.position.seat.name }}</span>
           </div>
@@ -254,6 +255,13 @@ export default {
       const date = moment.utc(this.checkinlist.subevent.date_from).tz(this.$root.timezone).format(this.$root.datetime_format)
       return `${name} · ${date}`
     },
+    checkResultSubevent() {
+      if (!this.checkResult) return ''
+      if (!this.checkResult.position.subevent) return ''
+      const name = i18nstring_localize(this.checkResult.position.subevent.name)
+      const date = moment.utc(this.checkResult.position.subevent.date_from).tz(this.$root.timezone).format(this.$root.datetime_format)
+      return `${name} · ${date}`
+    },
     checkResultItemvar() {
       if (!this.checkResult) return ''
       if (this.checkResult.position.variation) {
@@ -331,7 +339,7 @@ export default {
         this.$refs.input.blur()
       })
 
-      fetch(this.$root.api.lists + this.checkinlist.id + '/positions/' + encodeURIComponent(id) + '/redeem/?expand=item&expand=variation', {
+      fetch(this.$root.api.lists + this.checkinlist.id + '/positions/' + encodeURIComponent(id) + '/redeem/?expand=item&expand=subevent&expand=variation', {
         method: 'POST',
         headers: {
           'X-CSRFToken': document.querySelector("input[name=csrfmiddlewaretoken]").value,
@@ -351,6 +359,9 @@ export default {
                 status: 'error',
                 reason: 'invalid',
               }
+            }
+            if (!response.ok && [401, 403].includes(response.status)) {
+              window.location.href = '/control/login?next=' + encodeURIComponent(window.location.pathname + window.location.search + window.location.hash);
             }
             if (!response.ok && response.status != 400) {
               throw new Error("HTTP status " + response.status);
@@ -440,7 +451,12 @@ export default {
 
       window.clearInterval(this.clearTimeout)
       fetch(this.$root.api.lists + this.checkinlist.id + '/positions/?ignore_status=true&expand=subevent&expand=item&expand=variation&check_rules=true&search=' + encodeURIComponent(this.query))
-          .then(response => response.json())
+          .then(response => {
+            if (!response.ok && [401, 403].includes(response.status)) {
+              window.location.href = '/control/login?next=' + encodeURIComponent(window.location.pathname + window.location.search + window.location.hash);
+            }
+            return response.json()
+          })
           .then(data => {
             this.searchLoading = false
             if (data.results) {

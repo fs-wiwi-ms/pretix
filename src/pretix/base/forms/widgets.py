@@ -42,6 +42,24 @@ from django.utils.timezone import get_current_timezone, now
 from django.utils.translation import gettext_lazy as _
 
 
+def replace_arabic_numbers(inp):
+    if not isinstance(inp, str):
+        return inp
+    table = {
+        1632: 48,  # 0
+        1633: 49,  # 1
+        1634: 50,  # 2
+        1635: 51,  # 3
+        1636: 52,  # 4
+        1637: 53,  # 5
+        1638: 54,  # 6
+        1639: 55,  # 7
+        1640: 56,  # 8
+        1641: 57,  # 9
+    }
+    return inp.translate(table)
+
+
 class DatePickerWidget(forms.DateInput):
     def __init__(self, attrs=None, date_format=None):
         attrs = attrs or {}
@@ -61,6 +79,10 @@ class DatePickerWidget(forms.DateInput):
         date_attrs['placeholder'] = lazy(placeholder, str)
 
         forms.DateInput.__init__(self, date_attrs, date_format)
+
+    def value_from_datadict(self, data, files, name):
+        v = super().value_from_datadict(data, files, name)
+        return replace_arabic_numbers(v)
 
 
 class TimePickerWidget(forms.TimeInput):
@@ -83,17 +105,13 @@ class TimePickerWidget(forms.TimeInput):
 
         forms.TimeInput.__init__(self, time_attrs, time_format)
 
+    def value_from_datadict(self, data, files, name):
+        v = super().value_from_datadict(data, files, name)
+        return replace_arabic_numbers(v)
+
 
 class UploadedFileWidget(forms.ClearableFileInput):
     def __init__(self, *args, **kwargs):
-        # Browsers can't recognize that the server already has a file uploaded
-        # Don't mark this input as being required if we already have an answer
-        # (this needs to be done via the attrs, otherwise we wouldn't get the "required" star on the field label)
-        attrs = kwargs.get('attrs', {})
-        if kwargs.get('required') and kwargs.get('initial'):
-            attrs.update({'required': None})
-        kwargs.update({'attrs': attrs})
-
         self.position = kwargs.pop('position')
         self.event = kwargs.pop('event')
         self.answer = kwargs.pop('answer')
@@ -124,6 +142,15 @@ class UploadedFileWidget(forms.ClearableFileInput):
                 return eventreverse(self.event, 'presale:event.cart.download.answer', kwargs={
                     'answer': self.answer.pk,
                 })
+
+    def get_context(self, name, value, attrs):
+        # Browsers can't recognize that the server already has a file uploaded
+        # Don't mark this input as being required if we already have an answer
+        # (this needs to be done via the attrs, otherwise we wouldn't get the "required" star on the field label)
+        ctx = super().get_context(name, value, attrs)
+        if ctx['widget']['is_initial']:
+            ctx['widget']['attrs']['required'] = False
+        return ctx
 
     def format_value(self, value):
         if self.is_initial(value):
@@ -177,6 +204,10 @@ class SplitDateTimePickerWidget(forms.SplitDateTimeWidget):
         )
         # Skip one hierarchy level
         forms.MultiWidget.__init__(self, widgets, attrs)
+
+    def value_from_datadict(self, data, files, name):
+        v = super().value_from_datadict(data, files, name)
+        return [replace_arabic_numbers(i) for i in v]
 
 
 class BusinessBooleanRadio(forms.RadioSelect):

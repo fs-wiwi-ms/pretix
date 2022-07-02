@@ -38,6 +38,7 @@ import i18nfield.forms
 from django import forms
 from django.forms.models import ModelFormMetaclass
 from django.utils.crypto import get_random_string
+from django.utils.translation import gettext_lazy as _
 from formtools.wizard.views import SessionWizardView
 from hierarkey.forms import HierarkeyForm
 
@@ -112,11 +113,41 @@ class SettingsForm(i18nfield.forms.I18nFormMixin, HierarkeyForm):
             if isinstance(f, (RelativeDateTimeField, RelativeDateField)):
                 f.set_event(self.obj)
 
-    def save(self):
+    def _unmask_secret_fields(self):
         for k, v in self.cleaned_data.items():
             if isinstance(self.fields.get(k), SecretKeySettingsField) and self.cleaned_data.get(k) == SECRET_REDACTED:
                 self.cleaned_data[k] = self.initial[k]
+
+    def save(self):
+        self._unmask_secret_fields()
         return super().save()
+
+    def clean(self):
+        d = super().clean()
+
+        # There is logic in HierarkeyForm.save() to only persist fields that changed. HierarkeyForm determines if
+        # something changed by comparing `self._s.get(name)` to `value`. This leaves an edge case open for multi-lingual
+        # text fields. On the very first load, the initial value in `self._s.get(name)` will be a LazyGettextProxy-based
+        # string. However, only some of the languages are usually visible, so even if the user does not change anything
+        # at all, it will be considered a changed value and stored. We do not want that, as it makes it very hard to add
+        # languages to an organizer/event later on. So we trick it and make sure nothing gets changed in that situation.
+        for name, field in self.fields.items():
+            if isinstance(field, SecretKeySettingsField) and d.get(name) == SECRET_REDACTED and not self.initial.get(name):
+                self.add_error(
+                    name,
+                    _('Due to technical reasons you cannot set inputs, that need to be masked (e.g. passwords), to %(value)s.') % {'value': SECRET_REDACTED}
+                )
+
+            if isinstance(field, i18nfield.forms.I18nFormField):
+                value = d.get(name)
+                if not value:
+                    continue
+
+                current = self._s.get(name, as_type=type(value))
+                if name not in self.changed_data:
+                    d[name] = current
+
+        return d
 
     def get_new_filename(self, name: str) -> str:
         from pretix.base.models import Event
@@ -165,10 +196,16 @@ class SecretKeySettingsWidget(forms.TextInput):
         attrs.update({
             'autocomplete': 'new-password'  # see https://bugs.chromium.org/p/chromium/issues/detail?id=370363#c7
         })
+        self.__reflect_value = False
         super().__init__(attrs)
 
+    def value_from_datadict(self, data, files, name):
+        value = super().value_from_datadict(data, files, name)
+        self.__reflect_value = value and value != SECRET_REDACTED
+        return value
+
     def get_context(self, name, value, attrs):
-        if value:
+        if value and not self.__reflect_value:
             value = SECRET_REDACTED
         return super().get_context(name, value, attrs)
 

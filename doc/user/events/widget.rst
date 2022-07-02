@@ -253,17 +253,20 @@ If you want, you can suppress us loading the widget and/or modify the user data 
 
 If you then later want to trigger loading the widgets, just call ``window.PretixWidget.buildWidgets()``.
 
-Waiting for the widget to load
-------------------------------
+Waiting for the widget to load or close
+---------------------------------------
 
-If you want to run custom JavaScript once the widget is fully loaded, you can register a callback function. Note that
-this function might be run multiple times, for example if you have multiple widgets on a page or if the user switches
-e.g. from an event list to an event detail view::
+If you want to run custom JavaScript once the widget is fully loaded or when it is closed, you can register callback
+functions. Note that these function might be run multiple times, for example if you have multiple widgets on a page
+or if the user switches e.g. from an event list to an event detail view::
 
     <script type="text/javascript">
     window.pretixWidgetCallback = function () {
         window.PretixWidget.addLoadListener(function () {
             console.log("Widget has loaded!");
+        });
+        window.PretixWidget.addCloseListener(function () {
+            console.log("Widget has been closed!");
         });
     }
     </script>
@@ -308,6 +311,10 @@ Currently, the following attributes are understood by pretix itself:
   only works for the order email address as well as the invoice address. Attendee-level fields and questions can
   always be modified. Note that this is not a security feature and can easily be overridden by users, so do not rely
   on this for authentication.
+
+* If ``data-consent="…"`` is given, the cookie consent mechanism will be initialized with consent for the given cookie
+  providers. All other providers will be disabled, no consent dialog will be shown. This is useful if you already
+  asked the user for consent and don't want them to be asked again. Example: ``data-consent="facebook,google_analytics"``
 
 Any configured pretix plugins might understand more data fields. For example, if the appropriate plugins on pretix
 Hosted or pretix Enterprise are active, you can pass the following fields:

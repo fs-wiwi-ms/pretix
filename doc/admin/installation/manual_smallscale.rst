@@ -34,9 +34,6 @@ Linux and firewalls, we recommend that you start with `ufw`_.
           SSL certificates can be obtained for free these days. We also *do not* provide support for HTTP-only
           installations except for evaluation purposes.
 
-.. warning:: We recommend **PostgreSQL**. If you go for MySQL, make sure you run **MySQL 5.7 or newer** or
-             **MariaDB 10.2.7 or newer**.
-
 Unix user
 ---------
 
@@ -49,6 +46,9 @@ In this guide, all code lines prepended with a ``#`` symbol are commands that yo
 
 Database
 --------
+
+.. warning:: **Please use PostgreSQL for all new installations**. If you need to go for MySQL, make sure you run
+             **MySQL 5.7 or newer** or **MariaDB 10.2.7 or newer**.
 
 Having the database server installed, we still need a database and a database user. We can create these with any kind
 of database managing tool or directly on our database's shell. Please make sure that UTF8 is used as encoding for the
@@ -64,6 +64,8 @@ For PostgreSQL database creation, we would do::
 When using MySQL, make sure you set the character set of the database to ``utf8mb4``, e.g. like this::
 
     mysql > CREATE DATABASE pretix DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE utf8mb4_unicode_ci;
+
+You will also need to make sure that ``sql_mode`` in your ``my.cnf`` file does **not** include ``ONLY_FULL_GROUP_BY``.
 
 Package dependencies
 --------------------
@@ -142,7 +144,7 @@ If you're running MySQL, also install the client library::
 
     (venv)$ pip3 install mysqlclient
 
-Note that you need Python 3.6 or newer. You can find out your Python version using ``python -V``.
+Note that you need Python 3.7 or newer. You can find out your Python version using ``python -V``.
 
 We also need to create a data directory::
 
@@ -259,14 +261,14 @@ The following snippet is an example on how to configure a nginx proxy for pretix
         }
 
         location /static/ {
-            alias /var/pretix/venv/lib/python3.7/site-packages/pretix/static.dist/;
+            alias /var/pretix/venv/lib/python3.10/site-packages/pretix/static.dist/;
             access_log off;
             expires 365d;
             add_header Cache-Control "public";
         }
     }
 
-.. note:: Remember to replace the ``python3.7`` in the ``/static/`` path in the config 
+.. note:: Remember to replace the ``python3.10`` in the ``/static/`` path in the config
           above with your python version.
 
 We recommend reading about setting `strong encryption settings`_ for your web server.
@@ -279,6 +281,8 @@ Yay, you are done! You should now be able to reach pretix at https://pretix.your
 create an event and start selling tickets!
 
 You should probably read :ref:`maintainance` next.
+
+.. _`manual_updates`:
 
 Updates
 -------
@@ -294,6 +298,7 @@ To upgrade to a new pretix release, pull the latest code changes and run the fol
     (venv)$ python -m pretix updatestyles
     # systemctl restart pretix-web pretix-worker
 
+Make sure to also read :ref:`update_notes` and the release notes of the version you are updating to.
 
 .. _`manual_plugininstall`:
 

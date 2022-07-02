@@ -681,7 +681,9 @@ var shared_iframe_fragment = (
     + '</div>'
     + '<div class="pretix-widget-frame-inner" ref="frame-container" v-show="$root.frame_shown">'
     + '<iframe frameborder="0" width="650px" height="650px" @load="iframeLoaded" '
-    + '        :name="$root.parent.widget_id" src="about:blank" v-once>'
+    + '        :name="$root.parent.widget_id" src="about:blank" v-once'
+    + '        allow="autoplay *; camera *; fullscreen *; payment *"'
+    + '        referrerpolicy="origin">'
     + 'Please enable frames in your browser!'
     + '</iframe>'
     + '<div class="pretix-widget-frame-close"><a href="#" @click.prevent="close">'
@@ -745,6 +747,7 @@ Vue.component('pretix-overlay', {
             this.$root.frame_shown = false;
             this.$root.parent.frame_dismissed = true;
             this.$root.parent.reload();
+            this.$root.parent.trigger_close_callback();
         },
         iframeLoaded: function () {
             if (this.$root.frame_loading) {
@@ -1366,6 +1369,13 @@ var shared_root_methods = {
             }
         });
     },
+    trigger_close_callback: function () {
+        this.$nextTick(function () {
+            for (var i = 0; i < window.PretixWidget._closed.length; i++) {
+                window.PretixWidget._closed[i]()
+            }
+        });
+    },
     reload: function () {
         var url;
         if (this.$root.is_button) {
@@ -1396,9 +1406,9 @@ var shared_root_methods = {
             url += "&cart_id=" + encodeURIComponent(cart_id);
         }
         if (this.$root.date !== null) {
-            url += "&year=" + this.$root.date.substr(0, 4) + "&month=" + this.$root.date.substr(5, 2);
+            url += "&date=" + this.$root.date.substr(0, 7);
         } else if (this.$root.week !== null) {
-            url += "&year=" + this.$root.week[0] + "&week=" + this.$root.week[1];
+            url += "&date=" + this.$root.week[0] + "-W" + this.$root.week[1];
         }
         if (this.$root.style !== null) {
             url = url + '&style=' + encodeURIComponent(this.$root.style);
@@ -1591,7 +1601,7 @@ var shared_root_computed = {
                     has_priced = true;
                 } else {
                     cnt_items++;
-                    has_priced = has_priced || item.price.gross != "0.00";
+                    has_priced = has_priced || item.price.gross != "0.00" || item.free_price;
                 }
             }
         }
@@ -1789,8 +1799,12 @@ var create_button = function (element) {
 widgetlist = [];
 buttonlist = [];
 window.PretixWidget._loaded = [];
+window.PretixWidget._closed = [];
 window.PretixWidget.addLoadListener = function (f) {
     window.PretixWidget._loaded.push(f);
+}
+window.PretixWidget.addCloseListener = function (f) {
+    window.PretixWidget._closed.push(f);
 }
 window.PretixWidget.buildWidgets = function () {
     document.createElement("pretix-widget");

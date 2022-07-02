@@ -637,7 +637,7 @@ class SubEventSerializer(I18nAwareModelSerializer):
 class TaxRuleSerializer(CountryFieldMixin, I18nAwareModelSerializer):
     class Meta:
         model = TaxRule
-        fields = ('id', 'name', 'rate', 'price_includes_tax', 'eu_reverse_charge', 'home_country')
+        fields = ('id', 'name', 'rate', 'price_includes_tax', 'eu_reverse_charge', 'home_country', 'internal_name', 'keep_gross_if_rate_changes')
 
 
 class EventSettingsSerializer(SettingsSerializer):
@@ -704,6 +704,7 @@ class EventSettingsSerializer(SettingsSerializer):
         'payment_term_accept_late',
         'payment_explanation',
         'payment_pending_hidden',
+        'mail_days_order_expire_warning',
         'ticket_download',
         'ticket_download_date',
         'ticket_download_addons',
@@ -712,7 +713,6 @@ class EventSettingsSerializer(SettingsSerializer):
         'ticket_download_require_validated_email',
         'ticket_secret_length',
         'mail_prefix',
-        'mail_from',
         'mail_from_name',
         'mail_attach_ical',
         'mail_attach_tickets',
@@ -733,6 +733,7 @@ class EventSettingsSerializer(SettingsSerializer):
         'invoice_numbers_prefix_cancellations',
         'invoice_numbers_counter_length',
         'invoice_attendee_name',
+        'invoice_event_location',
         'invoice_include_expire_date',
         'invoice_address_explanation_text',
         'invoice_email_attachment',
@@ -762,6 +763,7 @@ class EventSettingsSerializer(SettingsSerializer):
         'cancel_allow_user_paid_refund_as_giftcard',
         'cancel_allow_user_paid_require_approval',
         'change_allow_user_variation',
+        'change_allow_user_addons',
         'change_allow_user_until',
         'change_allow_user_price',
         'primary_color',

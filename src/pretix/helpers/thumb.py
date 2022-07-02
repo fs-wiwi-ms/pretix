@@ -25,8 +25,8 @@ from io import BytesIO
 
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
-from PIL import Image, ImageOps
-from PIL.Image import LANCZOS
+from PIL import Image, ImageOps, ImageSequence
+from PIL.Image import Resampling
 
 from pretix.helpers.models import Thumbnail
 
@@ -141,7 +141,7 @@ def resize_image(image, size):
     image = ImageOps.exif_transpose(image)
 
     new_size, crop = get_sizes(size, image.size)
-    image = image.resize(new_size, resample=LANCZOS)
+    image = image.resize(new_size, resample=Resampling.LANCZOS)
     if crop:
         image = image.crop(crop)
 
@@ -171,12 +171,23 @@ def create_thumbnail(sourcename, size):
     except:
         raise ThumbnailError('Could not load image')
 
-    image = resize_image(image, size)
+    frames = [resize_image(frame, size) for frame in ImageSequence.Iterator(image)]
+    image_out = frames[0]
+    save_kwargs = {}
 
-    if source.name.endswith('.jpg') or source.name.endswith('.jpeg'):
+    if source.name.lower().endswith('.jpg') or source.name.lower().endswith('.jpeg'):
         # Yields better file sizes for photos
         target_ext = 'jpeg'
         quality = 95
+    elif source.name.lower().endswith('.gif') or source.name.lower().endswith('.png'):
+        target_ext = source.name.lower()[-3:]
+        quality = None
+        image_out.info = image.info
+        save_kwargs = {
+            'append_images': frames[1:],
+            'loop': image.info.get('loop', 0),
+            'save_all': True,
+        }
     else:
         target_ext = 'png'
         quality = None
@@ -184,9 +195,11 @@ def create_thumbnail(sourcename, size):
     checksum = hashlib.md5(image.tobytes()).hexdigest()
     name = checksum + '.' + size.replace('^', 'c') + '.' + target_ext
     buffer = BytesIO()
-    if image.mode not in ("1", "L", "RGB", "RGBA"):
-        image = image.convert('RGB')
-    image.save(fp=buffer, format=target_ext.upper(), quality=quality)
+    if image_out.mode == "P" and source.name.lower().endswith('.png'):
+        image_out = image_out.convert('RGBA')
+    if image_out.mode not in ("1", "L", "RGB", "RGBA"):
+        image_out = image_out.convert('RGB')
+    image_out.save(fp=buffer, format=target_ext.upper(), quality=quality, **save_kwargs)
     imgfile = ContentFile(buffer.getvalue())
 
     t = Thumbnail.objects.create(source=sourcename, size=size)

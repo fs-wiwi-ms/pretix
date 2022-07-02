@@ -36,9 +36,6 @@ Linux and firewalls, we recommend that you start with `ufw`_.
           SSL certificates can be obtained for free these days. We also *do not* provide support for HTTP-only
           installations except for evaluation purposes.
 
-.. warning:: We recommend **PostgreSQL**. If you go for MySQL, make sure you run **MySQL 5.7 or newer** or
-             **MariaDB 10.2.7 or newer**.
-
 .. warning:: By default, using `ufw` in conjunction will not have any effect. Please make sure to either bind the exposed
              ports of your docker container explicitly to 127.0.0.1 or configure docker to respect any set up firewall
              rules.
@@ -60,6 +57,9 @@ directory writable to the user that runs pretix inside the docker container::
 
 Database
 --------
+
+.. warning:: **Please use PostgreSQL for all new installations**. If you need to go for MySQL, make sure you run
+             **MySQL 5.7 or newer** or **MariaDB 10.2.7 or newer**.
 
 Next, we need a database and a database user. We can create these with any kind of database managing tool or directly on
 our database's shell. Please make sure that UTF8 is used as encoding for the best compatibility. You can check this with
@@ -91,6 +91,8 @@ When using MySQL, make sure you set the character set of the database to ``utf8m
 
     mysql > CREATE DATABASE pretix DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE utf8mb4_unicode_ci;
 
+You will also need to make sure that ``sql_mode`` in your ``my.cnf`` file does **not** include ``ONLY_FULL_GROUP_BY``.
+
 Redis
 -----
 
@@ -105,6 +107,18 @@ recommend connecting to redis via a unix socket. To enable redis on unix sockets
 Now restart redis-server::
 
     # systemctl restart redis-server
+
+In this setup, systemd will delete ``/var/run/redis`` on every redis restart, which will cause issues with pretix. To
+prevent this, you can execute::
+
+   # systemctl edit redis-server
+
+And insert the following::
+
+    [Service]
+    # Keep the directory around so that pretix.service in docker does not need to be
+    # restarted when redis is restarted.
+    RuntimeDirectoryPreserve=yes
 
 .. warning:: Setting the socket permissions to 777 is a possible security problem. If you have untrusted users on your
              system or have high security requirements, please don't do this and let redis listen to a TCP socket
@@ -256,6 +270,8 @@ create an event and start selling tickets!
 
 You should probably read :ref:`maintainance` next.
 
+.. _`docker_updates`:
+
 Updates
 -------
 
@@ -270,6 +286,8 @@ Updates are fairly simple, but require at least a short downtime::
 Restarting the service can take a few seconds, especially if the update requires changes to the database.
 Replace ``stable`` above with a specific version number like ``1.0`` or with ``latest`` for the development
 version, if you want to.
+
+Make sure to also read :ref:`update_notes` and the release notes of the version you are updating to.
 
 .. _`docker_plugininstall`:
 

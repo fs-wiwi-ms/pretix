@@ -56,7 +56,7 @@ from django.views.generic import (
     CreateView, DeleteView, ListView, TemplateView, UpdateView, View,
 )
 
-from pretix.base.models import CartPosition, LogEntry, OrderPosition, Voucher
+from pretix.base.models import CartPosition, LogEntry, Voucher
 from pretix.base.models.vouchers import generate_codes
 from pretix.base.services.locking import NoLockManager
 from pretix.base.services.vouchers import vouchers_send
@@ -435,7 +435,9 @@ class VoucherBulkCreate(EventPermissionRequiredMixin, AsyncFormView):
         def process_batch(batch_vouchers, voucherids):
             Voucher.objects.bulk_create(batch_vouchers)
             if not connection.features.can_return_rows_from_bulk_insert:
-                batch_vouchers = list(self.request.event.vouchers.filter(code__in=[v.code for v in batch_vouchers]))
+                from_db = list(self.request.event.vouchers.filter(code__in=[v.code for v in batch_vouchers]))
+                batch_vouchers.clear()
+                batch_vouchers += from_db
 
             log_entries = []
             for v in batch_vouchers:
@@ -460,7 +462,7 @@ class VoucherBulkCreate(EventPermissionRequiredMixin, AsyncFormView):
 
             batch_vouchers = []
             for code in form.cleaned_data['codes']:
-                if len(batch_vouchers) > batch_size:
+                if len(batch_vouchers) >= batch_size:
                     process_batch(batch_vouchers, voucherids)
 
                 obj = modelcopy(form.instance, code=None)
@@ -548,7 +550,7 @@ class VoucherBulkAction(EventPermissionRequiredMixin, View):
             for obj in self.objects:
                 if obj.allow_delete():
                     obj.log_action('pretix.voucher.deleted', user=self.request.user)
-                    OrderPosition.objects.filter(addon_to__voucher=obj).delete()
+                    CartPosition.objects.filter(addon_to__voucher=obj).delete()
                     obj.cartposition_set.all().delete()
                     obj.delete()
                 else:

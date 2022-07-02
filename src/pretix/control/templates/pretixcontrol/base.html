@@ -1,7 +1,6 @@
 {% load compress %}
 {% load static %}
 {% load i18n %}
-{% load hijack_tags %}
 {% load statici18n %}
 {% load eventsignal %}
 {% load eventurl %}
@@ -59,7 +58,7 @@
             <script type="text/javascript" src="{% static "colorpicker/bootstrap-colorpicker.js" %}"></script>
             <script type="text/javascript" src="{% static "fileupload/jquery.ui.widget.js" %}"></script>
             <script type="text/javascript" src="{% static "fileupload/jquery.fileupload.js" %}"></script>
-            <script type="text/javascript" src="{% static "lightbox/js/lightbox.min.js" %}"></script>
+            <script type="text/javascript" src="{% static "lightbox/js/lightbox.js" %}"></script>
             <script type="text/javascript" src="{% static "are-you-sure/jquery.are-you-sure.js" %}"></script>
 		{% endcompress %}
         {{ html_head|safe }}
@@ -351,7 +350,7 @@
                     </ul>
                 </div>
             {% endif %}
-            {% if request|is_hijacked %}
+            {% if request.user.is_hijacked %}
                 <div class="impersonate-warning">
                     <span class="fa fa-user-secret"></span>
                     {% blocktrans with user=request.user%}You are currently working on behalf of {{ user }}.{% endblocktrans %}
@@ -426,6 +425,15 @@
                     {% if debug_warning %}
                         <div class="alert alert-danger">
                             {% trans "pretix is running in debug mode. For security reasons, please never run debug mode on a production instance." %}
+                        </div>
+                    {% endif %}
+
+                    {% if request.user.needs_password_change %}
+                        <div class="alert alert-warning">
+                            {% blocktrans trimmed %}
+                                For security reasons, please change your password before you continue. Afterwards you
+                                will be redirected to your original destination.
+                            {% endblocktrans %}
                         </div>
                     {% endif %}
 

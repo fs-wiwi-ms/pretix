@@ -688,6 +688,19 @@ def test_by_secret_special_chars(token_client, organizer, clist, event, order):
 
 
 @pytest.mark.django_db
+def test_by_secret_special_chars_space_fallback(token_client, organizer, clist, event, order):
+    with scopes_disabled():
+        p = order.positions.first()
+    p.secret = "foo bar"
+    p.save()
+    resp = token_client.post('/api/v1/organizers/{}/events/{}/checkinlists/{}/positions/{}/redeem/'.format(
+        organizer.slug, event.slug, clist.pk, "foo+bar"
+    ), {}, format='json')
+    assert resp.status_code == 201
+    assert resp.data['status'] == 'ok'
+
+
+@pytest.mark.django_db
 def test_only_once(token_client, organizer, clist, event, order):
     with scopes_disabled():
         p = order.positions.first()
@@ -788,6 +801,28 @@ def test_forced_multiple(token_client, organizer, clist, event, order):
     resp = token_client.post('/api/v1/organizers/{}/events/{}/checkinlists/{}/positions/{}/redeem/'.format(
         organizer.slug, event.slug, clist.pk, p.pk
     ), {'force': True}, format='json')
+    assert resp.status_code == 201
+    assert resp.data['status'] == 'ok'
+
+
+@pytest.mark.django_db
+def test_forced_flag_set_if_required(token_client, organizer, clist, event, order):
+    with scopes_disabled():
+        p = order.positions.first()
+    resp = token_client.post('/api/v1/organizers/{}/events/{}/checkinlists/{}/positions/{}/redeem/'.format(
+        organizer.slug, event.slug, clist.pk, p.pk
+    ), {'force': True}, format='json')
+    with scopes_disabled():
+        assert not p.checkins.order_by('pk').last().forced
+        assert p.checkins.order_by('pk').last().force_sent
+    assert resp.status_code == 201
+    assert resp.data['status'] == 'ok'
+    resp = token_client.post('/api/v1/organizers/{}/events/{}/checkinlists/{}/positions/{}/redeem/'.format(
+        organizer.slug, event.slug, clist.pk, p.pk
+    ), {'force': True}, format='json')
+    with scopes_disabled():
+        assert p.checkins.order_by('pk').last().forced
+        assert p.checkins.order_by('pk').last().force_sent
     assert resp.status_code == 201
     assert resp.data['status'] == 'ok'
 
@@ -1151,6 +1186,7 @@ def test_redeem_unknown_revoked_force(token_client, organizer, clist, event, ord
     assert resp.data["status"] == "ok"
     with scopes_disabled():
         assert Checkin.objects.last().forced
+        assert Checkin.objects.last().force_sent
 
 
 @pytest.mark.django_db

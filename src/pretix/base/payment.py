@@ -192,6 +192,15 @@ class BasePaymentProvider:
         return self.verbose_name
 
     @property
+    def confirm_button_name(self) -> str:
+        """
+        A label for the "confirm" button on the last page before a payment is started. This
+        is **not** used in the regular checkout flow, but only if the payment method is selected
+        for an existing order later on.
+        """
+        return _("Pay now")
+
+    @property
     def identifier(self) -> str:
         """
         A short and unique identifier for this payment provider.
@@ -946,6 +955,8 @@ class BoxOfficeProvider(BasePaymentProvider):
         return {
             "pos_id": payment.info_data.get('pos_id', None),
             "receipt_id": payment.info_data.get('receipt_id', None),
+            "payment_type": payment.info_data.get('payment_type', None),
+            "payment_data": payment.info_data.get('payment_data', {}),
         }
 
     def payment_control_render(self, request, payment) -> str:

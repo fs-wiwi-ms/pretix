@@ -25,6 +25,7 @@ from datetime import timedelta
 from decimal import Decimal
 from itertools import groupby
 from smtplib import SMTPResponseException
+from typing import TypeVar
 
 import css_inline
 from django.conf import settings
@@ -32,6 +33,7 @@ from django.core.mail.backends.smtp import EmailBackend
 from django.db.models import Count
 from django.dispatch import receiver
 from django.template.loader import get_template
+from django.utils.formats import date_format
 from django.utils.timezone import now
 from django.utils.translation import (
     get_language, gettext_lazy as _, pgettext_lazy,
@@ -49,23 +51,23 @@ from pretix.base.templatetags.rich_text import markdown_compile_email
 
 logger = logging.getLogger('pretix.base.email')
 
+T = TypeVar("T", bound=EmailBackend)
 
-class CustomSMTPBackend(EmailBackend):
 
-    def test(self, from_addr):
-        try:
-            self.open()
-            self.connection.ehlo_or_helo_if_needed()
-            (code, resp) = self.connection.mail(from_addr, [])
-            if code != 250:
-                logger.warn('Error testing mail settings, code %d, resp: %s' % (code, resp))
-                raise SMTPResponseException(code, resp)
-            (code, resp) = self.connection.rcpt('testdummy@pretix.eu')
-            if (code != 250) and (code != 251):
-                logger.warn('Error testing mail settings, code %d, resp: %s' % (code, resp))
-                raise SMTPResponseException(code, resp)
-        finally:
-            self.close()
+def test_custom_smtp_backend(backend: T, from_addr: str) -> None:
+    try:
+        backend.open()
+        backend.connection.ehlo_or_helo_if_needed()
+        (code, resp) = backend.connection.mail(from_addr, [])
+        if code != 250:
+            logger.warning('Error testing mail settings, code %d, resp: %s' % (code, resp))
+            raise SMTPResponseException(code, resp)
+        (code, resp) = backend.connection.rcpt('testdummy@pretix.eu')
+        if (code != 250) and (code != 251):
+            logger.warning('Error testing mail settings, code %d, resp: %s' % (code, resp))
+            raise SMTPResponseException(code, resp)
+    finally:
+        backend.close()
 
 
 class BaseHTMLMailRenderer:
@@ -163,9 +165,20 @@ class TemplateBasedMailRenderer(BaseHTMLMailRenderer):
                 has_addons=Count('addons')
             ))
             htmlctx['cart'] = [(k, list(v)) for k, v in groupby(
-                positions, key=lambda op: (
-                    op.item, op.variation, op.subevent, op.attendee_name,
-                    (op.pk if op.addon_to_id else None), (op.pk if op.has_addons else None)
+                sorted(
+                    positions,
+                    key=lambda op: (
+                        (op.addon_to.positionid if op.addon_to_id else op.positionid),
+                        op.positionid
+                    )
+                ),
+                key=lambda op: (
+                    op.item,
+                    op.variation,
+                    op.subevent,
+                    op.attendee_name,
+                    op.addon_to_id,
+                    (op.pk if op.has_addons else None)
                 )
             )]
 
@@ -297,7 +310,11 @@ def get_email_context(**kwargs):
             val = [val]
         for v in val:
             if all(rp in kwargs for rp in v.required_context):
-                ctx[v.identifier] = v.render(kwargs)
+                try:
+                    ctx[v.identifier] = v.render(kwargs)
+                except:
+                    ctx[v.identifier] = '(error)'
+                    logger.exception(f'Failed to process email placeholder {v.identifier}.')
     return ctx
 
 
@@ -451,6 +468,15 @@ def base_placeholders(sender, **kwargs):
                     'position': '123'
                 }
             ),
+        ),
+        SimpleFunctionalMailTextPlaceholder(
+            'event_location', ['event_or_subevent'], lambda event_or_subevent: str(event_or_subevent.location or ''),
+            lambda event: str(event.location or ''),
+        ),
+        SimpleFunctionalMailTextPlaceholder(
+            'event_admission_time', ['event_or_subevent'],
+            lambda event_or_subevent: date_format(event_or_subevent.date_admission, 'TIME_FORMAT') if event_or_subevent.date_admission else '',
+            lambda event: date_format(event.date_admission, 'TIME_FORMAT') if event.date_admission else '',
         ),
         SimpleFunctionalMailTextPlaceholder(
             'subevent', ['waiting_list_entry', 'event'],
@@ -619,6 +645,10 @@ def base_placeholders(sender, **kwargs):
     for k, v in sender.meta_data.items():
         ph.append(SimpleFunctionalMailTextPlaceholder(
             'meta_%s' % k, ['event'], lambda event, k=k: event.meta_data[k],
+            v
+        ))
+        ph.append(SimpleFunctionalMailTextPlaceholder(
+            'meta_%s' % k, ['event_or_subevent'], lambda event_or_subevent, k=k: event_or_subevent.meta_data[k],
             v
         ))
 

@@ -43,14 +43,14 @@ from django.contrib import messages
 from django.core.cache import caches
 from django.db.models import Q
 from django.http import FileResponse, Http404, JsonResponse
-from django.shortcuts import get_object_or_404, redirect
+from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import translation
 from django.utils.crypto import get_random_string
 from django.utils.decorators import method_decorator
 from django.utils.functional import cached_property
-from django.utils.http import is_safe_url
+from django.utils.http import is_safe_url, url_has_allowed_host_and_scheme
 from django.utils.timezone import now
-from django.utils.translation import gettext as _
+from django.utils.translation import gettext as _, pgettext
 from django.views.decorators.clickjacking import xframe_options_exempt
 from django.views.generic import TemplateView, View
 from django_scopes import scopes_disabled
@@ -343,31 +343,45 @@ def get_or_create_cart_id(request, create=True):
     if current_id and current_id in request.session.get('carts', {}):
         if current_id != orig_current_id:
             request.session[session_keyname] = current_id
-        return current_id
-    else:
-        cart_data = {}
-        if prefix and 'take_cart_id' in request.GET and current_id:
-            new_id = current_id
-            cached_widget_data = widget_data_cache.get('widget_data_{}'.format(current_id))
-            if cached_widget_data:
-                cart_data['widget_data'] = cached_widget_data
+
+        cart_invalidated = (
+            request.session['carts'][current_id].get('customer_cart_tied_to_login', False) and
+            request.session['carts'][current_id].get('customer') and
+            (not request.customer or request.session['carts'][current_id].get('customer') != request.customer.pk)
+        )
+
+        if cart_invalidated:
+            # This cart was created with a login but the person is now logged out.
+            # Destroy the cart for privacy protection.
+            request.session['carts'][current_id] = {}
         else:
-            if not create:
-                return None
-            new_id = generate_cart_id(request, prefix=prefix)
+            return current_id
 
-        if 'widget_data' not in cart_data and 'widget_data' in request.GET:
-            try:
-                cart_data['widget_data'] = json.loads(request.GET.get('widget_data'))
-            except ValueError:
-                pass
+    cart_data = {}
+    if prefix and 'take_cart_id' in request.GET and current_id:
+        new_id = current_id
+        cached_widget_data = widget_data_cache.get('widget_data_{}'.format(current_id))
+        if cached_widget_data:
+            cart_data['widget_data'] = cached_widget_data
+    else:
+        if not create:
+            return None
+        new_id = generate_cart_id(request, prefix=prefix)
 
-        if 'carts' not in request.session:
-            request.session['carts'] = {}
-        if new_id not in request.session['carts']:
-            request.session['carts'][new_id] = cart_data
-        request.session[session_keyname] = new_id
-        return new_id
+    if 'widget_data' not in cart_data and 'widget_data' in request.GET:
+        try:
+            cart_data['widget_data'] = json.loads(request.GET.get('widget_data'))
+        except ValueError:
+            pass
+
+    if 'carts' not in request.session:
+        request.session['carts'] = {}
+
+    if new_id not in request.session['carts']:
+        request.session['carts'][new_id] = cart_data
+
+    request.session[session_keyname] = new_id
+    return new_id
 
 
 def cart_session(request):
@@ -523,8 +537,18 @@ class RedeemView(NoSearchIndexViewMixin, EventViewMixin, CartMixin, TemplateView
         context['max_times'] = self.voucher.max_usages - self.voucher.redeemed
 
         # Fetch all items
-        items, display_add_to_cart = get_grouped_items(self.request.event, self.subevent,
-                                                       voucher=self.voucher, channel=self.request.sales_channel.identifier)
+        items, display_add_to_cart = get_grouped_items(
+            self.request.event,
+            self.subevent,
+            voucher=self.voucher,
+            channel=self.request.sales_channel.identifier,
+            memberships=(
+                self.request.customer.usable_memberships(
+                    for_event=self.subevent or self.request.event,
+                    testmode=self.request.event.testmode
+                ) if getattr(self.request, 'customer', None) else None
+            ),
+        )
 
         # Calculate how many options the user still has. If there is only one option, we can
         # check the box right away ;)
@@ -596,7 +620,7 @@ class RedeemView(NoSearchIndexViewMixin, EventViewMixin, CartMixin, TemplateView
                 else:
                     err = error_messages['voucher_invalid']
         else:
-            return redirect(self.get_index_url())
+            return render(request, 'pretixpresale/event/voucher_form.html')
 
         if request.event.presale_start and now() < request.event.presale_start:
             err = error_messages['not_started']
@@ -606,8 +630,11 @@ class RedeemView(NoSearchIndexViewMixin, EventViewMixin, CartMixin, TemplateView
         self.subevent = None
         if request.event.has_subevents:
             if request.GET.get('subevent'):
-                self.subevent = get_object_or_404(SubEvent, event=request.event, pk=request.GET.get('subevent'),
-                                                  active=True)
+                try:
+                    subevent_pk = int(request.GET.get('subevent'))
+                    self.subevent = request.event.subevents.get(pk=subevent_pk, active=True)
+                except (ValueError, SubEvent.DoesNotExist):
+                    raise Http404(pgettext('subevent', 'We were unable to find the specified date.'))
 
             if hasattr(self, 'voucher') and self.voucher.subevent:
                 self.subevent = self.voucher.subevent
@@ -620,9 +647,14 @@ class RedeemView(NoSearchIndexViewMixin, EventViewMixin, CartMixin, TemplateView
 
         if err:
             messages.error(request, _(err))
-            return redirect(self.get_index_url())
+            return redirect(self.get_next_url() + "?voucher_invalid")
 
         return super().dispatch(request, *args, **kwargs)
+
+    def get_next_url(self):
+        if "next" in self.request.GET and url_has_allowed_host_and_scheme(self.request.GET.get("next"), allowed_hosts=None):
+            return self.request.GET.get("next")
+        return self.get_index_url()
 
     def get(self, request, *args, **kwargs):
         if 'iframe' in request.GET and 'require_cookie' not in request.GET:
@@ -651,5 +683,5 @@ class AnswerDownload(EventViewMixin, View):
         resp['Content-Disposition'] = 'attachment; filename="{}-cart-{}"'.format(
             self.request.event.slug.upper(),
             os.path.basename(answer.file.name).split('.', 1)[1]
-        )
+        ).encode("ascii", "ignore")
         return resp

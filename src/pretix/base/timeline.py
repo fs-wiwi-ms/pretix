@@ -84,13 +84,17 @@ def timeline_for_event(event, subevent=None):
             edit_url=ev_edit_url
         ))
 
-    if ev.presale_end:
-        tl.append(TimelineEvent(
-            event=event, subevent=subevent,
-            datetime=ev.presale_end,
-            description=pgettext_lazy('timeline', 'End of ticket sales'),
-            edit_url=ev_edit_url
-        ))
+    tl.append(TimelineEvent(
+        event=event, subevent=subevent,
+        datetime=(
+            ev.presale_end or ev.date_to or ev.date_from.astimezone(ev.timezone).replace(hour=23, minute=59, second=59)
+        ),
+        description='{}{}'.format(
+            pgettext_lazy('timeline', 'End of ticket sales'),
+            f" ({pgettext_lazy('timeline', 'automatically because the event is over and no end of presale has been configured')})" if not ev.presale_end else ""
+        ),
+        edit_url=ev_edit_url
+    ))
 
     rd = event.settings.get('last_order_modification_date', as_type=RelativeDateWrapper)
     if rd:
@@ -216,6 +220,30 @@ def timeline_for_event(event, subevent=None):
                         'subevent': subevent.pk,
                     })
                 ))
+
+    for d in event.discounts.filter(Q(available_from__isnull=False) | Q(available_until__isnull=False)):
+        if d.available_from:
+            tl.append(TimelineEvent(
+                event=event, subevent=subevent,
+                datetime=d.available_from,
+                description=pgettext_lazy('timeline', 'Discount "{name}" becomes active').format(name=str(d)),
+                edit_url=reverse('control:event.items.discounts.edit', kwargs={
+                    'event': event.slug,
+                    'organizer': event.organizer.slug,
+                    'discount': d.pk,
+                })
+            ))
+        if d.available_until:
+            tl.append(TimelineEvent(
+                event=event, subevent=subevent,
+                datetime=d.available_until,
+                description=pgettext_lazy('timeline', 'Discount "{name}" becomes inactive').format(name=str(d)),
+                edit_url=reverse('control:event.items.discounts.edit', kwargs={
+                    'event': event.slug,
+                    'organizer': event.organizer.slug,
+                    'discount': d.pk,
+                })
+            ))
 
     for p in event.items.filter(Q(available_from__isnull=False) | Q(available_until__isnull=False)):
         if p.available_from:

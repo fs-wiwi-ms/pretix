@@ -41,8 +41,11 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
 from django.db.models import Prefetch, Q, prefetch_related_objects
-from django.forms import CheckboxSelectMultiple, formset_factory
+from django.forms import (
+    CheckboxSelectMultiple, formset_factory, inlineformset_factory,
+)
 from django.urls import reverse
+from django.utils.functional import cached_property
 from django.utils.html import escape
 from django.utils.safestring import mark_safe
 from django.utils.timezone import get_current_timezone_name
@@ -57,13 +60,13 @@ from pretix.base.channels import get_all_sales_channels
 from pretix.base.email import get_available_placeholders
 from pretix.base.forms import I18nModelForm, PlaceholderValidator, SettingsForm
 from pretix.base.models import Event, Organizer, TaxRule, Team
-from pretix.base.models.event import EventMetaValue, SubEvent
+from pretix.base.models.event import EventFooterLink, EventMetaValue, SubEvent
 from pretix.base.reldate import RelativeDateField, RelativeDateTimeField
 from pretix.base.settings import (
     PERSON_NAME_SCHEMES, PERSON_NAME_TITLE_GROUPS, validate_event_settings,
 )
 from pretix.control.forms import (
-    MultipleLanguagesWidget, SlugWidget, SMTPSettingsMixin, SplitDateTimeField,
+    MultipleLanguagesWidget, SlugWidget, SplitDateTimeField,
     SplitDateTimePickerWidget,
 )
 from pretix.control.forms.widgets import Select2
@@ -522,6 +525,7 @@ class EventSettingsForm(SettingsForm):
         'last_order_modification_date',
         'allow_modifications_after_checkin',
         'checkout_show_copy_answers_button',
+        'show_checkin_number_user',
         'primary_color',
         'theme_color_success',
         'theme_color_danger',
@@ -534,34 +538,39 @@ class EventSettingsForm(SettingsForm):
         'og_image',
     ]
 
+    def _resolve_virtual_keys_input(self, data, prefix=''):
+        # set all dependants of virtual_keys and
+        # delete all virtual_fields to prevent them from being saved
+        for virtual_key in self.virtual_keys:
+            if prefix + virtual_key not in data:
+                continue
+            base_key = prefix + virtual_key.rsplit('_', 2)[0]
+            asked_key = base_key + '_asked'
+            required_key = base_key + '_required'
+
+            if data[prefix + virtual_key] == 'optional':
+                data[asked_key] = True
+                data[required_key] = False
+            elif data[prefix + virtual_key] == 'required':
+                data[asked_key] = True
+                data[required_key] = True
+            # Explicitly check for 'do_not_ask'.
+            # Do not overwrite as default-behaviour when no value for virtual field is transmitted!
+            elif data[prefix + virtual_key] == 'do_not_ask':
+                data[asked_key] = False
+                data[required_key] = False
+
+            # hierarkey.forms cannot handle non-existent keys in cleaned_data => do not delete, but set to None
+            if not prefix:
+                data[virtual_key] = None
+        return data
+
     def clean(self):
         data = super().clean()
         settings_dict = self.event.settings.freeze()
         settings_dict.update(data)
 
-        # set all dependants of virtual_keys and
-        # delete all virtual_fields to prevent them from being saved
-        for virtual_key in self.virtual_keys:
-            if virtual_key not in data:
-                continue
-            base_key = virtual_key.rsplit('_', 2)[0]
-            asked_key = base_key + '_asked'
-            required_key = base_key + '_required'
-
-            if data[virtual_key] == 'optional':
-                data[asked_key] = True
-                data[required_key] = False
-            elif data[virtual_key] == 'required':
-                data[asked_key] = True
-                data[required_key] = True
-            # Explicitly check for 'do_not_ask'.
-            # Do not overwrite as default-behaviour when no value for virtual field is transmitted!
-            elif data[virtual_key] == 'do_not_ask':
-                data[asked_key] = False
-                data[required_key] = False
-
-            # hierarkey.forms cannot handle non-existent keys in cleaned_data => do not delete, but set to None
-            data[virtual_key] = None
+        data = self._resolve_virtual_keys_input(data)
 
         validate_event_settings(self.event, data)
         return data
@@ -621,6 +630,35 @@ class EventSettingsForm(SettingsForm):
             else:
                 self.initial[virtual_key] = 'do_not_ask'
 
+    @cached_property
+    def changed_data(self):
+        data = []
+
+        # We need to resolve the mapping between our "virtual" fields and the "real"fields here, otherwise
+        # they are detected as "changed" on every save even though they aren't.
+        in_data = self._resolve_virtual_keys_input(self.data.copy(), prefix=f'{self.prefix}-' if self.prefix else '')
+
+        for name, field in self.fields.items():
+            prefixed_name = self.add_prefix(name)
+            data_value = field.widget.value_from_datadict(in_data, self.files, prefixed_name)
+            if not field.show_hidden_initial:
+                # Use the BoundField's initial as this is the value passed to
+                # the widget.
+                initial_value = self[name].initial
+            else:
+                initial_prefixed_name = self.add_initial_prefix(name)
+                hidden_widget = field.hidden_widget()
+                try:
+                    initial_value = field.to_python(hidden_widget.value_from_datadict(
+                        self.data, self.files, initial_prefixed_name))
+                except ValidationError:
+                    # Always assume data has changed if validation fails.
+                    data.append(name)
+                    continue
+            if field.has_changed(initial_value, data_value):
+                data.append(name)
+        return data
+
 
 class CancelSettingsForm(SettingsForm):
     auto_fields = [
@@ -639,6 +677,7 @@ class CancelSettingsForm(SettingsForm):
         'change_allow_user_variation',
         'change_allow_user_price',
         'change_allow_user_until',
+        'change_allow_user_addons',
     ]
 
     def __init__(self, *args, **kwargs):
@@ -751,6 +790,7 @@ class InvoiceSettingsForm(SettingsForm):
         'invoice_reissue_after_modify',
         'invoice_generate',
         'invoice_attendee_name',
+        'invoice_event_location',
         'invoice_include_expire_date',
         'invoice_numbers_consecutive',
         'invoice_numbers_prefix',
@@ -828,13 +868,15 @@ def contains_web_channel_validate(val):
         raise ValidationError(_("The online shop must be selected to receive these emails."))
 
 
-class MailSettingsForm(SMTPSettingsMixin, SettingsForm):
+class MailSettingsForm(SettingsForm):
     auto_fields = [
         'mail_prefix',
-        'mail_from',
         'mail_from_name',
         'mail_attach_ical',
         'mail_attach_tickets',
+        'mail_attachment_new_order',
+        'mail_attach_ical_paid_only',
+        'mail_attach_ical_description',
     ]
 
     mail_sales_channel_placed_paid = forms.MultipleChoiceField(
@@ -1035,14 +1077,15 @@ class MailSettingsForm(SMTPSettingsMixin, SettingsForm):
         'mail_text_order_free': ['event', 'order'],
         'mail_text_order_free_attendee': ['event', 'order', 'position'],
         'mail_text_order_changed': ['event', 'order'],
-        'mail_text_order_canceled': ['event', 'order'],
+        'mail_text_order_canceled': ['event', 'order', 'comment'],
         'mail_text_order_expire_warning': ['event', 'order'],
         'mail_text_order_custom_mail': ['event', 'order'],
         'mail_text_download_reminder': ['event', 'order'],
         'mail_text_download_reminder_attendee': ['event', 'order', 'position'],
         'mail_text_resend_link': ['event', 'order'],
         'mail_text_waiting_list': ['event', 'waiting_list_entry'],
-        'mail_text_resend_all_links': ['event', 'orders']
+        'mail_text_resend_all_links': ['event', 'orders'],
+        'mail_attach_ical_description': ['event', 'event_or_subevent'],
     }
 
     def _set_field_placeholders(self, fn, base_parameters):
@@ -1177,6 +1220,7 @@ class TaxRuleLineForm(I18nForm):
             ('reverse', _('Reverse charge')),
             ('no', _('No VAT')),
             ('block', _('Sale not allowed')),
+            ('require_approval', _('Order requires approval')),
         ],
     )
     rate = forms.DecimalField(
@@ -1210,7 +1254,7 @@ TaxRuleLineFormSet = formset_factory(
 class TaxRuleForm(I18nModelForm):
     class Meta:
         model = TaxRule
-        fields = ['name', 'rate', 'price_includes_tax', 'eu_reverse_charge', 'home_country']
+        fields = ['name', 'rate', 'price_includes_tax', 'eu_reverse_charge', 'home_country', 'internal_name', 'keep_gross_if_rate_changes']
 
 
 class WidgetCodeForm(forms.Form):
@@ -1441,4 +1485,26 @@ ConfirmTextFormset = formset_factory(
     ConfirmTextForm,
     formset=BaseConfirmTextFormSet,
     can_order=True, can_delete=True, extra=0
+)
+
+
+class EventFooterLinkForm(I18nModelForm):
+    class Meta:
+        model = EventFooterLink
+        fields = ('label', 'url')
+
+
+class BaseEventFooterLinkFormSet(I18nFormSetMixin, forms.BaseInlineFormSet):
+    def __init__(self, *args, **kwargs):
+        event = kwargs.pop('event', None)
+        if event:
+            kwargs['locales'] = event.settings.get('locales')
+        super().__init__(*args, **kwargs)
+
+
+EventFooterLinkFormset = inlineformset_factory(
+    Event, EventFooterLink,
+    EventFooterLinkForm,
+    formset=BaseEventFooterLinkFormSet,
+    can_order=False, can_delete=True, extra=0
 )

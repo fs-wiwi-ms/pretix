@@ -395,7 +395,13 @@ class ClassicInvoiceRenderer(BaseReportlabInvoiceRenderer):
             return txt
 
         if not self.invoice.event.has_subevents and self.invoice.event.settings.show_dates_on_frontpage:
-            if self.invoice.event.settings.show_date_to and self.invoice.event.date_to:
+            tz = self.invoice.event.timezone
+            show_end_date = (
+                self.invoice.event.settings.show_date_to and
+                self.invoice.event.date_to and
+                self.invoice.event.date_to.astimezone(tz).date() != self.invoice.event.date_from.astimezone(tz).date()
+            )
+            if show_end_date:
                 p_str = (
                     shorten(self.invoice.event.name) + '\n' +
                     pgettext('invoice', '{from_date}\nuntil {to_date}').format(
@@ -504,7 +510,7 @@ class ClassicInvoiceRenderer(BaseReportlabInvoiceRenderer):
         return story
 
     def _get_story(self, doc):
-        has_taxes = any(il.tax_value for il in self.invoice.lines.all())
+        has_taxes = any(il.tax_value for il in self.invoice.lines.all()) or self.invoice.reverse_charge
 
         story = [
             NextPageTemplate('FirstPage'),
@@ -550,7 +556,10 @@ class ClassicInvoiceRenderer(BaseReportlabInvoiceRenderer):
         for line in self.invoice.lines.all():
             if has_taxes:
                 tdata.append((
-                    Paragraph(line.description, self.stylesheet['Normal']),
+                    Paragraph(
+                        bleach.clean(line.description, tags=['br']).strip().replace('<br>', '<br/>').replace('\n', '<br />\n'),
+                        self.stylesheet['Normal']
+                    ),
                     "1",
                     localize(line.tax_rate) + " %",
                     money_filter(line.net_value, self.invoice.event.currency),
@@ -558,7 +567,10 @@ class ClassicInvoiceRenderer(BaseReportlabInvoiceRenderer):
                 ))
             else:
                 tdata.append((
-                    Paragraph(line.description, self.stylesheet['Normal']),
+                    Paragraph(
+                        bleach.clean(line.description, tags=['br']).strip().replace('<br>', '<br/>').replace('\n', '<br />\n'),
+                        self.stylesheet['Normal']
+                    ),
                     "1",
                     money_filter(line.gross_value, self.invoice.event.currency),
                 ))
@@ -595,7 +607,7 @@ class ClassicInvoiceRenderer(BaseReportlabInvoiceRenderer):
         table.setStyle(TableStyle(tstyledata))
         story.append(table)
 
-        story.append(Spacer(1, 15 * mm))
+        story.append(Spacer(1, 10 * mm))
 
         if self.invoice.payment_provider_text:
             story.append(Paragraph(
@@ -611,12 +623,14 @@ class ClassicInvoiceRenderer(BaseReportlabInvoiceRenderer):
                 self.invoice.additional_text,
                 self.stylesheet['Normal']
             ))
-            story.append(Spacer(1, 15 * mm))
+            story.append(Spacer(1, 5 * mm))
 
         tstyledata = [
             ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
             ('LEFTPADDING', (0, 0), (0, -1), 0),
             ('RIGHTPADDING', (-1, 0), (-1, -1), 0),
+            ('TOPPADDING', (0, 0), (-1, -1), 1),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 1),
             ('FONTSIZE', (0, 0), (-1, -1), 8),
             ('FONTNAME', (0, 0), (-1, -1), self.font_regular),
         ]
