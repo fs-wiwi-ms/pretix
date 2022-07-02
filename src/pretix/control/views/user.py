@@ -226,6 +226,7 @@ class UserSettings(UpdateView):
         msgs = []
 
         if 'new_pw' in form.changed_data:
+            self.request.user.needs_password_change = False
             msgs.append(_('Your password has been changed.'))
 
         if 'email' in form.changed_data:
@@ -243,6 +244,8 @@ class UserSettings(UpdateView):
         return sup
 
     def get_success_url(self):
+        if "next" in self.request.GET and url_has_allowed_host_and_scheme(self.request.GET.get("next"), allowed_hosts=None):
+            return self.request.GET.get("next")
         return reverse('control:user.settings')
 
 
@@ -396,7 +399,8 @@ class User2FADeviceConfirmWebAuthnView(RecentAuthenticationRequiredMixin, Templa
             ukey,
             self.request.user.email,
             str(self.request.user),
-            settings.SITE_URL
+            settings.SITE_URL,
+            attestation="none"
         )
         ctx['jsondata'] = json.dumps(make_credential_options.registration_dict)
 

@@ -186,6 +186,14 @@ def get_event_navigation(request: HttpRequest):
                     }),
                     'active': 'event.items.questions' in url.url_name,
                 },
+                {
+                    'label': _('Discounts'),
+                    'url': reverse('control:event.items.discounts', kwargs={
+                        'event': request.event.slug,
+                        'organizer': request.event.organizer.slug,
+                    }),
+                    'active': 'event.items.discounts' in url.url_name,
+                },
             ]
         })
 
@@ -343,10 +351,24 @@ def get_global_navigation(request):
             'icon': 'group',
         },
         {
-            'label': _('Order search'),
+            'label': _('Search'),
             'url': reverse('control:search.orders'),
-            'active': 'search.orders' in url.url_name,
+            'active': False,
             'icon': 'search',
+            'children': [
+                {
+                    'label': _('Orders'),
+                    'url': reverse('control:search.orders'),
+                    'active': 'search.orders' in url.url_name,
+                    'icon': 'search',
+                },
+                {
+                    'label': _('Payments'),
+                    'url': reverse('control:search.payments'),
+                    'active': 'search.payments' in url.url_name,
+                    'icon': 'search',
+                },
+            ]
         },
         {
             'label': _('User settings'),

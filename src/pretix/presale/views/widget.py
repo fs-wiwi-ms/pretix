@@ -134,6 +134,7 @@ def generate_widget_js(lang):
         })
         i18n_js = template.render(context)
         i18n_js = i18n_js.replace('for (const ', 'for (var ')  # remove if we really want to break IE11 for good
+        i18n_js = i18n_js.replace(r"value.includes(", r"-1 != value.indexOf(")  # remove if we really want to break IE11 for good
         code.append(i18n_js)
 
         files = [
@@ -226,8 +227,17 @@ class WidgetAPIProductList(EventListMixin, View):
             qs = qs.filter(category__pk__in=self.request.GET.get('categories').split(","))
 
         items, display_add_to_cart = get_grouped_items(
-            self.request.event, subevent=self.subevent, voucher=self.voucher, channel=self.request.sales_channel.identifier,
-            base_qs=qs
+            self.request.event,
+            subevent=self.subevent,
+            voucher=self.voucher,
+            channel=self.request.sales_channel.identifier,
+            base_qs=qs,
+            memberships=(
+                self.request.customer.usable_memberships(
+                    for_event=self.subevent or self.request.event,
+                    testmode=self.request.event.testmode
+                ) if getattr(self.request, 'customer', None) else None
+            ),
         )
 
         grps = []

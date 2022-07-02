@@ -194,22 +194,31 @@ def webhook(request, *args, **kwargs):
     if event_json['data']['object']['object'] == "charge":
         func = charge_webhook
         objid = event_json['data']['object']['id']
+        lookup_ids = [
+            objid,
+            (event_json['data']['object'].get('source') or {}).get('id')
+        ]
     elif event_json['data']['object']['object'] == "dispute":
         func = charge_webhook
         objid = event_json['data']['object']['charge']
+        lookup_ids = [objid]
     elif event_json['data']['object']['object'] == "source":
         func = source_webhook
         objid = event_json['data']['object']['id']
+        lookup_ids = [objid]
     elif event_json['data']['object']['object'] == "payment_intent":
         func = paymentintent_webhook
         objid = event_json['data']['object']['id']
+        lookup_ids = [objid]
     else:
         return HttpResponse("Not interested in this data type", status=200)
 
-    try:
-        rso = ReferencedStripeObject.objects.select_related('order', 'order__event').get(reference=objid)
+    rso = ReferencedStripeObject.objects.select_related('order', 'order__event').filter(
+        reference__in=[lid for lid in lookup_ids if lid]
+    ).first()
+    if rso:
         return func(rso.order.event, event_json, objid, rso)
-    except ReferencedStripeObject.DoesNotExist:
+    else:
         if event_json['data']['object']['object'] == "charge" and 'payment_intent' in event_json['data']['object']:
             # If we receive a charge webhook *before* the payment intent webhook, we don't know the charge ID yet
             # and can't match it -- but we know the payment intent ID!
@@ -273,7 +282,9 @@ def charge_webhook(event, event_json, charge_id, rso):
         payment = None
 
     with transaction.atomic():
-        if not payment:
+        if payment:
+            payment = OrderPayment.objects.select_for_update().get(pk=payment.pk)
+        else:
             payment = order.payments.filter(
                 info__icontains=charge['id'],
                 provider__startswith='stripe',
@@ -367,12 +378,14 @@ def source_webhook(event, event_json, source_id, rso):
                 return HttpResponse('Order not found', status=200)
             payment = None
 
-        if not payment:
+        if payment:
+            payment = OrderPayment.objects.select_for_update().get(pk=payment.pk)
+        else:
             payment = order.payments.filter(
                 info__icontains=src['id'],
                 provider__startswith='stripe',
                 amount=prov._amount_to_decimal(src['amount']) if src['amount'] is not None else order.total,
-            ).last()
+            ).select_for_update().last()
         if not payment:
             payment = order.payments.create(
                 state=OrderPayment.PAYMENT_STATE_CREATED,
@@ -394,7 +407,6 @@ def source_webhook(event, event_json, source_id, rso):
                 prov._charge_source(None, source_id, payment)
             except PaymentException:
                 logger.exception('Webhook error')
-
         elif src.status == 'failed':
             payment.fail(info=str(src))
         elif src.status == 'canceled' and payment.state in (OrderPayment.PAYMENT_STATE_PENDING, OrderPayment.PAYMENT_STATE_CREATED):
@@ -462,13 +474,12 @@ class StripeOrderView:
                 raise Http404('')
             else:
                 raise Http404('')
+        self.payment = get_object_or_404(
+            self.order.payments,
+            pk=self.kwargs['payment'],
+            provider__startswith='stripe'
+        )
         return super().dispatch(request, *args, **kwargs)
-
-    @cached_property
-    def payment(self):
-        return get_object_or_404(self.order.payments,
-                                 pk=self.kwargs['payment'],
-                                 provider__startswith='stripe')
 
     @cached_property
     def pprov(self):
@@ -506,7 +517,7 @@ class ReturnView(StripeOrderView, View):
 
         with transaction.atomic():
             self.order.refresh_from_db()
-            self.payment.refresh_from_db()
+            self.payment = OrderPayment.objects.select_for_update().get(pk=self.payment.pk)
             if self.payment.state == OrderPayment.PAYMENT_STATE_CONFIRMED:
                 if 'payment_stripe_token' in request.session:
                     del request.session['payment_stripe_token']

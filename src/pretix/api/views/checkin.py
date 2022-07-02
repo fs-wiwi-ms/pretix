@@ -157,6 +157,7 @@ class CheckinListViewSet(viewsets.ModelViewSet):
             list=self.get_object(),
             successful=False,
             forced=True,
+            force_sent=True,
             device=self.request.auth if isinstance(self.request.auth, Device) else None,
             gate=self.request.auth.gate if isinstance(self.request.auth, Device) else None,
             **kwargs,
@@ -424,13 +425,20 @@ class CheckinListPositionViewSet(viewsets.ReadOnlyModelViewSet):
             forced=force,
         )
         raw_barcode_for_checkin = None
+        from_revoked_secret = False
 
         try:
             queryset = self.get_queryset(ignore_status=True, ignore_products=True)
             if self.kwargs['pk'].isnumeric():
                 op = queryset.get(Q(pk=self.kwargs['pk']) | Q(secret=self.kwargs['pk']))
             else:
-                op = queryset.get(secret=self.kwargs['pk'])
+                # In application/x-www-form-urlencoded, you can encodes space ' ' with '+' instead of '%20'.
+                # `id`, however, is part of a path where this technically is not allowed. Old versions of our
+                # scan apps still do it, so we try work around it!
+                try:
+                    op = queryset.get(secret=self.kwargs['pk'])
+                except OrderPosition.DoesNotExist:
+                    op = queryset.get(secret=self.kwargs['pk'].replace('+', ' '))
         except OrderPosition.DoesNotExist:
             revoked_matches = list(self.request.event.revoked_secrets.filter(secret=self.kwargs['pk']))
             if len(revoked_matches) == 0:
@@ -493,6 +501,7 @@ class CheckinListPositionViewSet(viewsets.ReadOnlyModelViewSet):
             elif revoked_matches and force:
                 op = revoked_matches[0].position
                 raw_barcode_for_checkin = self.kwargs['pk']
+                from_revoked_secret = True
             else:
                 op = revoked_matches[0].position
                 op.order.log_action('pretix.event.checkin.revoked', data={
@@ -544,7 +553,7 @@ class CheckinListPositionViewSet(viewsets.ReadOnlyModelViewSet):
                     auth=self.request.auth,
                     type=type,
                     raw_barcode=raw_barcode_for_checkin,
-                    from_revoked_secret=True,
+                    from_revoked_secret=from_revoked_secret,
                 )
             except RequiredQuestionsError as e:
                 return Response({

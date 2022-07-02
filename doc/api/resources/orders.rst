@@ -68,6 +68,7 @@ positions                             list of objects            List of order p
                                                                  non-canceled positions are included.
 fees                                  list of objects            List of fees included in the order total. By default, only
                                                                  non-canceled fees are included.
+├ id                                  integer                    Internal ID of the fee record
 ├ fee_type                            string                     Type of fee (currently ``payment``, ``passbook``,
                                                                  ``other``)
 ├ value                               money (string)             Fee amount
@@ -131,6 +132,14 @@ last_modified                         datetime                   Last modificati
 .. versionchanged:: 4.4
 
    The ``item`` and ``variation`` query parameters have been added.
+
+.. versionchanged:: 4.6
+
+   The ``subevent`` query parameters has been added.
+
+.. versionchanged:: 4.8
+
+   The ``order.fees.id`` attribute has been added.
 
 
 .. _order-position-resource:
@@ -433,6 +442,7 @@ List of all orders
        recommend using this in combination with ``testmode=false``, since test mode orders can vanish at any time and
        you will not notice it using this method.
    :query datetime created_since: Only return orders that have been created since the given date.
+   :query integer subevent: Only return orders with a position that contains this subevent ID. *Warning:* Result will also include orders if they contain mixed subevents, and it will even return orders where the subevent is only contained in a canceled position.
    :query datetime subevent_after: Only return orders that contain a ticket for a subevent taking place after the given date. This is an exclusive after, and it considers the **end** of the subevent (or its start, if the end is not set).
    :query datetime subevent_before: Only return orders that contain a ticket for a subevent taking place after the given date. This is an exclusive before, and it considers the **start** of the subevent.
    :query string exclude: Exclude a field from the output, e.g. ``fees`` or ``positions.downloads``. Can be used as a performance optimization. Can be passed multiple times.
@@ -599,13 +609,17 @@ Fetching individual orders
 Order ticket download
 ---------------------
 
+.. versionchanged:: 4.10
+
+   The API now supports ticket downloads for pending orders if allowed by the event settings.
+
 .. http:get:: /api/v1/organizers/(organizer)/events/(event)/orders/(code)/download/(output)/
 
    Download tickets for an order, identified by its order code. Depending on the chosen output, the response might
    be a ZIP file, PDF file or something else. The order details response contains a list of output options for this
    particular order.
 
-   Tickets can be only downloaded if the order is paid and if ticket downloads are active. Note that in some cases the
+   Tickets can only be downloaded if ticket downloads are active and – depending on event settings – the order is either paid or pending. Note that in some cases the
    ticket file might not yet have been created. In that case, you will receive a status code :http:statuscode:`409` and
    you are expected to retry the request after a short period of waiting.
 
@@ -730,6 +744,37 @@ Generating new secrets
    :statuscode 401: Authentication failure
    :statuscode 403: The requested organizer/event does not exist **or** you have no permission to update this order.
 
+.. http:post:: /api/v1/organizers/(organizer)/events/(event)/orderpositions/(id)/regenerate_secrets/
+
+   Triggers generation of a new ``secret`` attribute for a single order position.
+
+   **Example request**:
+
+   .. sourcecode:: http
+
+      POST /api/v1/organizers/bigevents/events/sampleconf/orderpositions/23/regenerate_secrets/ HTTP/1.1
+      Host: pretix.eu
+      Accept: application/json, text/javascript
+
+   **Example response**:
+
+   .. sourcecode:: http
+
+      HTTP/1.1 200 OK
+      Vary: Accept
+      Content-Type: application/json
+
+      (Full order position resource, see above.)
+
+   :param organizer: The ``slug`` field of the organizer of the event
+   :param event: The ``slug`` field of the event
+   :param code: The ``id`` field of the order position to update
+
+   :statuscode 200: no error
+   :statuscode 400: The order position could not be updated due to invalid submitted data.
+   :statuscode 401: Authentication failure
+   :statuscode 403: The requested organizer/event does not exist **or** you have no permission to update this order position.
+
 Deleting orders
 ---------------
 
@@ -834,6 +879,7 @@ Creating orders
    * ``comment`` (optional)
    * ``custom_followup_at`` (optional)
    * ``checkin_attention`` (optional)
+   * ``require_approval`` (optional)
    * ``invoice_address`` (optional)
 
       * ``company``
@@ -893,8 +939,9 @@ Creating orders
 
    * ``force`` (optional). If set to ``true``, quotas will be ignored.
    * ``send_email`` (optional). If set to ``true``, the same emails will be sent as for a regular order, regardless of
-     whether these emails are enabled for certain sales channels. Defaults to
-     ``false``. Used to be ``send_mail`` before pretix 3.14.
+     whether these emails are enabled for certain sales channels. If set to ``null``, behavior will be controlled by pretix'
+     settings based on the sales channels (added in pretix 4.7). Defaults to ``false``.
+     Used to be ``send_mail`` before pretix 3.14.
 
    If you want to use add-on products, you need to set the ``positionid`` fields of all positions manually
    to incrementing integers starting with ``1``. Then, you can reference one of these
@@ -1039,6 +1086,9 @@ Order state operations
    will instead stay paid, but all positions will be removed (or marked as canceled) and replaced by the cancellation
    fee as the only component of the order.
 
+   You can control whether the customer is notified through ``send_email`` (defaults to ``true``).
+   You can pass a ``comment`` that can be visible to the user if it is used in the email template.
+
    **Example request**:
 
    .. sourcecode:: http
@@ -1050,6 +1100,7 @@ Order state operations
 
       {
           "send_email": true,
+          "comment": "Event was canceled.",
           "cancellation_fee": null
       }
 
@@ -1588,6 +1639,10 @@ Fetching individual positions
 Order position ticket download
 ------------------------------
 
+.. versionchanged:: 4.10
+
+   The API now supports ticket downloads for pending orders if allowed by the event settings.
+
 .. http:get:: /api/v1/organizers/(organizer)/events/(event)/orderpositions/(id)/download/(output)/
 
    Download tickets for one order position, identified by its internal ID.
@@ -1599,7 +1654,7 @@ Order position ticket download
    The referenced URL can provide a download or a regular, human-viewable website - so it is advised to open this URL
    in a webbrowser and leave it up to the user to handle the result.
 
-   Tickets can be only downloaded if the order is paid and if ticket downloads are active. Also, depending on event
+   Tickets can only be downloaded if ticket downloads are active and – depending on event settings – the order is either paid or pending. Also, depending on event
    configuration downloads might be only unavailable for add-on products or non-admission products.
    Note that in some cases the ticket file might not yet have been created. In that case, you will receive a status
    code :http:statuscode:`409` and you are expected to retry the request after a short period of waiting.
@@ -1635,12 +1690,19 @@ Order position ticket download
    :statuscode 409: The file is not yet ready and will now be prepared. Retry the request after waiting for a few
                     seconds.
 
+.. _rest-orderpositions-manipulate:
+
 Manipulating individual positions
 ---------------------------------
 
 .. versionchanged:: 3.15
 
    The ``PATCH`` method has been added for individual positions.
+
+.. versionchanged:: 4.8
+
+   The ``PATCH`` method now supports changing items, variations, subevents, seats, prices, and tax rules.
+   The ``POST`` endpoint to add individual positions has been added.
 
 .. http:patch:: /api/v1/organizers/(organizer)/events/(event)/orderpositions/(id)/
 
@@ -1668,6 +1730,21 @@ Manipulating individual positions
      and ``option_identifiers`` will be ignored. As a special case, you can submit the magic value
      ``"file:keep"`` as the answer to a file question to keep the current value without re-uploading it.
 
+   * ``item``
+
+   * ``variation``
+
+   * ``subevent``
+
+   * ``seat`` (specified as a string mapping to a ``string_guid``)
+
+   * ``price``
+
+   * ``tax_rule``
+
+   Changing parameters such as ``item`` or ``price`` will **not** automatically trigger creation of a new invoice,
+   you need to take care of that yourself.
+
    **Example request**:
 
    .. sourcecode:: http
@@ -1689,7 +1766,7 @@ Manipulating individual positions
       Vary: Accept
       Content-Type: application/json
 
-      (Full order resource, see above.)
+      (Full order position resource, see above.)
 
    :param organizer: The ``slug`` field of the organizer of the event
    :param event: The ``slug`` field of the event
@@ -1700,9 +1777,83 @@ Manipulating individual positions
    :statuscode 401: Authentication failure
    :statuscode 403: The requested organizer/event does not exist **or** you have no permission to update this order.
 
+.. http:post:: /api/v1/organizers/(organizer)/events/(event)/orderpositions/
+
+   Adds a new position to an order. Currently, only the following fields are supported:
+
+   * ``order`` (mandatory, specified as a string mapping to a ``code``)
+
+   * ``addon_to`` (optional, specified as an integer mapping to the ``positionid`` of the parent position)
+
+   * ``item`` (mandatory)
+
+   * ``variation`` (mandatory depending on item)
+
+   * ``subevent`` (mandatory depending on event)
+
+   * ``seat`` (specified as a string mapping to a ``string_guid``, mandatory depending on event and item)
+
+   * ``price`` (default price will be used if unset)
+
+   * ``attendee_email``
+
+   * ``attendee_name_parts`` or ``attendee_name``
+
+   * ``company``
+
+   * ``street``
+
+   * ``zipcode``
+
+   * ``city``
+
+   * ``country``
+
+   * ``state``
+
+   * ``answers``: Validation is handled the same way as when creating orders through the API. You are therefore
+     expected to provide ``question``, ``answer``, and possibly ``options``. ``question_identifier``
+     and ``option_identifiers`` will be ignored. As a special case, you can submit the magic value
+     ``"file:keep"`` as the answer to a file question to keep the current value without re-uploading it.
+
+   This will **not** automatically trigger creation of a new invoice, you need to take care of that yourself.
+
+   **Example request**:
+
+   .. sourcecode:: http
+
+      POST /api/v1/organizers/bigevents/events/sampleconf/orderpositions/ HTTP/1.1
+      Host: pretix.eu
+      Accept: application/json, text/javascript
+      Content-Type: application/json
+
+      {
+        "order": "ABC12",
+        "item": 5,
+        "addon_to": 1
+      }
+
+   **Example response**:
+
+   .. sourcecode:: http
+
+      HTTP/1.1 201 Created
+      Vary: Accept
+      Content-Type: application/json
+
+      (Full order position resource, see above.)
+
+   :param organizer: The ``slug`` field of the organizer of the event
+   :param event: The ``slug`` field of the event
+
+   :statuscode 200: no error
+   :statuscode 400: The position could not be created due to invalid submitted data.
+   :statuscode 401: Authentication failure
+   :statuscode 403: The requested organizer/event does not exist **or** you have no permission to create this position.
+
 .. http:delete:: /api/v1/organizers/(organizer)/events/(event)/orderpositions/(id)/
 
-   Deletes an order position, identified by its internal ID.
+   Cancels an order position, identified by its internal ID.
 
    **Example request**:
 
@@ -1727,6 +1878,128 @@ Manipulating individual positions
    :statuscode 401: Authentication failure
    :statuscode 403: The requested organizer/event does not exist **or** you have no permission to view this resource.
    :statuscode 404: The requested order position does not exist.
+
+Changing order contents
+-----------------------
+
+While you can :ref:`change positions individually <rest-orderpositions-manipulate>` sometimes it is necessary to make
+multiple changes to an order at once within one transaction. This makes it possible to e.g. swap the seats of two
+attendees in an order without running into conflicts. This interface also offers some possibilities not available
+otherwise, such as splitting an order or changing fees.
+
+.. versionchanged:: 4.8
+
+   This endpoint has been added to the system.
+
+.. http:post:: /api/v1/organizers/(organizer)/events/(event)/orders/(code)/change/
+
+   Performs a change operation on an order. You can supply the following fields:
+
+   * ``patch_positions``: A list of objects with the two keys ``position`` specifying an order position ID and
+     ``body`` specifying the desired changed values of the position (``item``, ``variation``, ``subevent``, ``seat``,
+     ``price``, ``tax_rule``).
+
+   * ``cancel_positions``: A list of objects with the single key ``position`` specifying an order position ID.
+
+   * ``split_positions``: A list of objects with the single key ``position`` specifying an order position ID.
+
+   * ``create_positions``: A list of objects describing new order positions with the same fields supported as when
+     creating them individually through the ``POST …/orderpositions/`` endpoint.
+
+   * ``patch_fees``: A list of objects with the two keys ``fee`` specifying an order fee ID and
+     ``body`` specifying the desired changed values of the position (``value``).
+
+   * ``cancel_fees``: A list of objects with the single key ``fee`` specifying an order fee ID.
+
+   * ``recalculate_taxes``: If set to ``"keep_net"``, all taxes will be recalculated based on the tax rule and invoice
+     address, the net price will be kept. If set to ``"keep_gross"``, the gross price will be kept. If set to ``null``
+     (the default) the taxes are not recalculated.
+
+   * ``send_email``: If set to ``true``, the customer will be notified about the change. Defaults to ``false``.
+
+   * ``reissue_invoice``: If set to ``true`` and an invoice exists for the order, it will be canceled and a new invoice
+     will be issued. Defaults to ``true``.
+
+   **Example request**:
+
+   .. sourcecode:: http
+
+      POST /api/v1/organizers/bigevents/events/sampleconf/orders/ABC12/ HTTP/1.1
+      Host: pretix.eu
+      Accept: application/json, text/javascript
+      Content-Type: application/json
+
+      {
+        "cancel_positions": [
+          {
+            "position": 12373
+          }
+        ],
+        "patch_positions": [
+          {
+            "position": 12374,
+            "body": {
+              "item": 12,
+              "variation": None,
+              "subevent": 562,
+              "seat": "seat-guid-2",
+              "price": "99.99",
+              "tax_rule": 15
+            }
+          }
+        ],
+        "split_positions": [
+          {
+            "position": 12375
+          }
+        ],
+        "create_positions": [
+          {
+            "item": 12,
+            "variation": None,
+            "subevent": 562,
+            "seat": "seat-guid-2",
+            "price": "99.99",
+            "addon_to": 12374,
+            "attendee_name": "Peter",
+          }
+        ],
+        "cancel_fees": [
+          {
+            "fee": 49
+          }
+        ],
+        "change_fees": [
+          {
+            "fee": 51,
+            "body": {
+              "value": "12.00"
+            }
+          }
+        ],
+        "reissue_invoice": true,
+        "send_email": true,
+        "recalculate_taxes": "keep_gross"
+      }
+
+   **Example response**:
+
+   .. sourcecode:: http
+
+      HTTP/1.1 200 OK
+      Vary: Accept
+      Content-Type: application/json
+
+      (Full order position resource, see above.)
+
+   :param organizer: The ``slug`` field of the organizer of the event
+   :param event: The ``slug`` field of the event
+   :param code: The ``code`` field of the order to update
+
+   :statuscode 200: no error
+   :statuscode 400: The order could not be updated due to invalid submitted data.
+   :statuscode 401: Authentication failure
+   :statuscode 403: The requested organizer/event does not exist **or** you have no permission to update this order.
 
 
 Order payment endpoints

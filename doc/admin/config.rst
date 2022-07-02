@@ -65,6 +65,9 @@ Example::
     A comma-separated list of plugins that are not available even though they are installed.
     Defaults to an empty string.
 
+``plugins_show_meta``
+    Whether to show authors and versions of plugins, defaults to ``on``.
+
 ``auth_backends``
     A comma-separated list of available auth backends. Defaults to ``pretix.base.auth.NativeAuthBackend``.
 
@@ -220,12 +223,30 @@ Example::
 ``user``, ``password``
     The SMTP user data to use for the connection. Empty by default.
 
+``tls``, ``ssl``
+    Use STARTTLS or SSL for the SMTP connection. Off by default.
+
 ``from``
     The email address to set as ``From`` header in outgoing emails by the system.
     Default: ``pretix@localhost``
 
-``tls``, ``ssl``
-    Use STARTTLS or SSL for the SMTP connection. Off by default.
+``from_notifications``
+    The email address to set as ``From`` header in admin notification emails by the system.
+    Defaults to the value of ``from``.
+
+``from_organizers``
+    The email address to set as ``From`` header in outgoing emails by the system sent on behalf of organizers.
+    Defaults to the value of ``from``.
+
+``custom_sender_verification_required``
+    If this is on (the default), organizers need to verify email addresses they want to use as senders in their event.
+
+``custom_sender_spf_string``
+    If this is set to a valid SPF string, pretix will show a warning if organizers use a sender address from a domain
+    that does not include this value.
+
+``custom_smtp_allow_private_networks``
+    If this is off (the default), custom SMTP servers cannot be private network addresses.
 
 ``admins``
     Comma-separated list of email addresses that should receive a report about every error code 500 thrown by pretix.
@@ -282,7 +303,7 @@ You can use an existing memcached server as pretix's caching backend::
 ``location``
     The location of memcached, either a host:port combination or a socket file.
 
-If no memcached is configured, pretix will use Django's built-in local-memory caching method.
+If no memcached is configured, pretix will use redis for caching. If neither is configured, pretix will not use any caching.
 
 .. note:: If you use memcached and you deploy pretix across multiple servers, you should use *one*
           shared memcached instance, not multiple ones, because cache invalidations would not be
@@ -445,8 +466,10 @@ You can configure the maximum file size for uploading various files::
     max_size_image = 12
     ; Max upload size for favicons in MiB, defaults to 1 MiB
     max_size_favicon = 2
-    ; Max upload size for email attachments in MiB, defaults to 10 MiB
+    ; Max upload size for email attachments of manually sent emails in MiB, defaults to 10 MiB
     max_size_email_attachment = 15
+    ; Max upload size for email attachments of automatically sent emails in MiB, defaults to 1 MiB
+    max_size_email_auto_attachment = 2
     ; Max upload size for other files in MiB, defaults to 10 MiB
     ; This includes all file upload type order questions
     max_size_other = 100
