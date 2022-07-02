@@ -26,35 +26,14 @@
     {% else %}
         <h3>{% trans "Upcoming events" %}</h3>
     {% endif %}
-    <div>
-        <div class="btn-group" role="group">
-            <a href="?{% url_replace request "style" "list" "week" "" "year" "" "month" "" %}" type="button"
-                    class="btn btn-default active">
-                <span class="fa fa-list" aria-hidden="true"></span>
-                {% trans "List" %}
-            </a>
-            <a href="?{% url_replace request "style" "week" "month" "" "old" "" "page" "" %}" type="button"
-                    class="btn btn-default">
-                <span class="fa fa-calendar" aria-hidden="true"></span>
-                {% trans "Week" %}
-            </a>
-            <a href="?{% url_replace request "style" "calendar" "week" "" "old" "" "page" "" %}" type="button"
-                    class="btn btn-default">
-                <span class="fa fa-calendar" aria-hidden="true"></span>
-                {% trans "Month" %}
-            </a>
+    <div id="monthselform">
+        <div class="row">
+            <div class="col-md-12">
+                {% include "pretixpresale/fragment_calendar_nav.html" with date=date request=request style="list" %}
+            </div>
         </div>
-        <a href="{% eventurl request.organizer "presale:organizer.ical" %}?{% url_replace request "locale" request.LANGUAGE_CODE "page" "" "old" "" "week" "" "style" "" "month" "" "year" "" %}"
-                class="btn btn-default">
-            <span class="fa fa-calendar-plus-o" aria-hidden="true"></span>
-            {% trans "iCal" %}
-        </a>
-        {% if "old" in request.GET %}
-            <a href="?{% url_replace request "old" "" %}" class="btn btn-link">{% trans "Show upcoming" %}</a>
-        {% else %}
-            <a href="?{% url_replace request "old" "1" %}" class="btn btn-link">{% trans "Show past events" %}</a>
-        {% endif %}
     </div>
+    {% if events %}
     <div class="event-list">
         <div class="row hidden-xs hidden-sm">
             <div class="col-md-5">
@@ -81,7 +60,7 @@
                 <div class="col-md-3 col-xs-12">
 
                     {% if e.settings.show_dates_on_frontpage %}
-                        {{ e.daterange|default:e.get_date_range_display }}
+                        {{ e.daterange|default:e.get_date_range_display_as_html }}
                         {% if e.settings.show_times and not e.has_subevents %}
                             {% timezone e.tzname %}
                                 <br><small class="text-muted" data-time="{{ e.date_from.isoformat }}" data-timezone="{{ e.tzname }}">
@@ -139,17 +118,13 @@
                     </a>
                 </div>
             </div>
-        {% empty %}
-            {% if "old" in request.GET %}
-                <div class="col-md-12">
-                    <em>{% trans "No archived events found." %}</em>
-                </div>
-            {% else %}
-                <div class="col-md-12">
-                    <em>{% trans "No public upcoming events found." %}</em>
-                </div>
-            {% endif %}
         {% endfor %}
     </div>
+    {% endif %}
+    {% if "old" in request.GET %}
+        <p><em>{% if not events %}{% trans "No archived events found." %} {% endif %}<a href="?{% url_replace request "old" "" %}">{% trans "Show upcoming" %}</a></em></p>
+    {% else %}
+        <p><em>{% if not events %}{% trans "No public upcoming events found." %} {% endif %}<a href="?{% url_replace request "old" "1" %}">{% trans "Show past events" %}</a></em></p>
+    {% endif %}
     {% include "pretixpresale/pagination.html" %}
 {% endblock %}

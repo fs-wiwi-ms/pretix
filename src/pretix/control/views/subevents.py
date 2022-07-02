@@ -41,7 +41,7 @@ from django.contrib import messages
 from django.core.exceptions import ValidationError
 from django.core.files import File
 from django.db import connections, transaction
-from django.db.models import Count, F, Prefetch
+from django.db.models import Count, F, Prefetch, ProtectedError
 from django.db.models.functions import Coalesce, TruncDate, TruncTime
 from django.forms import inlineformset_factory
 from django.http import Http404, HttpResponse, HttpResponseRedirect
@@ -273,6 +273,7 @@ class SubEventEditorMixin(MetaDataEditorMixin):
                     'size': q.size,
                     'name': q.name,
                     'release_after_exit': q.release_after_exit,
+                    'ignore_for_event_availability': q.ignore_for_event_availability,
                     'itemvars': [str(i.pk) for i in q.items.all()] + [
                         '{}-{}'.format(v.item_id, v.pk) for v in q.variations.all()
                     ]
@@ -638,12 +639,14 @@ class SubEventBulkAction(SubEventQueryMixin, EventPermissionRequiredMixin, View)
             })
         elif request.POST.get('action') == 'delete_confirm':
             for obj in self.get_queryset():
-                if obj.allow_delete():
+                try:
+                    if not obj.allow_delete():
+                        raise ProtectedError('only deactivate', [obj])
                     CartPosition.objects.filter(addon_to__subevent=obj).delete()
                     obj.cartposition_set.all().delete()
                     obj.log_action('pretix.subevent.deleted', user=self.request.user)
                     obj.delete()
-                else:
+                except ProtectedError:
                     obj.log_action(
                         'pretix.subevent.changed', user=self.request.user, data={
                             'active': False
@@ -1469,7 +1472,7 @@ class SubEventBulkEdit(SubEventQueryMixin, EventPermissionRequiredMixin, FormVie
             form.is_valid() and
             self.quota_formset.is_valid() and
             (not self.list_formset or self.list_formset.is_valid()) and
-            all(f.is_valid() for f in self.itemvar_forms)and
+            all(f.is_valid() for f in self.itemvar_forms) and
             all(f.is_valid() for f in self.meta_forms)
         )
         if is_valid:

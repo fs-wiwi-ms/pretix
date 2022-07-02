@@ -938,7 +938,7 @@ def test_order_extend_expired_voucher_budget_ok(client, env):
         )
         p = o.positions.first()
         p.voucher = v
-        p.price_before_voucher = p.price
+        p.voucher_budget_use = Decimal('1.50')
         p.price -= Decimal('1.50')
         p.save()
 
@@ -969,7 +969,7 @@ def test_order_extend_expired_voucher_budget_fail(client, env):
         )
         p = o.positions.first()
         p.voucher = v
-        p.price_before_voucher = p.price
+        p.voucher_budget_use = Decimal('1.50')
         p.price -= Decimal('1.50')
         p.save()
 
@@ -1043,6 +1043,7 @@ def test_order_mark_paid_overpaid_expired(client, env):
         o.save()
         o.payments.create(state=OrderPayment.PAYMENT_STATE_CONFIRMED, amount=o.total * 2)
         assert o.pending_sum == -1 * o.total
+        assert o.payments.count() == 2
         q = Quota.objects.create(event=env[0], size=0)
         q.items.add(env[3])
 
@@ -1057,7 +1058,7 @@ def test_order_mark_paid_overpaid_expired(client, env):
     with scopes_disabled():
         o = Order.objects.get(id=env[2].id)
         assert o.status == Order.STATUS_PAID
-        assert o.payments.last().amount == 0
+        assert o.payments.count() == 2
         assert o.pending_sum == -1 * o.total
 
 
@@ -1977,7 +1978,7 @@ def test_refund_propose_lower_payment(client, env):
     }, follow=True)
     doc = BeautifulSoup(response.content.decode(), "lxml")
     assert doc.select("input[name=refund-{}]".format(p2.pk))[0]['value'] == '6.00'
-    assert doc.select("input[name=refund-manual]".format(p2.pk))[0]['value'] == '1.00'
+    assert doc.select("input[name=refund-manual]")[0]['value'] == '1.00'
 
 
 @pytest.mark.django_db
@@ -1998,7 +1999,7 @@ def test_refund_propose_equal_payment(client, env):
     }, follow=True)
     doc = BeautifulSoup(response.content.decode(), "lxml")
     assert doc.select("input[name=refund-{}]".format(p2.pk))[0]['value'] == '7.00'
-    assert not doc.select("input[name=refund-manual]".format(p2.pk))[0].get('value')
+    assert not doc.select("input[name=refund-manual]")[0].get('value')
 
 
 @pytest.mark.django_db
@@ -2019,7 +2020,7 @@ def test_refund_propose_higher_payment(client, env):
     }, follow=True)
     doc = BeautifulSoup(response.content.decode(), "lxml")
     assert doc.select("input[name=refund-{}]".format(p2.pk))[0]['value'] == '7.00'
-    assert not doc.select("input[name=refund-manual]".format(p2.pk))[0].get('value')
+    assert not doc.select("input[name=refund-manual]")[0].get('value')
 
 
 @pytest.mark.django_db

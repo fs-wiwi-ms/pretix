@@ -20,9 +20,13 @@
 # <https://www.gnu.org/licenses/>.
 #
 import json
+from contextlib import contextmanager
 
 from django.conf import settings
 from django.contrib import messages
+from django.contrib.auth import (
+    BACKEND_SESSION_KEY, get_user_model, load_backend, login,
+)
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import reverse
@@ -30,7 +34,7 @@ from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
 from django.views import View
 from django.views.generic import ListView, TemplateView
-from hijack.helpers import login_user, release_hijack
+from hijack import signals
 
 from pretix.base.auth import get_auth_backends
 from pretix.base.models import User
@@ -40,6 +44,25 @@ from pretix.control.forms.users import UserEditForm
 from pretix.control.permissions import AdministratorPermissionRequiredMixin
 from pretix.control.views import CreateView, UpdateView
 from pretix.control.views.user import RecentAuthenticationRequiredMixin
+
+
+def get_used_backend(request):
+    # vendored from hijack/views.py
+    backend_str = request.session[BACKEND_SESSION_KEY]
+    backend = load_backend(backend_str)
+    return backend
+
+
+@contextmanager
+def keep_session_age(session):
+    # vendored from hijack/views.py
+    try:
+        session_expiry = session["_session_expiry"]
+    except KeyError:
+        yield
+    else:
+        yield
+        session["_session_expiry"] = session_expiry
 
 
 class UserListView(AdministratorPermissionRequiredMixin, ListView):
@@ -139,10 +162,12 @@ class UserAnonymizeView(AdministratorPermissionRequiredMixin, RecentAuthenticati
         self.object = get_object_or_404(User, pk=self.kwargs.get("id"))
         self.object.log_action('pretix.user.anonymized',
                                user=request.user)
-        self.object.email = "{}@disabled.pretix.eu".format(self.object.pk)
+        self.object.email = "{}.{}@disabled.pretix.eu".format(self.object.pk, self.object.auth_backend)
         self.object.fullname = ""
         self.object.is_active = False
         self.object.notifications_send = False
+        self.object.auth_backend = 'anonymized'
+        self.object.auth_backend_identifier = None
         self.object.save()
         for le in self.object.all_logentries.filter(action_type="pretix.user.settings.changed"):
             d = le.parsed_data
@@ -171,7 +196,28 @@ class UserImpersonateView(AdministratorPermissionRequiredMixin, RecentAuthentica
                                          'other_email': self.object.email
                                      })
         oldkey = request.session.session_key
-        login_user(request, self.object)
+
+        hijacker = request.user
+        hijacked = self.object
+
+        hijack_history = request.session.get("hijack_history", [])
+        hijack_history.append(request.user._meta.pk.value_to_string(hijacker))
+
+        backend = get_used_backend(request)
+        backend = f"{backend.__module__}.{backend.__class__.__name__}"
+
+        with signals.no_update_last_login(), keep_session_age(request.session):
+            login(request, hijacked, backend=backend)
+
+        request.session["hijack_history"] = hijack_history
+
+        signals.hijack_started.send(
+            sender=None,
+            request=request,
+            hijacker=hijacker,
+            hijacked=hijacked,
+        )
+
         request.session['hijacker_session'] = oldkey
         return redirect(reverse('control:index'))
 
@@ -180,8 +226,26 @@ class UserImpersonateStopView(LoginRequiredMixin, View):
 
     def post(self, request, *args, **kwargs):
         impersonated = request.user
+
         hijs = request.session['hijacker_session']
-        release_hijack(request)
+        hijack_history = request.session.get("hijack_history", [])
+        hijacked = request.user
+        user_pk = hijack_history.pop()
+        hijacker = get_object_or_404(get_user_model(), pk=user_pk)
+        backend = get_used_backend(request)
+        backend = f"{backend.__module__}.{backend.__class__.__name__}"
+        with signals.no_update_last_login(), keep_session_age(request.session):
+            login(request, hijacker, backend=backend)
+
+        request.session["hijack_history"] = hijack_history
+
+        signals.hijack_ended.send(
+            sender=None,
+            request=request,
+            hijacker=hijacker,
+            hijacked=hijacked,
+        )
+
         ss = request.user.get_active_staff_session(hijs)
         if ss:
             request.session.save()

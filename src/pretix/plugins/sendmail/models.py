@@ -34,6 +34,7 @@ from pretix.base.email import get_email_context
 from pretix.base.models import (
     Event, InvoiceAddress, Item, Order, OrderPosition, SubEvent,
 )
+from pretix.base.models.base import LoggingMixin
 from pretix.base.services.mail import SendMailException
 
 
@@ -44,10 +45,10 @@ class ScheduledMail(models.Model):
     STATE_MISSED = 'missed'
 
     STATE_CHOICES = [
-        (STATE_SCHEDULED, STATE_SCHEDULED),
-        (STATE_FAILED, STATE_FAILED),
-        (STATE_COMPLETED, STATE_COMPLETED),
-        (STATE_MISSED, STATE_MISSED),
+        (STATE_SCHEDULED, _('scheduled')),
+        (STATE_FAILED, _('failed')),
+        (STATE_COMPLETED, _('completed')),
+        (STATE_MISSED, _('missed')),
     ]
 
     id = models.BigAutoField(primary_key=True)
@@ -70,6 +71,9 @@ class ScheduledMail(models.Model):
         super().save(**kwargs)
 
     def recompute(self):
+        if self.state == self.STATE_COMPLETED:
+            return
+
         if self.rule.date_is_absolute:
             self.computed_datetime = self.rule.send_date
         else:
@@ -103,6 +107,8 @@ class ScheduledMail(models.Model):
             orders = orders.filter(
                 Exists(OrderPosition.objects.filter(order=OuterRef('pk'), subevent=self.subevent))
             )
+        elif e.has_subevents:
+            return  # This rule should not even exist
 
         if not self.rule.all_products:
             orders = orders.filter(
@@ -164,7 +170,7 @@ class ScheduledMail(models.Model):
             self.last_successful_order_id = o.pk
 
 
-class Rule(models.Model):
+class Rule(models.Model, LoggingMixin):
     CUSTOMERS = "orders"
     ATTENDEES = "attendees"
     BOTH = "both"

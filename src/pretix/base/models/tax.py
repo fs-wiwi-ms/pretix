@@ -25,7 +25,6 @@ from decimal import Decimal
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils.formats import localize
-from django.utils.timezone import get_current_timezone, now
 from django.utils.translation import gettext_lazy as _, pgettext
 from i18nfield.fields import I18nCharField
 from i18nfield.strings import LazyI18nString
@@ -82,6 +81,15 @@ class TaxedPrice:
             name=self.name,
         )
 
+    def __eq__(self, other):
+        return (
+            self.gross == other.gross and
+            self.net == other.net and
+            self.tax == other.tax and
+            self.rate == other.rate and
+            self.name == other.name
+        )
+
 
 TAXED_ZERO = TaxedPrice(
     gross=Decimal('0.00'),
@@ -93,7 +101,7 @@ TAXED_ZERO = TaxedPrice(
 
 EU_COUNTRIES = {
     'AT', 'BE', 'BG', 'HR', 'CY', 'CZ', 'DK', 'EE', 'FI', 'FR', 'DE', 'GR', 'HU', 'IE', 'IT', 'LV', 'LT', 'LU', 'MT',
-    'NL', 'PL', 'PT', 'RO', 'SK', 'SI', 'ES', 'SE', 'GB'
+    'NL', 'PL', 'PT', 'RO', 'SK', 'SI', 'ES', 'SE',
 }
 EU_CURRENCIES = {
     'BG': 'BGN',
@@ -106,17 +114,21 @@ EU_CURRENCIES = {
     'RO': 'RON',
     'SE': 'SEK'
 }
+VAT_ID_COUNTRIES = EU_COUNTRIES | {'CH'}
 
 
 def is_eu_country(cc):
     cc = str(cc)
-    if cc == 'GB':
-        return now().astimezone(get_current_timezone()).year <= 2020
-    else:
-        return cc in EU_COUNTRIES
+    return cc in EU_COUNTRIES
+
+
+def ask_for_vat_id(cc):
+    cc = str(cc)
+    return cc in VAT_ID_COUNTRIES
 
 
 def cc_to_vat_prefix(country_code):
+    country_code = str(country_code)
     if country_code == 'GR':
         return 'EL'
     return country_code
@@ -124,8 +136,13 @@ def cc_to_vat_prefix(country_code):
 
 class TaxRule(LoggedModel):
     event = models.ForeignKey('Event', related_name='tax_rules', on_delete=models.CASCADE)
+    internal_name = models.CharField(
+        verbose_name=_('Internal name'),
+        max_length=190,
+        null=True, blank=True,
+    )
     name = I18nCharField(
-        verbose_name=_('Name'),
+        verbose_name=_('Official name'),
         help_text=_('Should be short, e.g. "VAT"'),
         max_length=190,
     )
@@ -137,6 +154,10 @@ class TaxRule(LoggedModel):
     price_includes_tax = models.BooleanField(
         verbose_name=_("The configured product prices include the tax amount"),
         default=True,
+    )
+    keep_gross_if_rate_changes = models.BooleanField(
+        verbose_name=_("Keep gross amount constant if the tax rate changes based on the invoice address"),
+        default=False,
     )
     eu_reverse_charge = models.BooleanField(
         verbose_name=_("Use EU reverse charge taxation rules"),
@@ -162,10 +183,13 @@ class TaxRule(LoggedModel):
         pass
 
     def allow_delete(self):
-        from pretix.base.models.orders import OrderFee, OrderPosition
+        from pretix.base.models.orders import (
+            OrderFee, OrderPosition, Transaction,
+        )
 
         return (
-            not OrderFee.objects.filter(tax_rule=self, order__event=self.event).exists()
+            not Transaction.objects.filter(tax_rule=self, order__event=self.event).exists()
+            and not OrderFee.objects.filter(tax_rule=self, order__event=self.event).exists()
             and not OrderPosition.all.filter(tax_rule=self, order__event=self.event).exists()
             and not self.event.items.filter(tax_rule=self).exists()
             and self.event.settings.tax_rate_default != self
@@ -192,6 +216,8 @@ class TaxRule(LoggedModel):
             s = _('plus {rate}% {name}').format(rate=self.rate, name=self.name)
         if self.eu_reverse_charge:
             s += ' ({})'.format(_('reverse charge enabled'))
+        if self.internal_name:
+            return f'{self.internal_name} ({s})'
         return str(s)
 
     @property
@@ -205,7 +231,7 @@ class TaxRule(LoggedModel):
             rule = self.get_matching_rule(invoice_address)
             if rule.get('action', 'vat') == 'block':
                 raise self.SaleNotAllowed()
-            if rule.get('action', 'vat') == 'vat' and rule.get('rate') is not None:
+            if rule.get('action', 'vat') in ('vat', 'require_approval') and rule.get('rate') is not None:
                 return Decimal(rule.get('rate'))
         return Decimal(self.rate)
 
@@ -222,13 +248,19 @@ class TaxRule(LoggedModel):
             rate = override_tax_rate
         elif invoice_address:
             adjust_rate = self.tax_rate_for(invoice_address)
-            if (adjust_rate == gross_price_is_tax_rate or force_fixed_gross_price) and base_price_is == 'gross':
+            if (adjust_rate == gross_price_is_tax_rate or force_fixed_gross_price or self.keep_gross_if_rate_changes) and base_price_is == 'gross':
                 rate = adjust_rate
             elif adjust_rate != rate:
-                normal_price = self.tax(base_price, base_price_is, currency, subtract_from_gross=subtract_from_gross)
-                base_price = normal_price.net
-                base_price_is = 'net'
-                subtract_from_gross = Decimal('0.00')
+                if self.keep_gross_if_rate_changes:
+                    normal_price = self.tax(base_price, base_price_is, currency, subtract_from_gross=subtract_from_gross)
+                    base_price = normal_price.gross
+                    base_price_is = 'gross'
+                    subtract_from_gross = Decimal('0.00')
+                else:
+                    normal_price = self.tax(base_price, base_price_is, currency, subtract_from_gross=subtract_from_gross)
+                    base_price = normal_price.net
+                    base_price_is = 'net'
+                    subtract_from_gross = Decimal('0.00')
                 rate = adjust_rate
 
         if rate == Decimal('0.00'):
@@ -331,12 +363,19 @@ class TaxRule(LoggedModel):
 
         return False
 
+    def _require_approval(self, invoice_address):
+        if self._custom_rules:
+            rule = self.get_matching_rule(invoice_address)
+            if rule.get('action', 'vat') == 'require_approval':
+                return True
+        return False
+
     def _tax_applicable(self, invoice_address):
         if self._custom_rules:
             rule = self.get_matching_rule(invoice_address)
             if rule.get('action', 'vat') == 'block':
                 raise self.SaleNotAllowed()
-            return rule.get('action', 'vat') == 'vat'
+            return rule.get('action', 'vat') in ('vat', 'require_approval')
 
         if not self.eu_reverse_charge:
             # No reverse charge rules? Always apply VAT!

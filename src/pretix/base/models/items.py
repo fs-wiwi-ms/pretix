@@ -44,7 +44,7 @@ import dateutil.parser
 import pytz
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.core.validators import RegexValidator
+from django.core.validators import MinValueValidator, RegexValidator
 from django.db import models
 from django.db.models import Q
 from django.utils import formats
@@ -479,12 +479,14 @@ class Item(LoggedModel):
     min_per_order = models.IntegerField(
         verbose_name=_('Minimum amount per order'),
         null=True, blank=True,
+        validators=[MinValueValidator(0)],
         help_text=_('This product can only be bought if it is added to the cart at least this many times. If you keep '
                     'the field empty or set it to 0, there is no special limit for this product.')
     )
     max_per_order = models.IntegerField(
         verbose_name=_('Maximum amount per order'),
         null=True, blank=True,
+        validators=[MinValueValidator(0)],
         help_text=_('This product can only be bought at most this many times within one order. If you keep the field '
                     'empty or set it to 0, there is no special limit for this product. The limit for the maximum '
                     'number of items in the whole order applies regardless.')
@@ -522,6 +524,12 @@ class Item(LoggedModel):
         'MembershipType',
         verbose_name=_('Allowed membership types'),
         blank=True,
+    )
+    require_membership_hidden = models.BooleanField(
+        verbose_name=_('Hide without a valid membership'),
+        help_text=_('Do not show this unless the customer is logged in and has a valid membership. Be aware that '
+                    'this means it will never be visible in the widget.'),
+        default=False,
     )
     grant_membership_type = models.ForeignKey(
         'MembershipType',
@@ -687,9 +695,9 @@ class Item(LoggedModel):
         return res
 
     def allow_delete(self):
-        from pretix.base.models.orders import OrderPosition
+        from pretix.base.models.orders import OrderPosition, Transaction
 
-        return not OrderPosition.all.filter(item=self).exists()
+        return not Transaction.objects.filter(item=self).exists() and not OrderPosition.all.filter(item=self).exists()
 
     @property
     def includes_mixed_tax_rate(self):
@@ -758,6 +766,9 @@ class ItemVariation(models.Model):
     :type default_price: decimal.Decimal
     :param original_price: The item's "original" price. Will not be used for any calculations, will just be shown.
     :type original_price: decimal.Decimal
+    :param require_approval: If set to ``True``, orders containing this variation can only be processed and paid after
+    approval by an administrator
+    :type require_approval: bool
     """
     item = models.ForeignKey(
         Item,
@@ -793,6 +804,13 @@ class ItemVariation(models.Model):
         help_text=_('If set, this will be displayed next to the current price to show that the current price is a '
                     'discounted one. This is just a cosmetic setting and will not actually impact pricing.')
     )
+    require_approval = models.BooleanField(
+        verbose_name=_('Require approval'),
+        default=False,
+        help_text=_('If this variation is part of an order, the order will be put into an "approval" state and '
+                    'will need to be confirmed by you before it can be paid and completed. You can use this e.g. for '
+                    'discounted tickets that are only available to specific groups.'),
+    )
     require_membership = models.BooleanField(
         verbose_name=_('Require a valid membership'),
         default=False,
@@ -801,6 +819,12 @@ class ItemVariation(models.Model):
         'MembershipType',
         verbose_name=_('Membership types'),
         blank=True,
+    )
+    require_membership_hidden = models.BooleanField(
+        verbose_name=_('Hide without a valid membership'),
+        help_text=_('Do not show this unless the customer is logged in and has a valid membership. Be aware that '
+                    'this means it will never be visible in the widget.'),
+        default=False,
     )
     available_from = models.DateTimeField(
         verbose_name=_("Available from"),
@@ -820,7 +844,7 @@ class ItemVariation(models.Model):
         blank=True,
     )
     hide_without_voucher = models.BooleanField(
-        verbose_name=_('This variation will only be shown if a voucher matching the product is redeemed.'),
+        verbose_name=_('Show only if a matching voucher is redeemed.'),
         default=False,
         help_text=_('This variation will be hidden from the event page until the user enters a voucher '
                     'that unlocks this variation.')
@@ -946,10 +970,13 @@ class ItemVariation(models.Model):
         return self.position < other.position
 
     def allow_delete(self):
-        from pretix.base.models.orders import CartPosition, OrderPosition
+        from pretix.base.models.orders import (
+            CartPosition, OrderPosition, Transaction,
+        )
 
         return (
-            not OrderPosition.objects.filter(variation=self).exists()
+            not Transaction.objects.filter(variation=self).exists()
+            and not OrderPosition.objects.filter(variation=self).exists()
             and not CartPosition.objects.filter(variation=self).exists()
         )
 
@@ -1216,7 +1243,13 @@ class Question(LoggedModel):
         max_length=190,
         verbose_name=_("Internal identifier"),
         help_text=_('You can enter any value here to make it easier to match the data with other sources. If you do '
-                    'not input one, we will generate one automatically.')
+                    'not input one, we will generate one automatically.'),
+        validators=[
+            RegexValidator(
+                regex=r"^[a-zA-Z0-9.\-_]+$",
+                message=_("The identifier may only contain letters, numbers, dots, dashes, and underscores."),
+            ),
+        ],
     )
     help_text = I18nTextField(
         verbose_name=_("Help text"),
@@ -1434,7 +1467,17 @@ class Question(LoggedModel):
 
 class QuestionOption(models.Model):
     question = models.ForeignKey('Question', related_name='options', on_delete=models.CASCADE)
-    identifier = models.CharField(max_length=190)
+    identifier = models.CharField(
+        max_length=190,
+        help_text=_('You can enter any value here to make it easier to match the data with other sources. If you do '
+                    'not input one, we will generate one automatically.'),
+        validators=[
+            RegexValidator(
+                regex=r"^[a-zA-Z0-9.\-_]+$",
+                message=_("The identifier may only contain letters, numbers, dots, dashes, and underscores."),
+            ),
+        ],
+    )
     answer = I18nCharField(verbose_name=_('Answer'))
     position = models.IntegerField(default=0)
 
@@ -1672,7 +1715,7 @@ class Quota(LoggedModel):
             if event != item.event:
                 raise ValidationError(_('One or more items do not belong to this event.'))
             if item.has_variations:
-                if not any(var.item == item for var in variations):
+                if not variations or not any(var.item == item for var in variations):
                     raise ValidationError(_('One or more items has variations but none of these are in the variations list.'))
 
     @staticmethod

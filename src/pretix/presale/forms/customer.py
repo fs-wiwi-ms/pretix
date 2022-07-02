@@ -21,6 +21,7 @@
 #
 import hashlib
 import ipaddress
+import random
 
 from django import forms
 from django.conf import settings
@@ -29,10 +30,15 @@ from django.contrib.auth.password_validation import (
     password_validators_help_texts, validate_password,
 )
 from django.contrib.auth.tokens import PasswordResetTokenGenerator
+from django.core import signing
 from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
+from phonenumber_field.formfields import PhoneNumberField
 
-from pretix.base.forms.questions import NamePartsFormField
+from pretix.base.forms.questions import (
+    NamePartsFormField, WrappedPhoneNumberPrefixWidget, get_country_by_locale,
+    get_phone_prefix,
+)
 from pretix.base.i18n import get_language_without_region
 from pretix.base.models import Customer
 from pretix.base.services.mail import mail
@@ -54,6 +60,7 @@ class AuthenticationForm(forms.Form):
         label=_("Password"),
         strip=False,
         widget=forms.PasswordInput(attrs={'autocomplete': 'current-password'}),
+        max_length=4096,
     )
 
     error_messages = {
@@ -135,7 +142,22 @@ class RegistrationForm(forms.Form):
 
     def __init__(self, request=None, *args, **kwargs):
         self.request = request
+        self.standalone = kwargs.pop('standalone')
+        self.signer = signing.TimestampSigner(salt=f'customer-registration-captcha-{get_client_ip(request)}')
         super().__init__(*args, **kwargs)
+
+        event = getattr(request, "event", None)
+        if event and event.settings.order_phone_asked:
+            if event.settings.region or event.organizer.settings.region:
+                country_code = event.settings.region or event.organizer.settings.region
+                phone_prefix = get_phone_prefix(country_code)
+                if phone_prefix:
+                    self.initial['phone'] = "+{}.".format(phone_prefix)
+            self.fields['phone'] = PhoneNumberField(
+                label=_('Phone'),
+                required=event.settings.order_phone_required,
+                widget=WrappedPhoneNumberPrefixWidget()
+            )
 
         self.fields['name_parts'] = NamePartsFormField(
             max_length=255,
@@ -144,6 +166,32 @@ class RegistrationForm(forms.Form):
             titles=request.organizer.settings.name_scheme_titles,
             label=_('Name'),
         )
+
+        if self.standalone:
+            # In the setandalone registration form, we add a simple CAPTCHA. We don't expect
+            # this to actually turn away and motivated attacker, it's mainly a protection
+            # against spam bots looking for contact forms. Since the standalone registration
+            # form is one of the simplest public forms we have in the application it is the
+            # most common target for untargeted bots.
+            a = random.randint(1, 9)
+            b = random.randint(1, 9)
+            if 'challenge' in self.data:
+                try:
+                    a, b = self.signer.unsign(self.data.get('challenge'), max_age=3600).split('+')
+                    a, b = int(a), int(b)
+                except:
+                    pass
+            self.fields['challenge'] = forms.CharField(
+                widget=forms.HiddenInput,
+                initial=self.signer.sign(f'{a}+{b}')
+
+            )
+            self.fields['response'] = forms.IntegerField(
+                label=_('What is the result of {num1} + {num2}?').format(
+                    num1=a, num2=b,
+                ),
+                min_value=0,
+            )
 
     @cached_property
     def ratelimit_key(self):
@@ -176,6 +224,19 @@ class RegistrationForm(forms.Form):
                     code='duplicate',
                 )
 
+        if self.standalone:
+            expect = -1
+            try:
+                a, b = self.signer.unsign(self.cleaned_data.get('challenge'), max_age=3600).split('+')
+                expect = int(a) + int(b)
+            except:
+                pass
+            if self.cleaned_data.get('response') != expect:
+                raise forms.ValidationError(
+                    {'response': _('Please enter the correct result.')},
+                    code='challenge_invalid'
+                )
+
         if not self.cleaned_data.get('email'):
             raise forms.ValidationError(
                 {'email': self.error_messages['required']},
@@ -199,6 +260,7 @@ class RegistrationForm(forms.Form):
         customer = self.request.organizer.customers.create(
             email=self.cleaned_data['email'],
             name_parts=self.cleaned_data['name_parts'],
+            phone=self.cleaned_data.get('phone'),
             is_active=True,
             is_verified=False,
             locale=get_language_without_region(),
@@ -234,11 +296,13 @@ class SetPasswordForm(forms.Form):
     password = forms.CharField(
         label=_('Password'),
         widget=forms.PasswordInput(attrs={'minlength': '8', 'autocomplete': 'new-password'}),
+        max_length=4096,
         required=True
     )
     password_repeat = forms.CharField(
         label=_('Repeat password'),
         widget=forms.PasswordInput(attrs={'minlength': '8', 'autocomplete': 'new-password'}),
+        max_length=4096,
     )
 
     def __init__(self, customer=None, *args, **kwargs):
@@ -326,11 +390,13 @@ class ChangePasswordForm(forms.Form):
     password = forms.CharField(
         label=_('New password'),
         widget=forms.PasswordInput,
+        max_length=4096,
         required=True
     )
     password_repeat = forms.CharField(
         label=_('Repeat password'),
         widget=forms.PasswordInput(attrs={'minlength': '8', 'autocomplete': 'new-password'}),
+        max_length=4096,
     )
 
     def __init__(self, customer, *args, **kwargs):
@@ -389,12 +455,13 @@ class ChangeInfoForm(forms.ModelForm):
         label=_('Your current password'),
         widget=forms.PasswordInput,
         help_text=_('Only required if you change your email address'),
+        max_length=4096,
         required=False
     )
 
     class Meta:
         model = Customer
-        fields = ('name_parts', 'email')
+        fields = ('name_parts', 'email', 'phone')
 
     def __init__(self, request=None, *args, **kwargs):
         self.request = request
@@ -406,6 +473,18 @@ class ChangeInfoForm(forms.ModelForm):
             scheme=request.organizer.settings.name_scheme,
             titles=request.organizer.settings.name_scheme_titles,
             label=_('Name'),
+        )
+
+        if not self.initial.get('phone') and (request.organizer.settings.region or self.instance.locale):
+            country_code = self.instance.organizer.settings.region or get_country_by_locale(self.instance.locale)
+            phone_prefix = get_phone_prefix(country_code)
+            if phone_prefix:
+                self.initial['phone'] = "+{}.".format(phone_prefix)
+
+        self.fields['phone'] = PhoneNumberField(
+            label=_('Phone'),
+            required=False,
+            widget=WrappedPhoneNumberPrefixWidget()
         )
 
     def clean_password_current(self):

@@ -39,26 +39,31 @@ from django import forms
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db.models import Q
+from django.forms import inlineformset_factory
+from django.forms.utils import ErrorDict
 from django.utils.crypto import get_random_string
 from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _, pgettext_lazy
 from django_scopes.forms import SafeModelMultipleChoiceField
-from i18nfield.forms import I18nFormField, I18nTextarea
+from i18nfield.forms import I18nFormField, I18nFormSetMixin, I18nTextarea
+from phonenumber_field.formfields import PhoneNumberField
 from pytz import common_timezones
 
 from pretix.api.models import WebHook
 from pretix.api.webhooks import get_all_webhook_events
 from pretix.base.forms import I18nModelForm, PlaceholderValidator, SettingsForm
-from pretix.base.forms.questions import NamePartsFormField
+from pretix.base.forms.questions import (
+    NamePartsFormField, WrappedPhoneNumberPrefixWidget, get_country_by_locale,
+    get_phone_prefix,
+)
 from pretix.base.forms.widgets import SplitDateTimePickerWidget
 from pretix.base.models import (
     Customer, Device, EventMetaProperty, Gate, GiftCard, Membership,
     MembershipType, Organizer, Team,
 )
+from pretix.base.models.organizer import OrganizerFooterLink
 from pretix.base.settings import PERSON_NAME_SCHEMES, PERSON_NAME_TITLE_GROUPS
-from pretix.control.forms import (
-    ExtFileField, SMTPSettingsMixin, SplitDateTimeField,
-)
+from pretix.control.forms import ExtFileField, SplitDateTimeField
 from pretix.control.forms.event import (
     SafeEventMultipleChoiceField, multimail_validate,
 )
@@ -266,6 +271,69 @@ class DeviceForm(forms.ModelForm):
         }
 
 
+class DeviceBulkEditForm(forms.ModelForm):
+
+    def __init__(self, *args, **kwargs):
+        organizer = kwargs.pop('organizer')
+        self.mixed_values = kwargs.pop('mixed_values')
+        self.queryset = kwargs.pop('queryset')
+        super().__init__(*args, **kwargs)
+        self.fields['limit_events'].queryset = organizer.events.all().order_by(
+            '-has_subevents', '-date_from'
+        )
+        self.fields['gate'].queryset = organizer.gates.all()
+
+    def clean(self):
+        d = super().clean()
+        if self.prefix + '__events' in self.data.getlist('_bulk') and not d['all_events'] and not d['limit_events']:
+            raise ValidationError(_('Your device will not have access to anything, please select some events.'))
+
+        return d
+
+    class Meta:
+        model = Device
+        fields = ['all_events', 'limit_events', 'security_profile', 'gate']
+        widgets = {
+            'limit_events': forms.CheckboxSelectMultiple(attrs={
+                'data-inverse-dependency': '#id_all_events',
+                'class': 'scrolling-multiple-choice scrolling-multiple-choice-large',
+            }),
+        }
+        field_classes = {
+            'limit_events': SafeEventMultipleChoiceField
+        }
+
+    def save(self, commit=True):
+        objs = list(self.queryset)
+        fields = set()
+
+        check_map = {
+            'all_events': '__events',
+            'limit_events': '__events',
+        }
+        for k in self.fields:
+            cb_val = self.prefix + check_map.get(k, k)
+            if cb_val not in self.data.getlist('_bulk'):
+                continue
+
+            fields.add(k)
+            for obj in objs:
+                if k == 'limit_events':
+                    getattr(obj, k).set(self.cleaned_data[k])
+                else:
+                    setattr(obj, k, self.cleaned_data[k])
+
+        if fields:
+            Device.objects.bulk_update(objs, [f for f in fields if f != 'limit_events'], 200)
+
+    def full_clean(self):
+        if len(self.data) == 0:
+            # form wasn't submitted
+            self._errors = ErrorDict()
+            return
+        super().full_clean()
+
+
 class OrganizerSettingsForm(SettingsForm):
     timezone = forms.ChoiceField(
         choices=((a, a) for a in common_timezones),
@@ -284,6 +352,7 @@ class OrganizerSettingsForm(SettingsForm):
         required=False,
     )
     auto_fields = [
+        'allowed_restricted_plugins',
         'customer_accounts',
         'customer_accounts_link_by_email',
         'invoice_regenerate_allowed',
@@ -307,8 +376,14 @@ class OrganizerSettingsForm(SettingsForm):
         'theme_color_danger',
         'theme_color_background',
         'theme_round_borders',
-        'primary_font'
-
+        'primary_font',
+        'privacy_url',
+        'cookie_consent',
+        'cookie_consent_dialog_title',
+        'cookie_consent_dialog_text',
+        'cookie_consent_dialog_text_secondary',
+        'cookie_consent_dialog_button_yes',
+        'cookie_consent_dialog_button_no',
     ]
 
     organizer_logo_image = ExtFileField(
@@ -331,7 +406,12 @@ class OrganizerSettingsForm(SettingsForm):
     )
 
     def __init__(self, *args, **kwargs):
+        is_admin = kwargs.pop('is_admin', False)
         super().__init__(*args, **kwargs)
+
+        if not is_admin:
+            del self.fields['allowed_restricted_plugins']
+
         self.fields['name_scheme'].choices = (
             (k, _('Ask for {fields}, display like {example}').format(
                 fields=' + '.join(str(vv[1]) for vv in v['fields']),
@@ -348,9 +428,8 @@ class OrganizerSettingsForm(SettingsForm):
         ]
 
 
-class MailSettingsForm(SMTPSettingsMixin, SettingsForm):
+class MailSettingsForm(SettingsForm):
     auto_fields = [
-        'mail_from',
         'mail_from_name',
     ]
 
@@ -415,6 +494,7 @@ class MailSettingsForm(SMTPSettingsMixin, SettingsForm):
                 if f == 'full_name':
                     continue
                 placeholders['name_%s' % f] = name_scheme['sample'][f]
+            placeholders['name_for_salutation'] = _("Mr Doe")
         return placeholders
 
     def _set_field_placeholders(self, fn, base_parameters):
@@ -529,11 +609,21 @@ class CustomerUpdateForm(forms.ModelForm):
 
     class Meta:
         model = Customer
-        fields = ['is_active', 'name_parts', 'email', 'is_verified', 'locale']
+        fields = ['is_active', 'external_identifier', 'name_parts', 'email', 'is_verified', 'phone', 'locale', 'notes']
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if not self.instance.phone and (self.instance.organizer.settings.region or self.instance.locale):
+            country_code = self.instance.organizer.settings.region or get_country_by_locale(self.instance.locale)
+            phone_prefix = get_phone_prefix(country_code)
+            if phone_prefix:
+                self.initial['phone'] = "+{}.".format(phone_prefix)
 
+        self.fields['phone'] = PhoneNumberField(
+            label=_('Phone'),
+            required=False,
+            widget=WrappedPhoneNumberPrefixWidget()
+        )
         self.fields['name_parts'] = NamePartsFormField(
             max_length=255,
             required=False,
@@ -557,6 +647,13 @@ class CustomerUpdateForm(forms.ModelForm):
                 )
 
         return self.cleaned_data
+
+
+class CustomerCreateForm(CustomerUpdateForm):
+
+    class Meta:
+        model = Customer
+        fields = ['is_active', 'identifier', 'external_identifier', 'name_parts', 'email', 'is_verified', 'phone', 'locale', 'notes']
 
 
 class MembershipUpdateForm(forms.ModelForm):
@@ -587,3 +684,25 @@ class MembershipUpdateForm(forms.ModelForm):
             titles=self.instance.customer.organizer.settings.name_scheme_titles,
             label=_('Attendee name'),
         )
+
+
+class OrganizerFooterLinkForm(I18nModelForm):
+    class Meta:
+        model = OrganizerFooterLink
+        fields = ('label', 'url')
+
+
+class BaseOrganizerFooterLinkFormSet(I18nFormSetMixin, forms.BaseInlineFormSet):
+    def __init__(self, *args, **kwargs):
+        organizer = kwargs.pop('organizer', None)
+        if organizer:
+            kwargs['locales'] = organizer.settings.get('locales')
+        super().__init__(*args, **kwargs)
+
+
+OrganizerFooterLinkFormset = inlineformset_factory(
+    Organizer, OrganizerFooterLink,
+    OrganizerFooterLinkForm,
+    formset=BaseOrganizerFooterLinkFormSet,
+    can_order=False, can_delete=True, extra=0
+)

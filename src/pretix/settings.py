@@ -67,6 +67,7 @@ DATA_DIR = config.get('pretix', 'datadir', fallback=os.environ.get('DATA_DIR', '
 LOG_DIR = os.path.join(DATA_DIR, 'logs')
 MEDIA_ROOT = os.path.join(DATA_DIR, 'media')
 PROFILE_DIR = os.path.join(DATA_DIR, 'profiles')
+CACHE_DIR = os.path.join(DATA_DIR, 'cache')
 
 if not os.path.exists(DATA_DIR):
     os.mkdir(DATA_DIR)
@@ -74,6 +75,8 @@ if not os.path.exists(LOG_DIR):
     os.mkdir(LOG_DIR)
 if not os.path.exists(MEDIA_ROOT):
     os.mkdir(MEDIA_ROOT)
+if not os.path.exists(CACHE_DIR):
+    os.mkdir(CACHE_DIR)
 
 if config.has_option('django', 'secret'):
     SECRET_KEY = config.get('django', 'secret')
@@ -181,6 +184,7 @@ if config.get('pretix', 'trust_x_forwarded_proto', fallback=False):
 PRETIX_PLUGINS_DEFAULT = config.get('pretix', 'plugins_default',
                                     fallback='pretix.plugins.sendmail,pretix.plugins.statistics,pretix.plugins.checkinlists,pretix.plugins.autocheckin')
 PRETIX_PLUGINS_EXCLUDE = config.get('pretix', 'plugins_exclude', fallback='').split(',')
+PRETIX_PLUGINS_SHOW_META = config.getboolean('pretix', 'plugins_show_meta', fallback=True)
 
 FETCH_ECB_RATES = config.getboolean('pretix', 'ecb_rates', fallback=True)
 
@@ -210,8 +214,12 @@ ALLOWED_HOSTS = ['*']
 LANGUAGE_CODE = config.get('locale', 'default', fallback='en')
 TIME_ZONE = config.get('locale', 'timezone', fallback='UTC')
 
-MAIL_FROM = SERVER_EMAIL = DEFAULT_FROM_EMAIL = config.get(
-    'mail', 'from', fallback='pretix@localhost')
+MAIL_FROM = SERVER_EMAIL = DEFAULT_FROM_EMAIL = config.get('mail', 'from', fallback='pretix@localhost')
+MAIL_FROM_NOTIFICATIONS = config.get('mail', 'from_notifications', fallback=MAIL_FROM)
+MAIL_FROM_ORGANIZERS = config.get('mail', 'from_organizers', fallback=MAIL_FROM)
+MAIL_CUSTOM_SENDER_VERIFICATION_REQUIRED = config.getboolean('mail', 'custom_sender_verification_required', fallback=True)
+MAIL_CUSTOM_SENDER_SPF_STRING = config.get('mail', 'custom_sender_spf_string', fallback='')
+MAIL_CUSTOM_SMTP_ALLOW_PRIVATE_NETWORKS = config.getboolean('mail', 'custom_smtp_allow_private_networks', fallback=False)
 EMAIL_HOST = config.get('mail', 'host', fallback='localhost')
 EMAIL_PORT = config.getint('mail', 'port', fallback=25)
 EMAIL_HOST_USER = config.get('mail', 'user', fallback='')
@@ -219,6 +227,7 @@ EMAIL_HOST_PASSWORD = config.get('mail', 'password', fallback='')
 EMAIL_USE_TLS = config.getboolean('mail', 'tls', fallback=False)
 EMAIL_USE_SSL = config.getboolean('mail', 'ssl', fallback=False)
 EMAIL_SUBJECT_PREFIX = '[pretix] '
+EMAIL_BACKEND = EMAIL_CUSTOM_SMTP_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 
 ADMINS = [('Admin', n) for n in config.get('mail', 'admins', fallback='').split(",") if n]
 
@@ -347,6 +356,7 @@ INSTALLED_APPS = [
     'pretix.plugins.banktransfer',
     'pretix.plugins.stripe',
     'pretix.plugins.paypal',
+    'pretix.plugins.paypal2',
     'pretix.plugins.ticketoutputpdf',
     'pretix.plugins.sendmail',
     'pretix.plugins.statistics',
@@ -364,7 +374,6 @@ INSTALLED_APPS = [
     'statici18n',
     'django_countries',
     'hijack',
-    'compat',
     'oauth2_provider',
     'phonenumber_field'
 ]
@@ -386,7 +395,8 @@ for entry_point in iter_entry_points(group='pretix.plugin', name=None):
     PLUGINS.append(entry_point.module_name)
     INSTALLED_APPS.append(entry_point.module_name)
 
-HIJACK_AUTHORIZE_STAFF = True
+HIJACK_PERMISSION_CHECK = "hijack.permissions.superusers_and_staff"
+HIJACK_INSERT_BEFORE = None
 
 
 REST_FRAMEWORK = {
@@ -437,6 +447,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'hijack.middleware.HijackUserMiddleware',
     'pretix.control.middleware.PermissionMiddleware',
     'pretix.control.middleware.AuditLogMiddleware',
     'pretix.base.middleware.LocaleMiddleware',
@@ -500,26 +511,30 @@ ALL_LANGUAGES = [
     ('de-informal', _('German (informal)')),
     ('ar', _('Arabic')),
     ('zh-hans', _('Chinese (simplified)')),
+    ('cs', _('Czech')),
     ('da', _('Danish')),
     ('nl', _('Dutch')),
     ('nl-informal', _('Dutch (informal)')),
     ('fr', _('French')),
     ('fi', _('Finnish')),
+    ('gl', _('Galician')),
     ('el', _('Greek')),
     ('it', _('Italian')),
     ('lv', _('Latvian')),
     ('pl', _('Polish')),
     ('pt-pt', _('Portuguese (Portugal)')),
     ('pt-br', _('Portuguese (Brazil)')),
+    ('ro', _('Romanian')),
     ('ru', _('Russian')),
     ('es', _('Spanish')),
     ('tr', _('Turkish')),
+    ('uk', _('Ukrainian')),
 ]
 LANGUAGES_OFFICIAL = {
     'en', 'de', 'de-informal'
 }
 LANGUAGES_INCUBATING = {
-    'pl', 'fi', 'pt-br'
+    'pl', 'fi', 'pt-br', 'gl', 'cs'
 } - set(config.get('languages', 'allow_incubating', fallback='').split(','))
 LANGUAGES_RTL = {
     'ar', 'hw'
@@ -579,7 +594,7 @@ CSRF_FAILURE_VIEW = 'pretix.base.views.errors.csrf_failure'
 
 template_loaders = (
     'django.template.loaders.filesystem.Loader',
-    'django.template.loaders.app_directories.Loader',
+    'pretix.helpers.template_loaders.AppLoader',
 )
 if not DEBUG:
     template_loaders = (
@@ -634,6 +649,10 @@ COMPRESS_PRECOMPILERS = (
     ('text/vue', 'pretix.helpers.compressor.VueCompiler'),
 )
 
+COMPRESS_OFFLINE_CONTEXT = {
+    'basetpl': 'empty.html',
+}
+
 COMPRESS_ENABLED = COMPRESS_OFFLINE = not debug_fallback
 
 COMPRESS_FILTERS = {
@@ -641,7 +660,10 @@ COMPRESS_FILTERS = {
         # CssAbsoluteFilter is incredibly slow, especially when dealing with our _flags.scss
         # However, we don't need it if we consequently use the static() function in Sass
         # 'compressor.filters.css_default.CssAbsoluteFilter',
-        'compressor.filters.cssmin.CSSCompressorFilter',
+        'compressor.filters.cssmin.rCSSMinFilter',
+    ),
+    'js': (
+        'compressor.filters.jsmin.JSMinFilter',
     )
 }
 
@@ -848,7 +870,8 @@ DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10 MB
 # File sizes are in MiB
 FILE_UPLOAD_MAX_SIZE_IMAGE = 1024 * 1024 * config.getint("pretix_file_upload", "max_size_image", fallback=10)
 FILE_UPLOAD_MAX_SIZE_FAVICON = 1024 * 1024 * config.getint("pretix_file_upload", "max_size_favicon", fallback=1)
-FILE_UPLOAD_MAX_SIZE_EMAIL_ATTACHMENT = 1024 * 1024 * config.getint("pretix_file_upload", "max_size_email_attachment", fallback=10)
+FILE_UPLOAD_MAX_SIZE_EMAIL_ATTACHMENT = 1024 * 1024 * config.getint("pretix_file_upload", "max_size_email_attachment", fallback=5)
+FILE_UPLOAD_MAX_SIZE_EMAIL_AUTO_ATTACHMENT = 1024 * 1024 * config.getint("pretix_file_upload", "max_size_email_auto_attachment", fallback=1)
 FILE_UPLOAD_MAX_SIZE_OTHER = 1024 * 1024 * config.getint("pretix_file_upload", "max_size_other", fallback=10)
 
 DEFAULT_AUTO_FIELD = 'django.db.models.AutoField'  # sadly. we would prefer BigInt, and should use it for all new models but the migration will be hard

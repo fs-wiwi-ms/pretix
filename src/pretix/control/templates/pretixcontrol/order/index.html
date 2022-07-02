@@ -52,18 +52,22 @@
                         {% if order.status == 'n' or order.status == 'e' %}
                             <a href="{% url "control:event.order.transition" event=request.event.slug organizer=request.event.organizer.slug code=order.code %}?status=p"
                                     class="btn {% if overpaid >= 0 %}btn-success{% else %}btn-default{% endif %}">
+                                <span class="fa fa-check"></span>
                                 {% trans "Mark as paid" %}
                             </a>
                             <a href="{% url "control:event.order.extend" event=request.event.slug organizer=request.event.organizer.slug code=order.code %}" class="btn btn-default">
+                                <span class="fa fa-clock-o"></span>
                                 {% trans "Extend payment term" %}
                             </a>
                         {% endif %}
                         {% if order.cancel_allowed %}
                             <a href="{% url "control:event.order.transition" event=request.event.slug organizer=request.event.organizer.slug code=order.code %}?status=c" class="btn btn-default">
+                                <span class="fa fa-ban"></span>
                                 {% trans "Cancel order" %}
                             </a>
                         {% elif order.status == 'c' %}
                             <a href="{% url "control:event.order.reactivate" event=request.event.slug organizer=request.event.organizer.slug code=order.code %}" class="btn btn-default">
+                                <span class="fa fa-reply"></span>
                                 {% trans "Reactivate order" %}
                             </a>
                         {% endif %}
@@ -71,10 +75,16 @@
 
                     <a href="{% eventurl request.event "presale:event.order" order=order.code secret=order.secret %}"
                             class="btn btn-default" target="_blank">
+                        <span class="fa fa-eye"></span>
                         {% trans "View order as user" %}
                     </a>
                     <a href="{% url "control:event.order.mail_history" event=request.event.slug organizer=request.event.organizer.slug code=order.code %}" class="btn btn-default">
+                        <span class="fa fa-envelope-o"></span>
                         {% trans "View email history" %}
+                    </a>
+                    <a href="{% url "control:event.order.transactions" event=request.event.slug organizer=request.event.organizer.slug code=order.code %}" class="btn btn-default">
+                        <span class="fa fa-list"></span>
+                        {% trans "View transaction history" %}
                     </a>
                 </div>
             </div>
@@ -234,7 +244,23 @@
                                 {% for i in invoices %}
                                     <a href="{% url "control:event.invoice.download" invoice=i.pk event=request.event.slug organizer=request.event.organizer.slug %}">
                                         {% if i.is_cancellation %}{% trans "Cancellation" context "invoice" %}{% else %}{% trans "Invoice" %}{% endif %}
-                                        {{ i.number }}</a> ({{ i.date|date:"SHORT_DATE_FORMAT" }})
+                                        {{ i.number }}</a>
+                                    ({{ i.date|date:"SHORT_DATE_FORMAT" }})
+                                    {% if i.sent_to_customer.year == 1970 %}
+                                        <span class="fa-stack fa-stack-small" data-toggle="tooltip" title="{% trans "We don't know if this invoice was emailed to the customer since it was created before our system tracked this information" %}">
+                                            <span class="fa fa-background fa-envelope text-muted fa-stack-1x"></span>
+                                            <span class="fa fa-question fa-stack-1x fa-stack-shifted"></span>
+                                        </span>
+                                    {% elif i.sent_to_customer %}
+                                        <span class="fa-stack fa-stack-small" data-toggle="tooltip" title="{% trans "Invoice was emailed to customer" %}">
+                                            <span class="fa fa-background fa-envelope text-muted fa-stack-1x"></span>
+                                            <span class="fa fa-check text-success fa-stack-1x fa-stack-shifted"></span>
+                                        </span>
+                                    {% else %}
+                                        <span class="fa-stack fa-stack-small" data-toggle="tooltip" title="{% trans "Invoice was not yet emailed to customer" %}">
+                                            <span class="fa fa-background fa-envelope text-muted fa-stack-1x"></span>
+                                        </span>
+                                    {% endif %}
                                     {% if not i.canceled %}
                                         {% if request.event.settings.invoice_regenerate_allowed %}
                                             <form class="form-inline helper-display-inline" method="post"
@@ -268,6 +294,12 @@
                                         <br/>
                                     {% endif %}
                                 {% endfor %}
+                                {% if invoices_send_link %}
+                                    <br/>
+                                    <a class="btn btn-default btn-xs" href="{{ invoices_send_link }}">
+                                        {% trans "Email invoices" %}
+                                    </a>
+                                {% endif %}
                                 {% if can_generate_invoice %}
                                     <br/>
                                     <form class="form-inline helper-display-inline" method="post"
@@ -328,19 +360,19 @@
                                 {% if line.checkins.all %}
                                     {% for c in line.all_checkins.all %}
                                         {% if not c.successful %}
-                                            <span class="fa fa-fw fa-exclamation-circle text-danger" data-toggle="tooltip_html" title="{{ c.list.name }}<br>{% blocktrans trimmed with date=c.datetime|date:'SHORT_DATETIME_FORMAT' %}Denied scan: {{ date }}{% endblocktrans %}<br>{{ c.get_error_reason_display }}{% if c.gate %}<br>{{ c.gate }}{% endif %}"></span>
+                                            <span class="fa fa-fw fa-exclamation-circle text-danger" data-toggle="tooltip_html" title="{{ c.list.name|force_escape|force_escape }}<br>{% blocktrans trimmed with date=c.datetime|date:'SHORT_DATETIME_FORMAT' %}Denied scan: {{ date }}{% endblocktrans %}<br>{{ c.get_error_reason_display }}{% if c.gate %}<br>{{ c.gate }}{% endif %}"></span>
                                         {% elif c.type == "exit" %}
                                             {% if c.auto_checked_in %}
-                                                <span class="fa fa-fw text-success fa-hourglass-end" data-toggle="tooltip_html" title="{{ c.list.name }}<br>{% blocktrans trimmed with date=c.datetime|date:'SHORT_DATETIME_FORMAT' %}Automatically marked not present: {{ date }}{% endblocktrans %}"></span>
+                                                <span class="fa fa-fw text-success fa-hourglass-end" data-toggle="tooltip_html" title="{{ c.list.name|force_escape|force_escape }}<br>{% blocktrans trimmed with date=c.datetime|date:'SHORT_DATETIME_FORMAT' %}Automatically marked not present: {{ date }}{% endblocktrans %}"></span>
                                             {% else %}
-                                                <span class="fa fa-fw text-success fa-sign-out" data-toggle="tooltip_html" title="{{ c.list.name }}<br>{% blocktrans trimmed with date=c.datetime|date:'SHORT_DATETIME_FORMAT' %}Exit scan: {{ date }}{% endblocktrans %}{% if c.gate %}<br>{{ c.gate }}{% endif %}"></span>
+                                                <span class="fa fa-fw text-success fa-sign-out" data-toggle="tooltip_html" title="{{ c.list.name|force_escape|force_escape }}<br>{% blocktrans trimmed with date=c.datetime|date:'SHORT_DATETIME_FORMAT' %}Exit scan: {{ date }}{% endblocktrans %}{% if c.gate %}<br>{{ c.gate }}{% endif %}"></span>
                                             {% endif %}
                                         {% elif c.forced %}
-                                            <span class="fa fa-fw fa-warning text-warning" data-toggle="tooltip_html" title="{{ c.list.name }}<br>{% blocktrans trimmed with date=c.datetime|date:'SHORT_DATETIME_FORMAT' %}Additional entry scan: {{ date }}{% endblocktrans %}{% if c.gate %}<br>{{ c.gate }}{% endif %}"></span>
+                                            <span class="fa fa-fw fa-warning text-warning" data-toggle="tooltip_html" title="{{ c.list.name|force_escape|force_escape }}<br>{% blocktrans trimmed with date=c.datetime|date:'SHORT_DATETIME_FORMAT' %}Additional entry scan: {{ date }}{% endblocktrans %}{% if c.gate %}<br>{{ c.gate }}{% endif %}"></span>
                                         {% elif c.auto_checked_in %}
-                                            <span class="fa fa-fw fa-magic text-success" data-toggle="tooltip_html" title="{{ c.list.name }}<br>{% blocktrans trimmed with date=c.datetime|date:'SHORT_DATETIME_FORMAT' %}Automatically checked in: {{ date }}{% endblocktrans %}{% if c.gate %}<br>{{ c.gate }}{% endif %}"></span>
+                                            <span class="fa fa-fw fa-magic text-success" data-toggle="tooltip_html" title="{{ c.list.name|force_escape|force_escape }}<br>{% blocktrans trimmed with date=c.datetime|date:'SHORT_DATETIME_FORMAT' %}Automatically checked in: {{ date }}{% endblocktrans %}{% if c.gate %}<br>{{ c.gate }}{% endif %}"></span>
                                         {% else %}
-                                            <span class="fa fa-fw fa-check text-success" data-toggle="tooltip_html" title="{{ c.list.name }}<br>{% blocktrans trimmed with date=c.datetime|date:'SHORT_DATETIME_FORMAT' %}Entry scan: {{ date }}{% endblocktrans %}{% if c.gate %}<br>{{ c.gate }}{% endif %}"></span>
+                                            <span class="fa fa-fw fa-check text-success" data-toggle="tooltip_html" title="{{ c.list.name|force_escape|force_escape }}<br>{% blocktrans trimmed with date=c.datetime|date:'SHORT_DATETIME_FORMAT' %}Entry scan: {{ date }}{% endblocktrans %}{% if c.gate %}<br>{{ c.gate }}{% endif %}"></span>
                                         {% endif %}
                                     {% endfor %}
                                 {% endif %}
@@ -355,7 +387,7 @@
                                 {% if line.voucher %}
                                     <br/><span class="fa fa-tags fa-fw"></span> {% trans "Voucher code used:" %}
                                     <a
-                                            {% if line.price_before_voucher|default_if_none:"NONE" != "NONE" %}data-toggle="tooltip" title="{% blocktrans trimmed with price=line.price_before_voucher|money:request.event.currency %}Original price: {{ price }}{% endblocktrans %}"{% endif %}
+                                            {% if line.voucher.budget and line.voucher_budget_use|default_if_none:"NONE" != "NONE" %}data-toggle="tooltip" title="{% blocktrans trimmed with amount=line.voucher_budget_use|money:request.event.currency %}Used {{ amount }} discount from budget{% endblocktrans %}"{% endif %}
                                             href="{% url "control:event.voucher" event=request.event.slug organizer=request.event.organizer.slug voucher=line.voucher.pk %}">
                                         {{ line.voucher.code }}
                                     </a>
@@ -373,6 +405,15 @@
                                     <a href="{% url "control:organizer.customer.membership.edit" organizer=request.organizer.slug customer=order.customer.identifier id=line.used_membership.pk %}">
                                         {{ line.used_membership }}
                                     </a>
+                                {% endif %}
+                                {% if line.discount %}
+                                    <br />
+                                    <span class="text-success discounted" data-toggle="tooltip" title="{% trans "The price of this product was reduced because of an automatic discount or this product was part of the discount calculation for a different product in this order." %}">
+                                        <span class="fa fa-percent fa-fw" aria-hidden="true"></span>
+                                        <a href="{% url "control:event.items.discounts.edit" organizer=request.event.organizer.slug event=request.event.slug discount=line.discount.id %}">
+                                            {{ line.discount.internal_name }}
+                                        </a>
+                                    </span>
                                 {% endif %}
                                 {% if not line.canceled %}
                                     <div class="position-buttons">

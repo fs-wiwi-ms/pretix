@@ -1,4 +1,4 @@
-/*global $, Morris, gettext*/
+/*global $, Morris, gettext, formatPrice*/
 $(function () {
     // Question view
     if (!$("#item_variations").length) {
@@ -8,7 +8,10 @@ $(function () {
     function update_variation_summary($el) {
         var var_name = $el.find("input[name*=-value_]").filter(function () {return !!this.value}).first().val();
         var price = $el.find("input[name*=-default_price]").val();
-
+        if (price) {
+            var currency = $el.find("[name*=-default_price] + .input-group-addon").text();
+            price = formatPrice(price, currency);
+        }
 
         $el.find(".variation-name").text(var_name);
         $el.find(".variation-price").text(price);
@@ -54,5 +57,6 @@ $(function () {
         update_variation_summary($el);
         $(this).on("change dp.change", "input", function () {update_variation_summary($el)});
         setup_collapsible_details($("#item_variations"));
+        form_handlers($(event.target));
     });
 });

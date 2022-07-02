@@ -42,7 +42,6 @@ from datetime import datetime, time, timedelta
 from decimal import Decimal, DecimalException
 from urllib.parse import quote, urlencode
 
-import vat_moss.id
 from django import forms
 from django.conf import settings
 from django.contrib import messages
@@ -50,7 +49,7 @@ from django.core.exceptions import ValidationError
 from django.core.files import File
 from django.db import transaction
 from django.db.models import (
-    Count, Exists, IntegerField, OuterRef, Prefetch, ProtectedError, Q,
+    Count, Exists, F, IntegerField, OuterRef, Prefetch, ProtectedError, Q,
     Subquery, Sum,
 )
 from django.forms import formset_factory
@@ -65,7 +64,7 @@ from django.utils.formats import date_format, get_format
 from django.utils.functional import cached_property
 from django.utils.http import is_safe_url
 from django.utils.timezone import make_aware, now
-from django.utils.translation import gettext, gettext_lazy as _
+from django.utils.translation import gettext, gettext_lazy as _, ngettext
 from django.views.generic import (
     DetailView, FormView, ListView, TemplateView, View,
 )
@@ -83,7 +82,7 @@ from pretix.base.models import (
 from pretix.base.models.orders import (
     CancellationRequest, OrderFee, OrderPayment, OrderPosition, OrderRefund,
 )
-from pretix.base.models.tax import cc_to_vat_prefix, is_eu_country
+from pretix.base.models.tax import ask_for_vat_id
 from pretix.base.payment import PaymentException
 from pretix.base.secrets import assign_ticket_secret
 from pretix.base.services import tickets
@@ -103,6 +102,9 @@ from pretix.base.services.orders import (
     notify_user_changed_order, reactivate_order,
 )
 from pretix.base.services.stats import order_overview
+from pretix.base.services.tax import (
+    VATIDFinalError, VATIDTemporaryError, validate_vat_id,
+)
 from pretix.base.services.tickets import generate
 from pretix.base.signals import (
     order_modified, register_data_exporters, register_ticket_outputs,
@@ -313,6 +315,27 @@ class OrderDetail(OrderView):
         ctx['download_buttons'] = self.download_buttons
         ctx['payment_refund_sum'] = self.order.payment_refund_sum
         ctx['pending_sum'] = self.order.pending_sum
+
+        unsent_invoices = [ii.pk for ii in ctx['invoices'] if not ii.sent_to_customer]
+        if unsent_invoices:
+            ctx['invoices_send_link'] = reverse('control:event.order.sendmail', kwargs={
+                'event': self.request.event.slug,
+                'organizer': self.request.event.organizer.slug,
+                'code': self.order.code
+            }) + '?' + urlencode({
+                'subject': ngettext('Your invoice', 'Your invoices', len(unsent_invoices)),
+                'message': ngettext(
+                    'Hello,\n\nplease find your invoice attached to this email.\n\n'
+                    'Your {event} team',
+                    'Hello,\n\nplease find your invoices attached to this email.\n\n'
+                    'Your {event} team',
+                    len(unsent_invoices)
+                ).format(
+                    event="{event}",
+                ),
+                'attach_invoices': unsent_invoices
+            }, doseq=True)
+
         return ctx
 
     @cached_property
@@ -337,7 +360,8 @@ class OrderDetail(OrderView):
         cartpos = queryset.order_by(
             'item', 'variation'
         ).select_related(
-            'item', 'variation', 'addon_to', 'tax_rule', 'used_membership', 'used_membership__membership_type'
+            'item', 'variation', 'addon_to', 'tax_rule', 'used_membership', 'used_membership__membership_type',
+            'discount',
         ).prefetch_related(
             'item__questions', 'issued_gift_cards',
             Prefetch('answers', queryset=QuestionAnswer.objects.prefetch_related('options').select_related('question')),
@@ -378,6 +402,23 @@ class OrderDetail(OrderView):
             'net_total': self.object.net_total,
             'tax_total': self.object.tax_total,
         }
+
+
+class OrderTransactions(OrderView):
+    template_name = 'pretixcontrol/order/transactions.html'
+    permission = 'can_view_orders'
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        ctx['transactions'] = self.order.transactions.select_related(
+            'item', 'variation', 'subevent'
+        ).order_by('datetime')
+        ctx['sums'] = self.order.transactions.aggregate(
+            count=Sum('count'),
+            full_price=Sum(F('count') * F('price')),
+            full_tax_value=Sum(F('count') * F('tax_value')),
+        )
+        return ctx
 
 
 class OrderDownload(AsyncAction, OrderView):
@@ -856,6 +897,11 @@ class OrderRefundView(OrderView):
                             if self.request.POST.get('manual_state') == 'done'
                             else OrderRefund.REFUND_STATE_CREATED
                         ),
+                        execution_date=(
+                            now()
+                            if self.request.POST.get('manual_state') == 'done'
+                            else None
+                        ),
                         amount=manual_value,
                         comment=comment,
                         provider='manual'
@@ -1078,6 +1124,7 @@ class OrderRefundView(OrderView):
         return render(self.request, 'pretixcontrol/order/refund_choose.html', {
             'payments': payments,
             'new_refunds': new_refunds,
+            'full_refund': full_refund,
             'remainder': to_refund,
             'order': self.order,
             'comment': comment,
@@ -1137,6 +1184,19 @@ class OrderTransition(OrderView):
         to = self.request.POST.get('status', '')
         if self.order.status in (Order.STATUS_PENDING, Order.STATUS_EXPIRED) and to == 'p' and self.mark_paid_form.is_valid():
             ps = self.mark_paid_form.cleaned_data['amount']
+
+            if ps == Decimal('0.00') and self.order.pending_sum <= Decimal('0.00'):
+                p = self.order.payments.filter(state=OrderPayment.PAYMENT_STATE_CONFIRMED).last()
+                if p:
+                    p._mark_order_paid(
+                        user=self.request.user,
+                        send_mail=self.mark_paid_form.cleaned_data['send_email'],
+                        force=self.mark_paid_form.cleaned_data.get('force', False),
+                        payment_refund_sum=self.order.payment_refund_sum,
+                    )
+                    messages.success(self.request, _('The order has been marked as paid.'))
+                    return redirect(self.get_order_url())
+
             try:
                 p = self.order.payments.get(
                     state__in=(OrderPayment.PAYMENT_STATE_PENDING, OrderPayment.PAYMENT_STATE_CREATED),
@@ -1207,6 +1267,7 @@ class OrderTransition(OrderView):
         elif self.order.cancel_allowed() and to == 'c' and self.mark_canceled_form.is_valid():
             try:
                 cancel_order(self.order.pk, user=self.request.user,
+                             email_comment=self.mark_canceled_form.cleaned_data['comment'],
                              send_mail=self.mark_canceled_form.cleaned_data['send_email'],
                              cancel_invoice=self.mark_canceled_form.cleaned_data.get('cancel_invoice', True),
                              cancellation_fee=self.mark_canceled_form.cleaned_data.get('cancellation_fee'))
@@ -1244,6 +1305,7 @@ class OrderTransition(OrderView):
         elif self.order.cancel_allowed() and to == 'c':
             return render(self.request, 'pretixcontrol/order/cancel.html', {
                 'form': self.mark_canceled_form,
+                'fee': self.order.user_cancel_fee,
                 'order': self.order,
             })
         else:
@@ -1292,26 +1354,18 @@ class OrderCheckVATID(OrderView):
                 messages.error(self.request, _('No country specified.'))
                 return redirect(self.get_order_url())
 
-            if not is_eu_country(ia.country):
-                messages.error(self.request, _('VAT ID could not be checked since a non-EU country has been '
-                                               'specified.'))
-                return redirect(self.get_order_url())
-
-            if ia.vat_id[:2] != cc_to_vat_prefix(str(ia.country)):
-                messages.error(self.request, _('Your VAT ID does not match the selected country.'))
+            if not ask_for_vat_id(ia.country):
+                messages.error(self.request, _('VAT ID could not be checked since this country is not supported.'))
                 return redirect(self.get_order_url())
 
             try:
-                result = vat_moss.id.validate(ia.vat_id)
-                if result:
-                    country_code, normalized_id, company_name = result
-                    ia.vat_id_validated = True
-                    ia.vat_id = normalized_id
-                    ia.save()
-            except vat_moss.errors.InvalidError:
-                messages.error(self.request, _('This VAT ID is not valid.'))
-            except vat_moss.errors.WebServiceUnavailableError:
-                logger.exception('VAT ID checking failed for country {}'.format(ia.country))
+                normalized_id = validate_vat_id(ia.vat_id, str(ia.country))
+                ia.vat_id_validated = True
+                ia.vat_id = normalized_id
+                ia.save()
+            except VATIDFinalError as e:
+                messages.error(self.request, e.message)
+            except VATIDTemporaryError:
                 messages.error(self.request, _('The VAT ID could not be checked, as the VAT checking service of '
                                                'the country is currently not available.'))
             else:
@@ -1710,7 +1764,7 @@ class OrderChange(OrderView):
                 if p.form.cleaned_data['tax_rule'] and p.form.cleaned_data['tax_rule'] != p.tax_rule:
                     ocm.change_tax_rule(p, p.form.cleaned_data['tax_rule'])
 
-                if p.form.cleaned_data['operation_split']:
+                if p.form.cleaned_data.get('operation_split'):
                     ocm.split(p)
 
                 if p.form.cleaned_data['operation_secret']:
@@ -1954,6 +2008,8 @@ class OrderSendMail(EventPermissionRequiredMixin, OrderViewMixin, FormView):
             kwargs['initial']['subject'] = self.request.GET.get('subject')
         if self.request.GET.get('message'):
             kwargs['initial']['message'] = self.request.GET.get('message')
+        if self.request.GET.getlist('attach_invoices'):
+            kwargs['initial']['attach_invoices'] = self.order.invoices.filter(pk__in=self.request.GET.getlist('attach_invoices'))
         return kwargs
 
     def form_invalid(self, form):
@@ -2163,12 +2219,10 @@ class OrderGo(EventPermissionRequiredMixin, View):
             return redirect('control:event.order', event=request.event.slug, organizer=request.event.organizer.slug,
                             code=order.code)
         except Order.DoesNotExist:
-            try:
-                i = self.request.event.invoices.get(Q(invoice_no=code) | Q(full_invoice_no=code))
+            i = self.request.event.invoices.filter(Q(invoice_no=code) | Q(full_invoice_no=code)).first()
+            if i:
                 return redirect('control:event.order', event=request.event.slug, organizer=request.event.organizer.slug,
                                 code=i.order.code)
-            except Invoice.DoesNotExist:
-                pass
 
             messages.error(request, _('There is no order with the given order code.'))
             return redirect('control:event.orders', event=request.event.slug, organizer=request.event.organizer.slug)
@@ -2179,8 +2233,9 @@ class ExportMixin:
     def exporters(self):
         exporters = []
         responses = register_data_exporters.send(self.request.event)
-        for ex in sorted([response(self.request.event, self.request.organizer) for r, response in responses], key=lambda ex: str(ex.verbose_name)):
-            if self.request.GET.get("identifier") and ex.identifier != self.request.GET.get("identifier"):
+        id = self.request.GET.get("identifier") or self.request.POST.get("exporter")
+        for ex in sorted([response(self.request.event, self.request.organizer) for r, response in responses if response], key=lambda ex: str(ex.verbose_name)):
+            if id and ex.identifier != id:
                 continue
 
             # Use form parse cycle to generate useful defaults

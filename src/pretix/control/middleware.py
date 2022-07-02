@@ -43,7 +43,6 @@ from django.urls import get_script_prefix, resolve, reverse
 from django.utils.encoding import force_str
 from django.utils.translation import gettext as _
 from django_scopes import scope
-from hijack.templatetags.hijack_tags import is_hijacked
 
 from pretix.base.models import Event, Organizer
 from pretix.base.models.auth import SuperuserPermissionSet, User
@@ -67,6 +66,11 @@ class PermissionMiddleware:
         "auth.forgot.recover",
         "auth.invite",
         "user.settings.notifications.off",
+    )
+
+    EXCEPTIONS_FORCED_PW_CHANGE = (
+        "user.settings",
+        "auth.logout"
     )
 
     EXCEPTIONS_2FA = (
@@ -130,11 +134,26 @@ class PermissionMiddleware:
             if url_name not in ('user.reauth', 'auth.logout'):
                 return redirect(reverse('control:user.reauth') + '?next=' + quote(request.get_full_path()))
 
+        if request.user.needs_password_change and url_name not in self.EXCEPTIONS_FORCED_PW_CHANGE:
+            return redirect(reverse('control:user.settings') + '?next=' + quote(request.get_full_path()))
+
         if not request.user.require_2fa and settings.PRETIX_OBLIGATORY_2FA \
                 and url_name not in self.EXCEPTIONS_2FA:
             return redirect(reverse('control:user.settings.2fa'))
 
         if 'event' in url.kwargs and 'organizer' in url.kwargs:
+            if url.kwargs['organizer'] == '-' and url.kwargs['event'] == '-':
+                # This is a hack that just takes the user to ANY event. It's useful to link to features in support
+                # or documentation.
+                ev = request.user.get_events_with_any_permission().order_by('-date_from').first()
+                if not ev:
+                    raise Http404(_("The selected event was not found or you "
+                                    "have no permission to administrate it."))
+                k = dict(url.kwargs)
+                k['organizer'] = ev.organizer.slug
+                k['event'] = ev.slug
+                return redirect(reverse(url.view_name, kwargs=k, args=url.args))
+
             with scope(organizer=None):
                 request.event = Event.objects.filter(
                     slug=url.kwargs['event'],
@@ -150,6 +169,17 @@ class PermissionMiddleware:
             else:
                 request.eventpermset = request.user.get_event_permission_set(request.organizer, request.event)
         elif 'organizer' in url.kwargs:
+            if url.kwargs['organizer'] == '-':
+                # This is a hack that just takes the user to ANY organizer. It's useful to link to features in support
+                # or documentation.
+                org = request.user.get_organizers_with_any_permission().first()
+                if not org:
+                    raise Http404(_("The selected organizer was not found or you "
+                                    "have no permission to administrate it."))
+                k = dict(url.kwargs)
+                k['organizer'] = org.slug
+                return redirect(reverse(url.view_name, kwargs=k, args=url.args))
+
             request.organizer = Organizer.objects.filter(
                 slug=url.kwargs['organizer'],
             ).first()
@@ -175,7 +205,7 @@ class AuditLogMiddleware:
 
     def __call__(self, request):
         if request.path.startswith(get_script_prefix() + 'control') and request.user.is_authenticated:
-            if is_hijacked(request):
+            if getattr(request.user, "is_hijacked", False):
                 hijack_history = request.session.get('hijack_history', False)
                 hijacker = get_object_or_404(User, pk=hijack_history[0])
                 ss = hijacker.get_active_staff_session(request.session.get('hijacker_session'))

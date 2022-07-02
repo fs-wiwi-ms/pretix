@@ -195,6 +195,59 @@ class ItemDisplayTest(EventTestMixin, SoupTest):
         html = self.client.get('/%s/%s/' % (self.orga.slug, self.event.slug)).rendered_content
         self.assertNotIn("Early-bird", html)
 
+    def test_hidden_without_membership(self):
+        self.orga.settings.customer_accounts = True
+
+        with scopes_disabled():
+            mt = self.orga.membership_types.create(name="foo")
+            q = Quota.objects.create(event=self.event, name='Quota', size=2)
+            item = Item.objects.create(event=self.event, name='Early-bird ticket', default_price=0, active=True,
+                                       require_membership=True, require_membership_hidden=True)
+            item.require_membership_types.add(mt)
+            q.items.add(item)
+            customer = self.orga.customers.create(email='john@example.org', is_verified=True, is_active=True)
+            customer.set_password('foo')
+            customer.save()
+
+        html = self.client.get('/%s/%s/' % (self.orga.slug, self.event.slug)).rendered_content
+        self.assertNotIn("Early-bird", html)
+
+        r = self.client.post('/%s/account/login' % self.orga.slug, {
+            'email': 'john@example.org',
+            'password': 'foo',
+        })
+        assert r.status_code == 302
+
+        html = self.client.get('/%s/%s/' % (self.orga.slug, self.event.slug)).rendered_content
+        self.assertNotIn("Early-bird", html)
+
+        with scopes_disabled():
+            m = customer.memberships.create(
+                membership_type=mt,
+                date_start=self.event.date_from - datetime.timedelta(days=5),
+                date_end=self.event.date_from + datetime.timedelta(days=5),
+            )
+
+        html = self.client.get('/%s/%s/' % (self.orga.slug, self.event.slug)).rendered_content
+        self.assertIn("Early-bird", html)
+
+        m.canceled = True
+        m.save()
+        html = self.client.get('/%s/%s/' % (self.orga.slug, self.event.slug)).rendered_content
+        self.assertNotIn("Early-bird", html)
+
+        m.canceled = False
+        m.testmode = True
+        m.save()
+        html = self.client.get('/%s/%s/' % (self.orga.slug, self.event.slug)).rendered_content
+        self.assertNotIn("Early-bird", html)
+
+        m.testmode = False
+        m.date_end = m.date_start
+        m.save()
+        html = self.client.get('/%s/%s/' % (self.orga.slug, self.event.slug)).rendered_content
+        self.assertNotIn("Early-bird", html)
+
     def test_simple_with_category(self):
         with scopes_disabled():
             c = ItemCategory.objects.create(event=self.event, name="Entry tickets", position=0)
@@ -261,8 +314,7 @@ class ItemDisplayTest(EventTestMixin, SoupTest):
         resp = self.client.get('/%s/%s/' % (self.orga.slug, self.event.slug))
         self.assertIn("Foo SE2", resp.rendered_content)
         self.assertNotIn("Foo SE1", resp.rendered_content)
-        resp = self.client.get('/%s/%s/?year=%d&month=%d' % (self.orga.slug, self.event.slug, se1.date_from.year,
-                                                             se1.date_from.month))
+        resp = self.client.get('/%s/%s/?date=%d-%02d' % (self.orga.slug, self.event.slug, se1.date_from.year, se1.date_from.month))
         self.assertIn("Foo SE1", resp.rendered_content)
         self.assertNotIn("Foo SE2", resp.rendered_content)
 
@@ -279,9 +331,7 @@ class ItemDisplayTest(EventTestMixin, SoupTest):
         print(resp.rendered_content)
         self.assertIn("Foo SE2", resp.rendered_content)
         self.assertNotIn("Foo SE1", resp.rendered_content)
-        resp = self.client.get('/%s/%s/?year=%d&week=%d' % (self.orga.slug, self.event.slug,
-                                                            se1.date_from.isocalendar()[0],
-                                                            se1.date_from.isocalendar()[1]))
+        resp = self.client.get('/%s/%s/?date=%d-W%d' % (self.orga.slug, self.event.slug, se1.date_from.isocalendar()[0], se1.date_from.isocalendar()[1]))
         self.assertIn("Foo SE1", resp.rendered_content)
         self.assertNotIn("Foo SE2", resp.rendered_content)
 
@@ -789,7 +839,7 @@ class VoucherRedeemItemDisplayTest(EventTestMixin, SoupTest):
         html = self.client.get('/%s/%s/redeem?voucher=%s' % (self.orga.slug, self.event.slug, self.v.code))
         assert "Early-bird" in html.rendered_content
         assert "10.00" in html.rendered_content
-        assert "<del>€14.00</del>" in html.rendered_content
+        assert re.search(r"<del>.*€14\.00.*</del>", html.rendered_content.replace("\n", ""))
 
     def test_fail_redeemed(self):
         self.v.redeemed = 1

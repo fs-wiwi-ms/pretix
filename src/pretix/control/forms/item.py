@@ -32,6 +32,7 @@
 # Unless required by applicable law or agreed to in writing, software distributed under the Apache License 2.0 is
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under the License.
+import copy
 import os
 from decimal import Decimal
 from urllib.parse import urlencode
@@ -423,9 +424,10 @@ class ItemCreateForm(I18nModelForm):
         if self.cleaned_data.get('has_variations'):
             if self.cleaned_data.get('copy_from') and self.cleaned_data.get('copy_from').has_variations:
                 for variation in self.cleaned_data['copy_from'].variations.all():
-                    ItemVariation.objects.create(item=instance, value=variation.value, active=variation.active,
-                                                 position=variation.position, default_price=variation.default_price,
-                                                 description=variation.description, original_price=variation.original_price)
+                    v = copy.copy(variation)
+                    v.pk = None
+                    v.item = instance
+                    v.save()
             else:
                 ItemVariation.objects.create(
                     item=instance, value=__('Standard')
@@ -434,6 +436,9 @@ class ItemCreateForm(I18nModelForm):
         if self.cleaned_data.get('copy_from'):
             for question in self.cleaned_data['copy_from'].questions.all():
                 question.items.add(instance)
+                question.log_action('pretix.event.question.changed', user=self.user, data={
+                    'item_added': self.instance.pk
+                })
             for a in self.cleaned_data['copy_from'].addons.all():
                 instance.addons.create(addon_category=a.addon_category, min_count=a.min_count, max_count=a.max_count,
                                        price_included=a.price_included, position=a.position,
@@ -563,7 +568,7 @@ class ItemUpdateForm(I18nModelForm):
             if d['tax_rule'] and d['tax_rule'].rate > 0:
                 self.add_error(
                     'tax_rule',
-                    _("Gift card products should not be associated with non-zero tax rates since sales tax will be applied when the gift card is redeemed.")
+                    _("Gift card products should use a tax rule with a rate of 0 percent since sales tax will be applied when the gift card is redeemed.")
                 )
             if d['admission']:
                 self.add_error(
@@ -607,6 +612,7 @@ class ItemUpdateForm(I18nModelForm):
             'issue_giftcard',
             'require_membership',
             'require_membership_types',
+            'require_membership_hidden',
             'grant_membership_type',
             'grant_membership_duration_like_event',
             'grant_membership_duration_days',
@@ -626,7 +632,9 @@ class ItemUpdateForm(I18nModelForm):
                 'class': 'scrolling-multiple-choice'
             }),
             'generate_tickets': TicketNullBooleanSelect(),
-            'show_quota_left': ShowQuotaNullBooleanSelect()
+            'show_quota_left': ShowQuotaNullBooleanSelect(),
+            'max_per_order': forms.widgets.NumberInput(attrs={'min': 0}),
+            'min_per_order': forms.widgets.NumberInput(attrs={'min': 0}),
         }
 
 
@@ -712,7 +720,9 @@ class ItemVariationForm(I18nModelForm):
             'default_price',
             'original_price',
             'description',
+            'require_approval',
             'require_membership',
+            'require_membership_hidden',
             'require_membership_types',
             'available_from',
             'available_until',

@@ -34,8 +34,8 @@ var form_handlers = function (el) {
                 date: 'fa fa-calendar',
                 up: 'fa fa-chevron-up',
                 down: 'fa fa-chevron-down',
-                previous: 'fa fa-chevron-left',
-                next: 'fa fa-chevron-right',
+                previous: $("html").hasClass("rtl") ? 'fa fa-chevron-right' : 'fa fa-chevron-left',
+                next: $("html").hasClass("rtl") ? 'fa fa-chevron-left' : 'fa fa-chevron-right',
                 today: 'fa fa-screenshot',
                 clear: 'fa fa-trash',
                 close: 'fa fa-remove'
@@ -57,8 +57,8 @@ var form_handlers = function (el) {
                 date: 'fa fa-calendar',
                 up: 'fa fa-chevron-up',
                 down: 'fa fa-chevron-down',
-                previous: 'fa fa-chevron-left',
-                next: 'fa fa-chevron-right',
+                previous: $("html").hasClass("rtl") ? 'fa fa-chevron-right' : 'fa fa-chevron-left',
+                next: $("html").hasClass("rtl") ? 'fa fa-chevron-left' : 'fa fa-chevron-right',
                 today: 'fa fa-screenshot',
                 clear: 'fa fa-trash',
                 close: 'fa fa-remove'
@@ -99,8 +99,8 @@ var form_handlers = function (el) {
                 date: 'fa fa-calendar',
                 up: 'fa fa-chevron-up',
                 down: 'fa fa-chevron-down',
-                previous: 'fa fa-chevron-left',
-                next: 'fa fa-chevron-right',
+                previous: $("html").hasClass("rtl") ? 'fa fa-chevron-right' : 'fa fa-chevron-left',
+                next: $("html").hasClass("rtl") ? 'fa fa-chevron-left' : 'fa fa-chevron-right',
                 today: 'fa fa-screenshot',
                 clear: 'fa fa-trash',
                 close: 'fa fa-remove'
@@ -119,7 +119,7 @@ var form_handlers = function (el) {
                 width: $(this).attr("data-size") ? parseInt($(this).attr("data-size")) : 256,
                 height: $(this).attr("data-size") ? parseInt($(this).attr("data-size")) : 256,
             }
-        );
+        ).find("canvas").attr("role", "img").attr("aria-label", this.getAttribute("data-desc"));
     });
 
     el.find("input[data-exclusive-prefix]").each(function () {
@@ -174,22 +174,93 @@ var form_handlers = function (el) {
     }
 };
 
+function setup_basics(el) {
+    el.find("input[data-toggle=radiocollapse]").change(function () {
+        $($(this).attr("data-parent")).find(".collapse.in").collapse('hide');
+        $($(this).attr("data-target")).collapse('show');
+    });
+    el.find(".js-only").removeClass("js-only");
+    el.find(".js-hidden").hide();
+
+    el.find("div.collapsed").removeClass("collapsed").addClass("collapse");
+    el.find(".has-error, .alert-danger").each(function () {
+        $(this).closest("div.panel-collapse").collapse("show");
+    });
+    el.find(".has-error").first().each(function(){
+        if ($(this).is(':input')) this.focus();
+        else $(":input", this).get(0).focus();
+    });
+    el.find(".alert-danger").first().each(function() {
+        var content = $("<ul></ul>").click(function(e) {
+            var input = $(e.target.hash).get(0);
+            if (input) input.focus();
+            input.scrollIntoView({block: "center"});
+            e.preventDefault();
+        });
+        $(".has-error").each(function() {
+            var target = target = $(":input", this);
+            var desc = $("#" + target.attr("aria-describedby").split(' ', 1)[0]);
+            // multi-input fields have a role=group with aria-labelledby
+            var label = this.hasAttribute("aria-labelledby") ? $("#" + this.getAttribute("aria-labelledby")) : $("[for="+target.attr("id")+"]");
+
+            var $li = $("<li>");
+            $li.text(": " + desc.text())
+            $li.prepend($("<a>").attr("href", "#" + target.attr("id")).text(label.get(0).childNodes[0].nodeValue))
+            content.append($li);
+        });
+        $(this).append(content);
+    });
+
+    el.find("[data-click-to-load]").on("click", function(e) {
+        var target = document.getElementById(this.getAttribute("data-click-to-load"));
+        target.src = this.href;
+        target.focus();
+        e.preventDefault();
+    });
+
+    el.find('[data-toggle="tooltip"]').tooltip();
+
+    // AddOns
+    el.find('.addon-variation-description').hide();
+    el.find('.toggle-variation-description').click(function () {
+        $(this).parent().find('.addon-variation-description').slideToggle();
+    });
+    el.find('input[type=radio][description]').change(function () {
+        if ($(this).prop("checked")) {
+            $(this).parent().parent().find('.addon-variation-description').stop().slideDown();
+        }
+    });
+}
+
+function setup_week_calendar() {
+    // Week calendar
+    // On mobile, auto-collapse all days except today, if we have more than 15 events in total
+    if ($(window).width() < 992 && $(".week-calendar .event").length > 15) {
+        $(".week-calendar .weekday:not(.today)").each(function () {
+            $(this).prop("open", false);
+        });
+    }
+}
 
 $(function () {
     "use strict";
 
     $("body").removeClass("nojs");
 
-    $("input[data-toggle=radiocollapse]").change(function () {
-        $($(this).attr("data-parent")).find(".collapse.in").collapse('hide');
-        $($(this).attr("data-target")).collapse('show');
-    });
-    $(".js-only").removeClass("js-only");
-    $(".js-hidden").hide();
+    var scrollpos = sessionStorage ? sessionStorage.getItem('scrollpos') : 0;
+    if (scrollpos) {
+        window.scrollTo(0, scrollpos);
+        sessionStorage.removeItem('scrollpos');
+    }
 
-    $("div.collapsed").removeClass("collapsed").addClass("collapse");
-    $(".has-error, .alert-danger").each(function () {
-        $(this).closest("div.panel-collapse").collapse("show");
+    $(".accordion-radio").click(function() {
+        var $input = $("input", this);
+        if (!$input.prop("checked")) $input.prop('checked', true).trigger("change");
+    });
+
+    setup_basics($("body"));
+    $(".overlay-remove").on("click", function() {
+        $(this).closest(".contains-overlay").find(".overlay").fadeOut();
     });
 
     $("#voucher-box").hide();
@@ -199,20 +270,7 @@ $(function () {
         $("#voucher-toggle").slideUp();
     });
 
-    $('[data-toggle="tooltip"]').tooltip();
-
     $("#ajaxerr").on("click", ".ajaxerr-close", ajaxErrDialog.hide);
-
-    // AddOns
-    $('.addon-variation-description').hide();
-    $('.toggle-variation-description').click(function () {
-        $(this).parent().find('.addon-variation-description').slideToggle();
-    });
-    $('input[type=radio][description]').change(function () {
-        if ($(this).prop("checked")) {
-            $(this).parent().parent().find('.addon-variation-description').stop().slideDown();
-        }
-    });
 
     // Copy answers
     $(".js-copy-answers").click(function (e) {
@@ -280,16 +338,26 @@ $(function () {
     // Subevent choice
     if ($(".subevent-toggle").length) {
         $(".subevent-list").hide();
-        $(".subevent-toggle").css("display", "block").click(function () {
+        $(".subevent-toggle").show().click(function () {
             $(".subevent-list").slideToggle(300);
-            $(".subevent-toggle").slideToggle(300)
+            $(this).slideToggle(300).attr("aria-expanded", true);
         });
     }
-
+    if (sessionStorage) {
+        $("[data-save-scrollpos]").click(function () {
+            sessionStorage.setItem('scrollpos', window.scrollY);
+        });
+    }
     $("#monthselform select").change(function () {
-        $(this).closest("form").get(0).submit();
+        if (sessionStorage) sessionStorage.setItem('scrollpos', window.scrollY);
+        this.form.submit();
     });
-
+    $("#monthselform input").on("dp.change", function () {
+        if ($(this).data("DateTimePicker")) {  // prevent submit after dp init
+            if (sessionStorage) sessionStorage.setItem('scrollpos', window.scrollY);
+            this.form.submit();
+        }
+    });
     var update_cart_form = function () {
         var is_enabled = $(".product-row input[type=checkbox]:checked, .variations input[type=checkbox]:checked, .product-row input[type=radio]:checked, .variations input[type=radio]:checked").length;
         if (!is_enabled) {
@@ -320,7 +388,7 @@ $(function () {
 
     $(".table-calendar td.has-events").click(function () {
         var $tr = $(this).closest(".table-calendar").find(".selected-day");
-        $tr.find("td").html($(this).find(".events").html());
+        $tr.find("td").html($(this).find(".events").clone());
         $tr.find("td").prepend($("<h3>").text($(this).attr("data-date")));
         $tr.removeClass("hidden");
     });
@@ -377,14 +445,14 @@ $(function () {
         dependency.closest('.form-group, form').find('input[name=' + dependency.attr("name") + ']').on("dp.change", update);
     });
 
-    $("input[name$=vat_id][data-countries-in-eu]").each(function () {
+    $("input[name$=vat_id][data-countries-with-vat-id]").each(function () {
         var dependent = $(this),
             dependency_country = $(this).closest(".panel-body, form").find('select[name$=country]'),
             dependency_id_is_business_1 = $(this).closest(".panel-body, form").find('input[id$=id_is_business_1]'),
             update = function (ev) {
                 if (dependency_id_is_business_1.length && !dependency_id_is_business_1.prop("checked")) {
                     dependent.closest(".form-group").hide();
-                } else if (dependent.attr('data-countries-in-eu').split(',').includes(dependency_country.val())) {
+                } else if (dependent.attr('data-countries-with-vat-id').split(',').includes(dependency_country.val())) {
                     dependent.closest(".form-group").show();
                 } else {
                     dependent.closest(".form-group").hide();
@@ -442,9 +510,11 @@ $(function () {
     $("span[data-timezone], small[data-timezone]").each(function() {
         var t = moment.tz($(this).attr("data-time"), $(this).attr("data-timezone"))
         var tz = moment.tz.zone($(this).attr("data-timezone"))
+        var tpl = '<div class="tooltip" role="tooltip"><div class="tooltip-arrow"></div><div class="tooltip-inner text-nowrap"></div></div>';
 
         $(this).tooltip({
-            'title': gettext("Time zone:") + " " + tz.abbr(t)
+            "title": gettext("Time zone:") + " " + tz.abbr(t),
+            "template": tpl
         });
         if (t.tz(tz.name).format() !== t.tz(local_tz).format()) {
             var $add = $("<span>")
@@ -462,21 +532,142 @@ $(function () {
             }
             $add.insertAfter($(this));
             $add.tooltip({
-                'title': gettext("Time zone:") + " " + moment.tz.zone(local_tz).abbr(t),
+                "title": gettext("Time zone:") + " " + moment.tz.zone(local_tz).abbr(t),
+                "template": tpl
             });
         }
     });
 
-    // Week calendar
-    // On mobile, auto-collapse all days except today, if we have more than 15 events in total
-    if ($(window).width() < 992 && $(".week-calendar .event").length > 15) {
-        $(".week-calendar .weekday:not(.today)").each(function () {
-            $(this).prop("open", false);
-        });
+    // For a very weird reason, window width is 0 on an initial load of the widget
+    if ($(window).width() > 0) {
+        setup_week_calendar()
+    } else {
+        $(window).on('resize', setup_week_calendar)
     }
+
+    // Day calendar
+    $(".day-calendar [data-concurrency]").each(function() {
+        var c = parseInt(this.getAttribute("data-concurrency"), 10);
+        if (c > 9) this.style.setProperty('--concurrency', c);
+    });
+
+    $(".day-calendar").each(function() {
+        // Fix Chrome not being able to use calc-division in grid
+        var s = window.getComputedStyle($(".day-timeline > li").get(0));
+        if (s.getPropertyValue('grid-column-start') != "auto") return;
+
+        var rasterSize = this.getAttribute("data-raster-size");
+        var duration = this.getAttribute("data-duration").split(":");
+        var cols = duration[0]*60/rasterSize + duration[1]/rasterSize;
+
+        $(".day-timeline", this).css("grid-template-columns", "repeat(" + cols + ", minmax(var(--col-min-size, 3em), 1fr))");
+
+        $(".day-timeline > li", this).each(function() {
+            var s = window.getComputedStyle(this);
+
+            var offset = this.getAttribute("data-offset").split(":");
+            var duration = this.getAttribute("data-duration").split(":");
+
+            var columnStart = 1 + offset[0]*60/rasterSize + offset[1]/rasterSize;
+            var columnSpan = duration[0]*60/rasterSize + duration[1]/rasterSize
+            this.style.gridColumn = columnStart + " / span " + columnSpan;
+        });
+    });
+
+    $(".day-calendar").each(function() {
+
+        var timezone = this.getAttribute("data-timezone");
+        var startTime = moment.tz(this.getAttribute("data-start"), timezone);
+
+        var currentTime = moment().tz(timezone);
+        if (!currentTime.isSame(startTime, 'day')) {
+            // Not on same day
+            return;
+        }
+
+        // scroll to best matching tick
+        var currentTimeCmp = parseInt(currentTime.format("Hmm"), 10);
+        var ticks = this.querySelectorAll(".ticks li");
+        var currentTick;
+        var t;
+        for (var i=0, max=ticks.length; i < max; i++) {
+            currentTick = ticks[i]
+            t = parseInt(currentTick.getAttribute("data-start").replace(":", ""), 10);
+            if (t > currentTimeCmp) {
+                currentTick = ticks[Math.max(i-1, 0)]
+                break;
+            }
+        }
+        if (currentTick.offsetLeft > 0.66*this.offsetWidth) {
+            this.scrollLeft = Math.max(currentTick.offsetLeft - this.offsetWidth/2, 0);
+        }
+
+
+        var thisCalendar = this;
+        var currentTimeInterval;
+
+        var timeFormat = document.body.getAttribute("data-timeformat");
+        var timeFormatParts = timeFormat.match(/([a-zA-Z_\s]+)([^a-zA-Z_\s])(.*)/);
+        if (!timeFormatParts) timeFormatParts = [timeFormat];
+        if (timeFormatParts.length > 1) timeFormatParts.shift();
+        var currentTimeBar = $('<div class="current-time-bar" aria-hidden="true"><time></time></div>').appendTo(this);
+        var currentTimeDisplay = currentTimeBar.find("time");
+        var currentTimeDisplayParts = [];
+        timeFormatParts.forEach(function(format) {
+            currentTimeDisplayParts.push([format, $("<span></span>").appendTo(currentTimeDisplay)])
+        }); 
+        var duration = this.getAttribute("data-duration").split(":").reduce(function(previousValue, currentValue, currentIndex) {
+            return previousValue + (currentIndex ? parseInt(currentValue, 10) * 60 : parseInt(currentValue, 10) * 60 * 60);
+        }, 0);
+        function setCurrentTimeBar() {
+            var currentTime = moment().tz(timezone);
+            var currentTimeDelta = Math.floor((currentTime - startTime)/1000);
+            if (currentTimeDelta < 0 || currentTimeDelta > duration) {
+                // Too early || Too late
+                window.clearInterval(currentTimeInterval);
+                currentTimeBar.remove();
+                return;
+            }
+            
+            var offset = thisCalendar.querySelector("h3").getBoundingClientRect().width;
+            var dx = Math.round(offset + (thisCalendar.scrollWidth-offset)*(currentTimeDelta/duration));
+            currentTimeDisplayParts.forEach(function(part) {
+                part[1].text(currentTime.format(part[0]));
+            });
+            if (currentTimeDisplay.get(0).getBoundingClientRect().width + dx >= thisCalendar.scrollWidth) {
+                currentTimeBar.addClass("swap-side");
+            }
+            else {
+                currentTimeBar.removeClass("swap-side");
+            }
+            thisCalendar.style.setProperty('--current-time-offset', dx + "px");
+        }
+        currentTimeInterval = window.setInterval(setCurrentTimeBar, 15*1000);
+        $(window).on("resize", setCurrentTimeBar);
+        setCurrentTimeBar();
+    });
 
     // Lightbox
     lightbox.init();
+
+    // free-range price input auto-check checkbox/set count-input to 1 if 0
+    $("[data-checked-onchange]").each(function() {
+        var countInput = this;
+        $("#" + this.getAttribute("data-checked-onchange")).on("change", function() {
+            if (countInput.type === "checkbox") {
+                if (countInput.checked) return;
+                countInput.checked = true;
+            }
+            else if (countInput.type === "number" && !countInput.valueAsNumber) {
+                countInput.value = "1";
+            }
+            else {
+                return;
+            }
+            // in case of a change, trigger event
+            $(countInput).trigger("change");
+        });
+    });
 });
 
 function copy_answers(elements, answers) {

@@ -35,6 +35,7 @@
 from collections import OrderedDict
 from datetime import datetime, time, timedelta
 
+import bleach
 import dateutil.parser
 from django import forms
 from django.db.models import (
@@ -374,8 +375,8 @@ class PDFCheckinList(ReportlabExportMixin, CheckInListMixin, BaseExporter):
                 CBFlowable(bool(op.last_checked_in)),
                 '✘' if op.order.status != Order.STATUS_PAID else '✔',
                 op.order.code,
-                Paragraph(name, self.get_style()),
-                Paragraph(item, self.get_style()),
+                Paragraph(bleach.clean(str(name), tags=['br']).strip().replace('<br>', '<br/>'), self.get_style()),
+                Paragraph(bleach.clean(str(item), tags=['br']).strip().replace('<br>', '<br/>'), self.get_style()),
             ]
             acache = {}
             if op.addon_to:
@@ -395,6 +396,7 @@ class PDFCheckinList(ReportlabExportMixin, CheckInListMixin, BaseExporter):
                     acache[a.question_id] = str(a)
             for q in questions:
                 txt = acache.get(q.pk, '')
+                txt = bleach.clean(txt, tags=['br']).strip().replace('<br>', '<br/>')
                 p = Paragraph(txt, self.get_style())
                 while p.wrap(colwidths[len(row)], 5000)[1] > 50 * mm:
                     txt = txt[:len(txt) - 50] + "..."
@@ -511,13 +513,15 @@ class CSVCheckinList(CheckInListMixin, ListExporter):
             ]
             if len(name_scheme['fields']) > 1:
                 for k, label, w in name_scheme['fields']:
-                    row.append(
-                        (
-                            op.attendee_name_parts or
-                            (op.addon_to.attendee_name_parts if op.addon_to else {}) or
-                            ia.name_parts
-                        ).get(k, '')
-                    )
+                    v = (
+                        op.attendee_name_parts or
+                        (op.addon_to.attendee_name_parts if op.addon_to else {}) or
+                        ia.name_parts
+                    ).get(k, '')
+                    if k == "salutation":
+                        v = pgettext("person_name_salutation", v)
+
+                    row.append(v)
             row += [
                 str(op.item) + (" – " + str(op.variation.value) if op.variation else ""),
                 op.price,
@@ -614,6 +618,7 @@ class CheckinLogList(ListExporter):
             _('Product'),
             _('Name'),
             _('Device'),
+            _('Offline'),
             _('Offline override'),
             _('Automatically checked in'),
             _('Gate'),
@@ -660,6 +665,7 @@ class CheckinLogList(ListExporter):
                 str(ci.position.item) if ci.position else (str(ci.raw_item) if ci.raw_item else ''),
                 (ci.position.attendee_name or ia.name) if ci.position else '',
                 str(ci.device) if ci.device else '',
+                _('Yes') if ci.force_sent is True else (_('No') if ci.force_sent is False else '?'),
                 _('Yes') if ci.forced else _('No'),
                 _('Yes') if ci.auto_checked_in else _('No'),
                 str(ci.gate or ''),

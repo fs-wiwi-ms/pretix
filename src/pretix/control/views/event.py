@@ -74,13 +74,14 @@ from pretix.base.signals import register_ticket_outputs
 from pretix.base.templatetags.rich_text import markdown_compile_email
 from pretix.control.forms.event import (
     CancelSettingsForm, CommentForm, ConfirmTextFormset, EventDeleteForm,
-    EventMetaValueForm, EventSettingsForm, EventUpdateForm,
-    InvoiceSettingsForm, ItemMetaPropertyForm, MailSettingsForm,
-    PaymentSettingsForm, ProviderForm, QuickSetupForm,
+    EventFooterLinkFormset, EventMetaValueForm, EventSettingsForm,
+    EventUpdateForm, InvoiceSettingsForm, ItemMetaPropertyForm,
+    MailSettingsForm, PaymentSettingsForm, ProviderForm, QuickSetupForm,
     QuickSetupProductFormSet, TaxRuleForm, TaxRuleLineFormSet,
     TicketSettingsForm, WidgetCodeForm,
 )
 from pretix.control.permissions import EventPermissionRequiredMixin
+from pretix.control.views.mailsetup import MailSettingsSetupView
 from pretix.control.views.user import RecentAuthenticationRequiredMixin
 from pretix.helpers.database import rolledback_transaction
 from pretix.multidomain.urlreverse import get_event_domain
@@ -91,6 +92,7 @@ from ...base.i18n import language
 from ...base.models.items import (
     Item, ItemCategory, ItemMetaProperty, Question, Quota,
 )
+from ...base.services.mail import TolerantDict
 from ...base.settings import SETTINGS_AFFECTING_CSS, LazyI18nStringList
 from ..logdisplay import OVERVIEW_BANLIST
 from . import CreateView, PaginationMixin, UpdateView
@@ -184,6 +186,7 @@ class EventUpdate(DecoupleMixin, EventSettingsViewMixin, EventPermissionRequired
         context['meta_forms'] = self.meta_forms
         context['item_meta_property_formset'] = self.item_meta_property_formset
         context['confirm_texts_formset'] = self.confirm_texts_formset
+        context['footer_links_formset'] = self.footer_links_formset
         return context
 
     @transaction.atomic
@@ -193,6 +196,7 @@ class EventUpdate(DecoupleMixin, EventSettingsViewMixin, EventPermissionRequired
         self.save_meta()
         self.save_item_meta_property_formset(self.object)
         self.save_confirm_texts_formset(self.object)
+        self.save_footer_links_formset(self.object)
         change_css = False
 
         if self.sform.has_changed() or self.confirm_texts_formset.has_changed():
@@ -202,6 +206,10 @@ class EventUpdate(DecoupleMixin, EventSettingsViewMixin, EventPermissionRequired
             self.request.event.log_action('pretix.event.settings', user=self.request.user, data=data)
             if any(p in self.sform.changed_data for p in SETTINGS_AFFECTING_CSS):
                 change_css = True
+        if self.footer_links_formset.has_changed():
+            self.request.event.log_action('pretix.event.footerlinks.changed', user=self.request.user, data={
+                'data': self.footer_links_formset.cleaned_data
+            })
         if form.has_changed():
             self.request.event.log_action('pretix.event.changed', user=self.request.user, data={
                 k: (form.cleaned_data.get(k).name
@@ -236,7 +244,8 @@ class EventUpdate(DecoupleMixin, EventSettingsViewMixin, EventPermissionRequired
     def post(self, request, *args, **kwargs):
         form = self.get_form()
         if form.is_valid() and self.sform.is_valid() and all([f.is_valid() for f in self.meta_forms]) and \
-                self.item_meta_property_formset.is_valid() and self.confirm_texts_formset.is_valid():
+                self.item_meta_property_formset.is_valid() and self.confirm_texts_formset.is_valid() and \
+                self.footer_links_formset.is_valid():
             # reset timezone
             zone = timezone(self.sform.cleaned_data['timezone'])
             event = form.instance
@@ -290,9 +299,17 @@ class EventUpdate(DecoupleMixin, EventSettingsViewMixin, EventPermissionRequired
     def save_confirm_texts_formset(self, obj):
         obj.settings.confirm_texts = LazyI18nStringList(
             form_data['text'].data
-            for form_data in sorted(self.confirm_texts_formset.cleaned_data, key=operator.itemgetter("ORDER"))
-            if not form_data.get("DELETE", False)
+            for form_data in sorted((d for d in self.confirm_texts_formset.cleaned_data if d), key=operator.itemgetter("ORDER"))
+            if form_data and not form_data.get("DELETE", False)
         )
+
+    @cached_property
+    def footer_links_formset(self):
+        return EventFooterLinkFormset(self.request.POST if self.request.method == "POST" else None, event=self.object,
+                                      prefix="footer-links", instance=self.object)
+
+    def save_footer_links_formset(self, obj):
+        self.footer_links_formset.save()
 
 
 class EventPlugins(EventSettingsViewMixin, EventPermissionRequiredMixin, TemplateView, SingleObjectMixin):
@@ -326,15 +343,27 @@ class EventPlugins(EventSettingsViewMixin, EventPermissionRequiredMixin, Templat
             'FORMAT': _('Output and export formats'),
             'API': _('API features'),
         }
+
+        plugins_grouped = groupby(
+            sorted(
+                plugins,
+                key=lambda p: (
+                    str(getattr(p, 'category', _('Other'))),
+                    (0 if getattr(p, 'featured', False) else 1),
+                    str(p.name).lower().replace('pretix ', '')
+                ),
+            ),
+            lambda p: str(getattr(p, 'category', _('Other')))
+        )
+        plugins_grouped = [(c, list(plist)) for c, plist in plugins_grouped]
+
         context['plugins'] = sorted([
-            (c, labels.get(c, c), list(plist))
+            (c, labels.get(c, c), plist, any(getattr(p, 'picture', None) for p in plist))
             for c, plist
-            in groupby(
-                sorted(plugins, key=lambda p: str(getattr(p, 'category', _('Other')))),
-                lambda p: str(getattr(p, 'category', _('Other')))
-            )
+            in plugins_grouped
         ], key=lambda c: (order.index(c[0]), c[1]) if c[0] in order else (999, str(c[1])))
         context['plugins_active'] = self.object.get_plugins()
+        context['show_meta'] = settings.PRETIX_PLUGINS_SHOW_META
         return context
 
     def get(self, request, *args, **kwargs):
@@ -353,19 +382,17 @@ class EventPlugins(EventSettingsViewMixin, EventPermissionRequiredMixin, Templat
         }
 
         with transaction.atomic():
-            allow_restricted = request.user.has_active_staff_session(request.session.session_key)
-
             for key, value in request.POST.items():
                 if key.startswith("plugin:"):
                     module = key.split(":")[1]
                     if value == "enable" and module in plugins_available:
                         if getattr(plugins_available[module], 'restricted', False):
-                            if not allow_restricted:
+                            if module not in request.event.settings.allowed_restricted_plugins:
                                 continue
 
                         self.request.event.log_action('pretix.event.plugins.enabled', user=self.request.user,
                                                       data={'plugin': module})
-                        self.object.enable_plugin(module, allow_restricted=allow_restricted)
+                        self.object.enable_plugin(module, allow_restricted=request.event.settings.allowed_restricted_plugins)
                     else:
                         self.request.event.log_action('pretix.event.plugins.disabled', user=self.request.user,
                                                       data={'plugin': module})
@@ -637,27 +664,27 @@ class MailSettings(EventSettingsViewMixin, EventSettingsFormView):
                         k: form.cleaned_data.get(k) for k in form.changed_data
                     }
                 )
-
-            if request.POST.get('test', '0').strip() == '1':
-                backend = self.request.event.get_mail_backend(force_custom=True, timeout=10)
-                try:
-                    backend.test(self.request.event.settings.mail_from)
-                except Exception as e:
-                    messages.warning(self.request, _('An error occurred while contacting the SMTP server: %s') % str(e))
-                else:
-                    if form.cleaned_data.get('smtp_use_custom'):
-                        messages.success(self.request, _('Your changes have been saved and the connection attempt to '
-                                                         'your SMTP server was successful.'))
-                    else:
-                        messages.success(self.request, _('We\'ve been able to contact the SMTP server you configured. '
-                                                         'Remember to check the "use custom SMTP server" checkbox, '
-                                                         'otherwise your SMTP server will not be used.'))
-            else:
-                messages.success(self.request, _('Your changes have been saved.'))
+            messages.success(self.request, _('Your changes have been saved.'))
             return redirect(self.get_success_url())
         else:
             messages.error(self.request, _('We could not save your changes. See below for details.'))
             return self.get(request)
+
+
+class MailSettingsSetup(EventPermissionRequiredMixin, MailSettingsSetupView):
+    permission = 'can_change_event_settings'
+    basetpl = 'pretixcontrol/event/base.html'
+
+    def get_success_url(self) -> str:
+        return reverse('control:event.settings.mail', kwargs={
+            'organizer': self.request.event.organizer.slug,
+            'event': self.request.event.slug
+        })
+
+    def log_action(self, data):
+        self.request.event.log_action(
+            'pretix.event.settings', user=self.request.user, data=data
+        )
 
 
 class MailSettingsPreview(EventPermissionRequiredMixin, View):
@@ -730,7 +757,7 @@ class MailSettingsRendererPreview(MailSettingsPreview):
 
     def get(self, request, *args, **kwargs):
         v = str(request.event.settings.mail_text_order_placed)
-        v = v.format_map(self.placeholders('mail_text_order_placed'))
+        v = v.format_map(TolerantDict(self.placeholders('mail_text_order_placed')))
         renderers = request.event.get_html_mail_renderers()
         if request.GET.get('renderer') in renderers:
             with rolledback_transaction():
@@ -1042,6 +1069,9 @@ class EventLog(EventPermissionRequiredMixin, PaginationMixin, ListView):
             qs = qs.filter(device_id=self.request.GET.get('user')[2:])
         elif self.request.GET.get('user'):
             qs = qs.filter(user_id=self.request.GET.get('user'))
+
+        if self.request.GET.get('action_type'):
+            qs = qs.filter(action_type=self.request.GET['action_type'])
 
         if self.request.GET.get('content_type'):
             qs = qs.filter(content_type=get_object_or_404(ContentType, pk=self.request.GET.get('content_type')))
@@ -1414,7 +1444,7 @@ class QuickSetupView(FormView):
             })
             quota.items.add(*items)
 
-        self.request.event.set_active_plugins(plugins_active, allow_restricted=True)
+        self.request.event.set_active_plugins(plugins_active, allow_restricted=plugins_active)
         self.request.event.save()
         messages.success(self.request, _('Your changes have been saved. You can now go on with looking at the details '
                                          'or take your event live to start selling!'))
