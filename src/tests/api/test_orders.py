@@ -114,7 +114,7 @@ def order(event, item, taxrule, question):
         o.fees.create(fee_type=OrderFee.FEE_TYPE_PAYMENT, value=Decimal('0.25'), tax_rate=Decimal('19.00'),
                       tax_value=Decimal('0.05'), tax_rule=taxrule, canceled=True)
         InvoiceAddress.objects.create(order=o, company="Sample company", country=Country('NZ'),
-                                      vat_id="DE123", vat_id_validated=True)
+                                      vat_id="DE123", vat_id_validated=True, custom_field="Custom info")
         op = OrderPosition.objects.create(
             order=o,
             item=item,
@@ -264,6 +264,7 @@ TEST_ORDER_RES = {
         "country": "NZ",
         "state": "",
         "internal_reference": "",
+        "custom_field": "Custom info",
         "vat_id": "DE123",
         "vat_id_validated": True
     },
@@ -1654,3 +1655,58 @@ def test_revoked_secret_list(token_client, organizer, event):
     ))
     assert resp.status_code == 200
     assert [res] == resp.data['results']
+
+
+@pytest.mark.django_db
+def test_pdf_data(token_client, organizer, event, order, django_assert_max_num_queries):
+    # order detail
+    resp = token_client.get('/api/v1/organizers/{}/events/{}/orders/{}/?pdf_data=true'.format(
+        organizer.slug, event.slug, order.code
+    ))
+    assert resp.status_code == 200
+    assert resp.data['positions'][0].get('pdf_data')
+    resp = token_client.get('/api/v1/organizers/{}/events/{}/orders/{}/'.format(
+        organizer.slug, event.slug, order.code
+    ))
+    assert resp.status_code == 200
+    assert not resp.data['positions'][0].get('pdf_data')
+
+    # order list
+    with django_assert_max_num_queries(29):
+        resp = token_client.get('/api/v1/organizers/{}/events/{}/orders/?pdf_data=true'.format(
+            organizer.slug, event.slug
+        ))
+    assert resp.status_code == 200
+    assert resp.data['results'][0]['positions'][0].get('pdf_data')
+    resp = token_client.get('/api/v1/organizers/{}/events/{}/orders/'.format(
+        organizer.slug, event.slug
+    ))
+    assert resp.status_code == 200
+    assert not resp.data['results'][0]['positions'][0].get('pdf_data')
+
+    # position list
+    with django_assert_max_num_queries(32):
+        resp = token_client.get('/api/v1/organizers/{}/events/{}/orderpositions/?pdf_data=true'.format(
+            organizer.slug, event.slug
+        ))
+    assert resp.status_code == 200
+    assert resp.data['results'][0].get('pdf_data')
+    resp = token_client.get('/api/v1/organizers/{}/events/{}/orderpositions/'.format(
+        organizer.slug, event.slug
+    ))
+    assert resp.status_code == 200
+    assert not resp.data['results'][0].get('pdf_data')
+
+    posid = resp.data['results'][0]['id']
+
+    # position detail
+    resp = token_client.get('/api/v1/organizers/{}/events/{}/orderpositions/{}/?pdf_data=true'.format(
+        organizer.slug, event.slug, posid
+    ))
+    assert resp.status_code == 200
+    assert resp.data.get('pdf_data')
+    resp = token_client.get('/api/v1/organizers/{}/events/{}/orderpositions/{}/'.format(
+        organizer.slug, event.slug, posid
+    ))
+    assert resp.status_code == 200
+    assert not resp.data.get('pdf_data')

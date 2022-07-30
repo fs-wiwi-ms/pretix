@@ -54,7 +54,9 @@ from lxml import html
 
 from pretix.base.context import get_powered_by
 from pretix.base.i18n import language
-from pretix.base.models import CartPosition, Event, Quota, SubEvent, Voucher
+from pretix.base.models import (
+    CartPosition, Event, ItemVariation, Quota, SubEvent, Voucher,
+)
 from pretix.base.services.cart import error_messages
 from pretix.base.settings import GlobalSettingsObject
 from pretix.base.templatetags.rich_text import rich_text
@@ -222,9 +224,18 @@ class WidgetAPIProductList(EventListMixin, View):
     def _get_items(self):
         qs = self.request.event.items
         if 'items' in self.request.GET:
-            qs = qs.filter(pk__in=self.request.GET.get('items').split(","))
+            qs = qs.filter(pk__in=[pk.strip() for pk in self.request.GET.get('items').split(",") if pk.strip().isdigit()])
         if 'categories' in self.request.GET:
-            qs = qs.filter(category__pk__in=self.request.GET.get('categories').split(","))
+            qs = qs.filter(category__pk__in=[pk.strip() for pk in self.request.GET.get('categories').split(",") if pk.strip().isdigit()])
+        variation_filter = None
+        if 'variations' in self.request.GET:
+            variation_filter = [int(pk.strip()) for pk in self.request.GET.get('variations').split(",") if pk.strip().isdigit()]
+            qs = qs.filter(
+                pk__in=ItemVariation.objects.filter(
+                    item__event=self.request.event,
+                    pk__in=variation_filter,
+                ).values_list('item_id', flat=True)
+            )
 
         items, display_add_to_cart = get_grouped_items(
             self.request.event,
@@ -295,7 +306,7 @@ class WidgetAPIProductList(EventListMixin, View):
                                     var.cached_availability[0],
                                     var.cached_availability[1] if item.do_show_quota_left else None
                                 ],
-                            } for var in item.available_variations
+                            } for var in item.available_variations if (not variation_filter or var.id in variation_filter)
                         ]
 
                     } for item in g

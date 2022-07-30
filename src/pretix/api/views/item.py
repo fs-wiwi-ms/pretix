@@ -461,7 +461,9 @@ with scopes_disabled():
     class QuotaFilter(FilterSet):
         class Meta:
             model = Quota
-            fields = ['subevent']
+            fields = {
+                'subevent': ['exact', 'in'],
+            }
 
 
 class QuotaViewSet(ConditionalListView, viewsets.ModelViewSet):
