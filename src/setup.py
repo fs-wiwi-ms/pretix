@@ -172,7 +172,7 @@ setup(
         'django-bootstrap3==15.0.*',
         'django-compressor==3.1.*',
         'django-countries==7.2.*',
-        'django-filter==21.1',
+        'django-filter==23.1',
         'django-formset-js-improved==0.5.0.2',
         'django-formtools==2.3',
         'django-hierarkey==1.1.*',
