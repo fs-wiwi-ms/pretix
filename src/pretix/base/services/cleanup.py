@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -23,13 +23,16 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.core.management import call_command
+from django.db.models import Exists, OuterRef
 from django.dispatch import receiver
 from django.utils.timezone import now
 from django_scopes import scopes_disabled
 
-from pretix.base.models import CachedCombinedTicket, CachedTicket
+from pretix.base.models import CachedCombinedTicket, CachedTicket, OutgoingMail
+from pretix.base.models.customers import CustomerSSOGrant
 
 from ..models import CachedFile, CartPosition, InvoiceAddress
+from ..models.auth import UserKnownLoginSource
 from ..signals import periodic_task
 
 
@@ -47,7 +50,18 @@ def clean_cart_positions(sender, **kwargs):
 @receiver(signal=periodic_task)
 @scopes_disabled()
 def clean_cached_files(sender, **kwargs):
-    for cf in CachedFile.objects.filter(expires__isnull=False, expires__lt=now()):
+    has_queued_email = Exists(
+        OutgoingMail.objects.filter(
+            should_attach_cached_files__pk=OuterRef("pk"),
+            status__in=(
+                OutgoingMail.STATUS_QUEUED,
+                OutgoingMail.STATUS_INFLIGHT,
+                OutgoingMail.STATUS_AWAITING_RETRY,
+                OutgoingMail.STATUS_FAILED,
+            ),
+        )
+    )
+    for cf in CachedFile.objects.filter(expires__isnull=False, expires__lt=now()).exclude(has_queued_email):
         cf.delete()
 
 
@@ -68,3 +82,15 @@ def clean_cached_tickets(sender, **kwargs):
 @scopes_disabled()
 def clearsessions(sender, **kwargs):
     call_command('clearsessions')
+
+
+@receiver(signal=periodic_task)
+@scopes_disabled()
+def clear_oidc_data(sender, **kwargs):
+    CustomerSSOGrant.objects.filter(expires__lt=now() - timedelta(days=14)).delete()
+
+
+@receiver(signal=periodic_task)
+@scopes_disabled()
+def clear_old_login_sources(sender, **kwargs):
+    UserKnownLoginSource.objects.filter(last_seen__lt=now() - timedelta(days=365)).delete()

@@ -14,8 +14,12 @@ The customer resource contains the following public fields:
 Field                                 Type                       Description
 ===================================== ========================== =======================================================
 identifier                            string                     Internal ID of the customer
-external_identifier                   string                     External ID of the customer (or ``null``)
+external_identifier                   string                     External ID of the customer (or ``null``). This field can
+                                                                 be changed for customers created manually or through
+                                                                 the API, but is read-only for customers created through a
+                                                                 SSO integration.
 email                                 string                     Customer email address
+phone                                 string                     Customer phone number
 name                                  string                     Name of this customer (or ``null``)
 name_parts                            object of strings          Decomposition of name (i.e. given name, family name)
 is_active                             boolean                    Whether this account is active
@@ -26,9 +30,13 @@ date_joined                           datetime                   Date and time o
 locale                                string                     Preferred language of the customer
 last_modified                         datetime                   Date and time of modification of the record
 notes                                 string                     Internal notes and comments (or ``null``)
+password                              string                     Can only be set during creation of a new customer, will
+                                                                 not be included in any responses.
 ===================================== ========================== =======================================================
 
-.. versionadded:: 4.0
+.. versionchanged:: 2024.3
+
+   The attribute ``phone`` has been added.
 
 Endpoints
 ---------
@@ -62,6 +70,7 @@ Endpoints
             "identifier": "8WSAJCJ",
             "external_identifier": null,
             "email": "customer@example.org",
+            "phone": "+493012345678",
             "name": "John Doe",
             "name_parts": {
                 "_scheme": "full",
@@ -109,6 +118,7 @@ Endpoints
         "identifier": "8WSAJCJ",
         "external_identifier": null,
         "email": "customer@example.org",
+        "phone": "+493012345678",
         "name": "John Doe",
         "name_parts": {
             "_scheme": "full",
@@ -131,7 +141,9 @@ Endpoints
 
 .. http:post:: /api/v1/organizers/(organizer)/customers/
 
-   Creates a new customer
+   Creates a new customer. In addition to the fields defined on the resource, you can pass the field ``send_email``
+   to control whether the system should send an account activation email with a password reset link (defaults to
+   ``false``).
 
    **Example request**:
 
@@ -143,7 +155,10 @@ Endpoints
       Content-Type: application/json
 
       {
-        "email": "test@example.org"
+        "email": "test@example.org",
+        "phone": "+493012345678",
+        "password": "verysecret",
+        "send_email": true
       }
 
    **Example response**:
@@ -158,6 +173,7 @@ Endpoints
         "identifier": "8WSAJCJ",
         "external_identifier": null,
         "email": "test@example.org",
+        "phone": "+493012345678",
         ...
       }
 
@@ -173,8 +189,8 @@ Endpoints
    the resource, other fields will be reset to default. With ``PATCH``, you only need to provide the fields that you
    want to change.
 
-   You can change all fields of the resource except the ``identifier``, ``last_login``, ``date_joined``, ``name``,
-   and ``last_modified`` fields.
+   You can change all fields of the resource except the ``identifier``, ``last_login``, ``date_joined``,
+   ``name`` (which is auto-generated from ``name_parts``), and ``last_modified`` fields.
 
    **Example request**:
 
@@ -202,6 +218,7 @@ Endpoints
         "identifier": "8WSAJCJ",
         "external_identifier": null,
         "email": "test@example.org",
+        "phone": "+493012345678",
         …
       }
 
@@ -236,6 +253,7 @@ Endpoints
         "identifier": "8WSAJCJ",
         "external_identifier": null,
         "email": null,
+        "phone": null,
         …
       }
 

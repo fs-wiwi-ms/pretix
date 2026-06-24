@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -39,12 +39,14 @@ from django.utils.crypto import get_random_string
 from django.utils.timezone import now
 from django.utils.translation import gettext as _
 from django.views.generic import TemplateView
-from PyPDF2 import PdfFileReader, PdfFileWriter
-from PyPDF2.utils import PdfReadError
+from pypdf import PdfReader, PdfWriter
+from pypdf.errors import PdfReadError
 from reportlab.lib.units import mm
 
 from pretix.base.i18n import language
-from pretix.base.models import CachedFile, InvoiceAddress, OrderPosition
+from pretix.base.models import (
+    CachedFile, InvoiceAddress, ItemProgramTime, OrderPosition,
+)
 from pretix.base.pdf import get_images, get_variables
 from pretix.base.settings import PERSON_NAME_SCHEMES
 from pretix.control.permissions import EventPermissionRequiredMixin
@@ -56,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 class BaseEditorView(EventPermissionRequiredMixin, TemplateView):
     template_name = 'pretixcontrol/pdf/index.html'
-    permission = 'can_change_settings'
+    permission = 'event.settings.general:write'
     accepted_formats = (
         'application/pdf',
     )
@@ -95,17 +97,38 @@ class BaseEditorView(EventPermissionRequiredMixin, TemplateView):
                                                description=_("Sample product description"))
         item2 = self.request.event.items.create(name=_("Sample workshop"), default_price=Decimal('23.40'))
 
+        ItemProgramTime.objects.create(start=now(), end=now(), item=item)
+        ItemProgramTime.objects.create(start=now(), end=now(), item=item2)
+
         from pretix.base.models import Order
         order = self.request.event.orders.create(status=Order.STATUS_PENDING, datetime=now(),
                                                  email='sample@pretix.eu',
+                                                 sales_channel=self.request.event.organizer.sales_channels.get(identifier="web"),
                                                  locale=self.request.event.settings.locale,
                                                  expires=now(), code="PREVIEW1234", total=Decimal('119.00'))
 
         scheme = PERSON_NAME_SCHEMES[self.request.event.settings.name_scheme]
         sample = {k: str(v) for k, v in scheme['sample'].items()}
-        p = order.positions.create(item=item, attendee_name_parts=sample, price=item.default_price)
-        order.positions.create(item=item2, attendee_name_parts=sample, price=item.default_price, addon_to=p)
-        order.positions.create(item=item2, attendee_name_parts=sample, price=item.default_price, addon_to=p)
+        p = order.positions.create(
+            item=item,
+            attendee_name_parts=sample,
+            company=_("Sample company"),
+            price=item.default_price
+        )
+        order.positions.create(
+            item=item2,
+            attendee_name_parts=sample,
+            company=_("Sample company"),
+            price=item.default_price,
+            addon_to=p
+        )
+        order.positions.create(
+            item=item2,
+            attendee_name_parts=sample,
+            company=_("Sample company"),
+            price=item.default_price,
+            addon_to=p
+        )
 
         InvoiceAddress.objects.create(order=order, name_parts=sample, company=_("Sample company"))
         return p
@@ -153,11 +176,11 @@ class BaseEditorView(EventPermissionRequiredMixin, TemplateView):
 
     def post(self, request, *args, **kwargs):
         if "emptybackground" in request.POST:
-            p = PdfFileWriter()
+            p = PdfWriter()
             try:
-                p.addBlankPage(
-                    width=float(request.POST.get('width')) * mm,
-                    height=float(request.POST.get('height')) * mm,
+                p.add_blank_page(
+                    width=Decimal('%.5f' % (float(request.POST.get('width')) * mm)),
+                    height=Decimal('%.5f' % (float(request.POST.get('height')) * mm)),
                 )
             except ValueError:
                 return JsonResponse({
@@ -203,7 +226,7 @@ class BaseEditorView(EventPermissionRequiredMixin, TemplateView):
 
             try:
                 bg_bytes = c.file.read()
-                PdfFileReader(BytesIO(bg_bytes), strict=False)
+                PdfReader(BytesIO(bg_bytes), strict=False)
             except PdfReadError as e:
                 return JsonResponse({
                     "status": "error",
@@ -224,7 +247,7 @@ class BaseEditorView(EventPermissionRequiredMixin, TemplateView):
         cf = None
         if request.POST.get("background", "").strip():
             try:
-                cf = CachedFile.objects.get(id=request.POST.get("background"))
+                cf = CachedFile.objects.get(id=request.POST.get("background"), web_download=True)
             except CachedFile.DoesNotExist:
                 pass
 
@@ -240,12 +263,7 @@ class BaseEditorView(EventPermissionRequiredMixin, TemplateView):
 
             resp = HttpResponse(data, content_type=mimet)
             ftype = fname.split(".")[-1]
-            if settings.DEBUG:
-                # attachment is more secure as we're dealing with user-generated stuff here, but inline is much more convenient during debugging
-                resp['Content-Disposition'] = 'inline; filename="ticket-preview.{}"'.format(ftype)
-                resp._csp_ignore = True
-            else:
-                resp['Content-Disposition'] = 'attachment; filename="ticket-preview.{}"'.format(ftype)
+            resp['Content-Disposition'] = 'inline; filename="ticket-preview.{}"'.format(ftype)
             return resp
         elif "data" in request.POST:
             if cf:
@@ -262,13 +280,14 @@ class BaseEditorView(EventPermissionRequiredMixin, TemplateView):
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        ctx['fonts'] = get_fonts()
+        ctx['fonts'] = get_fonts(self.request.event, pdf_support_required=True)
         ctx['pdf'] = self.get_current_background()
         ctx['variables'] = self.get_variables()
         ctx['images'] = self.get_images()
         ctx['layout'] = json.dumps(self.get_current_layout())
         ctx['title'] = self.title
         ctx['locales'] = [p for p in settings.LANGUAGES if p[0] in self.request.event.settings.locales]
+        ctx['maxfilesize'] = self.maxfilesize
         return ctx
 
 
@@ -278,13 +297,12 @@ class FontsCSSView(TemplateView):
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        ctx['fonts'] = get_fonts()
+        ctx['fonts'] = get_fonts(self.request.event if hasattr(self.request, 'event') else None, pdf_support_required=True)
         return ctx
 
 
 class PdfView(TemplateView):
     def get(self, request, *args, **kwargs):
         cf = get_object_or_404(CachedFile, id=kwargs.get("filename"), filename="background_preview.pdf")
-        resp = FileResponse(cf.file, content_type='application/pdf')
-        resp['Content-Disposition'] = 'attachment; filename="{}"'.format(cf.filename)
+        resp = FileResponse(cf.file, filename=cf.filename, content_type='application/pdf')
         return resp

@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -24,7 +24,6 @@ import json
 
 import pytest
 from django.utils.timezone import now
-from pytz import UTC
 
 from pretix.api.models import ApiCall
 from pretix.base.models import Order
@@ -159,8 +158,9 @@ def order(event):
     return Order.objects.create(
         code='FOO', event=event, email='dummy@dummy.test',
         status=Order.STATUS_PENDING, secret="k24fiuwvu8kxz3y1",
-        datetime=datetime.datetime(2017, 12, 1, 10, 0, 0, tzinfo=UTC),
-        expires=datetime.datetime(2017, 12, 10, 10, 0, 0, tzinfo=UTC),
+        datetime=datetime.datetime(2017, 12, 1, 10, 0, 0, tzinfo=datetime.timezone.utc),
+        expires=datetime.datetime(2017, 12, 10, 10, 0, 0, tzinfo=datetime.timezone.utc),
+        sales_channel=event.organizer.sales_channels.get(identifier="web"),
         total=23, locale='en'
     )
 
@@ -169,15 +169,14 @@ def order(event):
 def test_allow_retry_409(token_client, organizer, event, order):
     order.status = Order.STATUS_EXPIRED
     order.save()
-    with event.lock():
-        resp = token_client.post(
-            '/api/v1/organizers/{}/events/{}/orders/{}/mark_paid/'.format(
-                organizer.slug, event.slug, order.code
-            ), format='json', HTTP_X_IDEMPOTENCY_KEY='foo'
-        )
-        assert resp.status_code == 409
-        order.refresh_from_db()
-        assert order.status == Order.STATUS_EXPIRED
+    resp = token_client.post(
+        '/api/v1/organizers/{}/events/{}/orders/{}/mark_paid/?_debug_flag=fail-locking'.format(
+            organizer.slug, event.slug, order.code
+        ), format='json', HTTP_X_IDEMPOTENCY_KEY='foo'
+    )
+    assert resp.status_code == 409
+    order.refresh_from_db()
+    assert order.status == Order.STATUS_EXPIRED
     resp = token_client.post(
         '/api/v1/organizers/{}/events/{}/orders/{}/mark_paid/'.format(
             organizer.slug, event.slug, order.code

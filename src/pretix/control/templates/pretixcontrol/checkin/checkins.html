@@ -56,7 +56,7 @@
             </p>
         </div>
     {% else %}
-        <div class="table-responsive">
+        <span class="table-responsive">
             <table class="table table-hover table-quotas">
                 <thead>
                 <tr>
@@ -127,6 +127,7 @@
                                 <strong>
                                     <a href="{% url "control:event.order" event=request.event.slug organizer=request.event.organizer.slug code=c.position.order.code %}">{{ c.position.order.code }}</a>-{{ c.position.positionid }}
                                 </strong>
+                                {% include "pretixcontrol/checkin/fragment_checkin_source_type.html" with source_type=c.raw_source_type %}
                                 {% if c.position.attendee_name %}
                                     <br>
                                     <small>
@@ -143,9 +144,13 @@
                                     </small>
                                 {% endif %}
                             {% else %}
-                                <span class="fa fa-qrcode fa-fw"></span>
+                                {% include "pretixcontrol/checkin/fragment_checkin_source_type.html" with source_type=c.raw_source_type %}
                                 <span title="{{ c.raw_barcode }}">
                                     {{ c.raw_barcode|slice:":16" }}{% if c.raw_barcode|length > 16 %}…{% endif %}
+                                    <button type="button" class="btn btn-xs btn-link btn-clipboard" data-clipboard-text="{{ c.raw_barcode }}">
+                                        <i class="fa fa-clipboard" aria-hidden="true"></i>
+                                        <span class="sr-only">{% trans "Copy to clipboard" %}</span>
+                                    </button>
                                 </span>
                                 {% if c.raw_item %}
                                     <br>

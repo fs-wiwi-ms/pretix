@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -20,29 +20,49 @@
 # <https://www.gnu.org/licenses/>.
 #
 from collections import OrderedDict
-from urllib.parse import urlsplit
+from urllib.parse import urlparse, urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import pytz
 from django.conf import settings
+from django.core.exceptions import BadRequest
 from django.http import Http404, HttpRequest, HttpResponse
 from django.middleware.common import CommonMiddleware
-from django.urls import get_script_prefix
+from django.urls import get_script_prefix, resolve
 from django.utils import timezone, translation
 from django.utils.cache import patch_vary_headers
 from django.utils.deprecation import MiddlewareMixin
-from django.utils.translation import LANGUAGE_SESSION_KEY
 from django.utils.translation.trans_real import (
     check_for_language, get_supported_language_variant, language_code_re,
     parse_accept_lang_header,
 )
 
-from pretix.base.i18n import get_language_without_region
+from pretix.base.i18n import get_language_without_region, set_region
 from pretix.base.settings import global_settings_object
 from pretix.multidomain.urlreverse import (
     get_event_domain, get_organizer_domain,
 )
+from pretix.presale.style import get_fonts
 
 _supported = None
+
+
+def get_supported_language(requested_language, allowed_languages, default_language):
+    language = requested_language
+    if language not in allowed_languages:
+        firstpart = language.split('-')[0]
+        if firstpart in allowed_languages:
+            language = firstpart
+        else:
+            language = default_language
+            for lang in allowed_languages:
+                if lang.startswith(firstpart + '-'):
+                    language = lang
+                    break
+    if language not in allowed_languages:
+        # This seems redundant, but can happen in the rare edge case that settings.locale is (wrongfully)
+        # not part of settings.locales
+        language = allowed_languages[0]
+    return language
 
 
 class LocaleMiddleware(MiddlewareMixin):
@@ -54,6 +74,7 @@ class LocaleMiddleware(MiddlewareMixin):
 
     def process_request(self, request: HttpRequest):
         language = get_language_from_request(request)
+        region = None
         # Normally, this middleware runs *before* the event is set. However, on event frontend pages it
         # might be run a second time by pretix.presale.EventMiddleware and in this case the event is already
         # set and can be taken into account for the decision.
@@ -66,28 +87,24 @@ class LocaleMiddleware(MiddlewareMixin):
                 settings_holder = None
 
             if settings_holder:
-                if language not in settings_holder.settings.locales:
-                    firstpart = language.split('-')[0]
-                    if firstpart in settings_holder.settings.locales:
-                        language = firstpart
-                    else:
-                        language = settings_holder.settings.locale
-                        for lang in settings_holder.settings.locales:
-                            if lang.startswith(firstpart + '-'):
-                                language = lang
-                                break
-                if language not in settings_holder.settings.locales:
-                    # This seems redundant, but can happen in the rare edge case that settings.locale is (wrongfully)
-                    # not part of settings.locales
-                    language = settings_holder.settings.locales[0]
+                language = get_supported_language(
+                    language,
+                    settings_holder.settings.locales,
+                    settings_holder.settings.locale,
+                )
                 if '-' not in language and settings_holder.settings.region:
                     language += '-' + settings_holder.settings.region
+                if settings_holder.settings.region:
+                    region = settings_holder.settings.region
         else:
             gs = global_settings_object(request)
             if '-' not in language and gs.settings.region:
                 language += '-' + gs.settings.region
+            if gs.settings.region:
+                region = gs.settings.region
 
         translation.activate(language)
+        set_region(region)
         request.LANGUAGE_CODE = get_language_without_region()
 
         tzname = None
@@ -99,9 +116,9 @@ class LocaleMiddleware(MiddlewareMixin):
             tzname = request.user.timezone
         if tzname:
             try:
-                timezone.activate(pytz.timezone(tzname))
+                timezone.activate(ZoneInfo(tzname))
                 request.timezone = tzname
-            except pytz.UnknownTimeZoneError:
+            except ZoneInfoNotFoundError:
                 pass
         else:
             timezone.deactivate()
@@ -128,12 +145,7 @@ def get_language_from_user_settings(request: HttpRequest) -> str:
             return lang_code
 
 
-def get_language_from_session_or_cookie(request: HttpRequest) -> str:
-    if hasattr(request, 'session'):
-        lang_code = request.session.get(LANGUAGE_SESSION_KEY)
-        if lang_code in _supported and lang_code is not None and check_for_language(lang_code):
-            return lang_code
-
+def get_language_from_cookie(request: HttpRequest) -> str:
     lang_code = request.COOKIES.get(settings.LANGUAGE_COOKIE_NAME)
     try:
         return get_supported_language_variant(lang_code)
@@ -187,14 +199,14 @@ def get_language_from_request(request: HttpRequest) -> str:
         return (
             get_language_from_user_settings(request)
             or get_language_from_customer_settings(request)
-            or get_language_from_session_or_cookie(request)
+            or get_language_from_cookie(request)
             or get_language_from_browser(request)
             or get_language_from_event(request)
             or get_default_language()
         )
     else:
         return (
-            get_language_from_session_or_cookie(request)
+            get_language_from_cookie(request)
             or get_language_from_customer_settings(request)
             or get_language_from_user_settings(request)
             or get_language_from_browser(request)
@@ -224,6 +236,11 @@ def _merge_csp(a, b):
         if k not in a:
             a[k] = b[k]
 
+    for k, v in a.items():
+        if "'unsafe-inline'" in v:
+            # If we need unsafe-inline, drop any hashes or nonce as they will be ignored otherwise
+            a[k] = [i for i in v if not i.startswith("'nonce-") and not i.startswith("'sha-")]
+
 
 class SecurityMiddleware(MiddlewareMixin):
     CSP_EXEMPT = (
@@ -231,12 +248,20 @@ class SecurityMiddleware(MiddlewareMixin):
     )
 
     def process_response(self, request, resp):
+        def nested_dict_values(d):
+            for v in d.values():
+                if isinstance(v, dict):
+                    yield from nested_dict_values(v)
+                else:
+                    if isinstance(v, str):
+                        yield v
+
+        url = resolve(request.path_info)
+
         if settings.DEBUG and resp.status_code >= 400:
             # Don't use CSP on debug error page as it breaks of Django's fancy error
             # pages
             return resp
-
-        resp['X-XSS-Protection'] = '1'
 
         # We just need to have a P3P, not matter whats in there
         # https://blogs.msdn.microsoft.com/ieinternals/2013/09/17/a-quick-look-at-p3p/
@@ -248,22 +273,50 @@ class SecurityMiddleware(MiddlewareMixin):
         if gs.settings.leaflet_tiles:
             img_src.append(gs.settings.leaflet_tiles[:gs.settings.leaflet_tiles.index("/", 10)].replace("{s}", "*"))
 
+        font_src = set()
+        if hasattr(request, 'event'):
+            for font in get_fonts(request.event, pdf_support_required=False).values():
+                for path in list(nested_dict_values(font)):
+                    font_location = urlparse(path)
+                    if font_location.scheme and font_location.netloc:
+                        font_src.add('{}://{}'.format(font_location.scheme, font_location.netloc))
+
         h = {
             'default-src': ["{static}"],
-            'script-src': ['{static}', 'https://checkout.stripe.com', 'https://js.stripe.com'],
+            'script-src': ["{static}"],
             'object-src': ["'none'"],
-            'frame-src': ['{static}', 'https://checkout.stripe.com', 'https://js.stripe.com'],
+            'frame-src': ['{static}'],
             'style-src': ["{static}", "{media}"],
-            'connect-src': ["{dynamic}", "{media}", "https://checkout.stripe.com"],
-            'img-src': ["{static}", "{media}", "data:", "https://*.stripe.com"] + img_src,
-            'font-src': ["{static}"],
+            'connect-src': ["{dynamic}", "{media}"],
+            'img-src': ["{static}", "{media}", "data:"] + img_src,
+            'font-src': ["{static}"] + list(font_src),
             'media-src': ["{static}", "data:"],
             # form-action is not only used to match on form actions, but also on URLs
             # form-actions redirect to. In the context of e.g. payment providers or
-            # single-sign-on this can be nearly anything so we cannot really restrict
+            # single-sign-on this can be nearly anything, so we cannot really restrict
             # this. However, we'll restrict it to HTTPS.
             'form-action': ["{dynamic}", "https:"] + (['http:'] if settings.SITE_URL.startswith('http://') else []),
         }
+
+        if settings.VITE_DEV_MODE:
+            h['script-src'] += ["http://localhost:5173", "ws://localhost:5173"]
+            h['style-src'] += ["'unsafe-inline'"]
+            h['connect-src'] += ["http://localhost:5173", "ws://localhost:5173"]
+
+        if hasattr(request, 'csp_nonce'):
+            nonce = f"'nonce-{request.csp_nonce}'"
+            h['script-src'].append(nonce)
+            if not settings.VITE_DEV_MODE:
+                # can't have 'unsafe-inline' and nonce at the same time
+                h['style-src'].append(nonce)
+        # Only include pay.google.com for wallet detection purposes on the Payment selection page
+        if (
+                url.url_name == "event.order.pay.change" or
+                (url.url_name == "event.checkout" and url.kwargs['step'] == "payment")
+        ):
+            h['script-src'].append('https://pay.google.com')
+            h['frame-src'].append('https://pay.google.com')
+            h['connect-src'].append('https://google.com/pay')
         if settings.LOG_CSP:
             h['report-uri'] = ["/csp_report/"]
         if 'Content-Security-Policy' in resp:
@@ -301,12 +354,24 @@ class SecurityMiddleware(MiddlewareMixin):
             resp['Content-Security-Policy'] = _render_csp(h).format(static=staticdomain, dynamic=dynamicdomain,
                                                                     media=mediadomain)
             for k, v in h.items():
-                h[k] = ' '.join(v).format(static=staticdomain, dynamic=dynamicdomain, media=mediadomain).split(' ')
+                h[k] = sorted(set(' '.join(v).format(static=staticdomain, dynamic=dynamicdomain, media=mediadomain).split(' ')))
             resp['Content-Security-Policy'] = _render_csp(h)
         elif 'Content-Security-Policy' in resp:
             del resp['Content-Security-Policy']
 
         return resp
+
+
+class RejectInvalidInputMiddleware(MiddlewareMixin):
+
+    def process_request(self, request):
+        # Nullbytes in GET/POST parameters are mostly harmless, as they will later fail on database insertion, but it
+        # keeps spamming our error logs whenever someone tries to run a vulnerability scanner.
+        if "\x00" in request.META['QUERY_STRING'] or "%00" in request.META['QUERY_STRING']:
+            raise BadRequest("Invalid characters in input.")
+        if request.method in ('POST', 'PUT', 'PATCH') and request.content_type == "application/x-www-form-urlencoded":
+            if any("\x00" in value for key, value_list in request.POST.lists() for value in value_list):
+                raise BadRequest("Invalid characters in input.")
 
 
 class CustomCommonMiddleware(CommonMiddleware):

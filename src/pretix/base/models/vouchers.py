@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -137,6 +137,8 @@ class Voucher(LoggedModel):
     :type max_usages: int
     :param redeemed: The number of times this voucher already has been redeemed
     :type redeemed: int
+    :param min_usages: The minimum number of times this voucher must be redeemed
+    :type min_usages: int
     :param valid_until: The expiration date of this voucher (optional)
     :type valid_until: datetime
     :param block_quota: If set to true, this voucher will reserve quota for its holder
@@ -172,6 +174,9 @@ class Voucher(LoggedModel):
         ('percent', _('Reduce product price by (%)')),
     )
 
+    created = models.DateTimeField(
+        auto_now_add=True,
+    )
     event = models.ForeignKey(
         Event,
         on_delete=models.CASCADE,
@@ -199,11 +204,19 @@ class Voucher(LoggedModel):
         verbose_name=_("Redeemed"),
         default=0
     )
+    min_usages = models.PositiveIntegerField(
+        verbose_name=_("Minimum usages"),
+        help_text=_("If set to more than one, the voucher must be redeemed for this many products when it is used for "
+                    "the first time. On later usages, it can also be used for lower numbers of products. Note that "
+                    "this means that the total number of usages in some cases can be lower than this limit, e.g. in "
+                    "case of cancellations."),
+        default=1
+    )
     budget = models.DecimalField(
         verbose_name=_("Maximum discount budget"),
         help_text=_("This is the maximum monetary amount that will be discounted using this voucher across all usages. "
                     "If this is sum reached, the voucher can no longer be used."),
-        decimal_places=2, max_digits=10,
+        decimal_places=2, max_digits=13,
         null=True, blank=True
     )
     valid_until = models.DateTimeField(
@@ -226,14 +239,14 @@ class Voucher(LoggedModel):
         )
     )
     price_mode = models.CharField(
-        verbose_name=_("Price mode"),
+        verbose_name=_("Price effect"),
         max_length=100,
         choices=PRICE_MODES,
         default='none'
     )
     value = models.DecimalField(
         verbose_name=_("Voucher value"),
-        decimal_places=2, max_digits=10, null=True, blank=True,
+        decimal_places=2, max_digits=13, null=True, blank=True,
     )
     item = models.ForeignKey(
         Item, related_name='vouchers',
@@ -241,7 +254,8 @@ class Voucher(LoggedModel):
         null=True, blank=True,
         on_delete=models.PROTECT,  # We use a fake version of SET_NULL in Item.delete()
         help_text=_(
-            "This product is added to the user's cart if the voucher is redeemed."
+            "This product is added to the user's cart if the voucher is redeemed. Instead of a specific product, you "
+            "can also select a quota. In this case, all products assigned to this quota can be selected."
         )
     )
     variation = models.ForeignKey(
@@ -286,6 +300,14 @@ class Voucher(LoggedModel):
         verbose_name=_("Shows hidden products that match this voucher"),
         default=True
     )
+    all_addons_included = models.BooleanField(
+        verbose_name=_("Offer all add-on products for free when redeeming this voucher"),
+        default=False
+    )
+    all_bundles_included = models.BooleanField(
+        verbose_name=_("Include all bundled products without a designated price when redeeming this voucher"),
+        default=False
+    )
 
     objects = ScopedManager(organizer='event__organizer')
 
@@ -321,16 +343,17 @@ class Voucher(LoggedModel):
             if item:
                 raise ValidationError(_('You cannot select a quota and a specific product at the same time.'))
         elif item:
+            if item.require_bundling or (item.category_id and item.category.is_addon):
+                raise ValidationError(_('You cannot select a product that is only available as an add-on product or '
+                                        'as part of a bundle, since vouchers cannot be applied to add-on products or '
+                                        'bundled products.'))
             if item.event != event:
-                raise ValidationError(_('You cannot select an item that belongs to a different event.'))
+                raise ValidationError(_('You cannot select a product that belongs to a different event.'))
             if variation and (not item or not item.has_variations):
                 raise ValidationError(_('You cannot select a variation without having selected a product that provides '
                                         'variations.'))
             if variation and not item.variations.filter(pk=variation.pk).exists():
                 raise ValidationError(_('This variation does not belong to this product.'))
-            if item.has_variations and not variation and data.get('block_quota'):
-                raise ValidationError(_('You can only block quota if you specify a specific product variation. '
-                                        'Otherwise it might be unclear which quotas to block.'))
             if item.category and item.category.is_addon:
                 raise ValidationError(_('It is currently not possible to create vouchers for add-on products.'))
         elif block_quota:
@@ -350,6 +373,11 @@ class Voucher(LoggedModel):
                     'redeemed': redeemed
                 }
             )
+        if data.get('min_usages') is not None:
+            if data.get('max_usages', 1) < data.get('min_usages', 1):
+                raise ValidationError(
+                    _('The maximum number of usages may not be lower than the minimum number of usages.'),
+                )
 
     @staticmethod
     def clean_subevent(data, event):
@@ -404,39 +432,62 @@ class Voucher(LoggedModel):
             elif old_instance.variation:
                 quotas |= set(old_instance.variation.quotas.filter(subevent=old_instance.subevent))
             elif old_instance.item:
-                quotas |= set(old_instance.item.quotas.filter(subevent=old_instance.subevent))
+                if old_instance.item.has_variations:
+                    quotas |= set(
+                        Quota.objects.filter(pk__in=Quota.variations.through.objects.filter(
+                            itemvariation__item=old_instance.item,
+                            quota__subevent=old_instance.subevent,
+                        ).values('quota_id'))
+                    )
+                else:
+                    quotas |= set(old_instance.item.quotas.filter(subevent=old_instance.subevent))
         return quotas
 
     @staticmethod
     def clean_quota_check(data, cnt, old_instance, event, quota, item, variation):
+        from ..services.locking import lock_objects
+        from ..services.quotas import QuotaAvailability
+
         old_quotas = Voucher.clean_quota_get_ignored(old_instance)
 
         if event.has_subevents and data.get('block_quota') and not data.get('subevent'):
             raise ValidationError(_('If you want this voucher to block quota, you need to select a specific date.'))
 
         if quota:
-            if quota in old_quotas:
-                return
-            else:
-                avail = quota.availability(count_waitinglist=False)
-        elif item and item.has_variations and not variation:
-            raise ValidationError(_('You can only block quota if you specify a specific product variation. '
-                                    'Otherwise it might be unclear which quotas to block.'))
+            new_quotas = {quota}
         elif item and variation:
-            avail = variation.check_quotas(ignored_quotas=old_quotas, subevent=data.get('subevent'))
+            new_quotas = set(variation.quotas.filter(subevent=data.get('subevent')))
         elif item and not item.has_variations:
-            avail = item.check_quotas(ignored_quotas=old_quotas, subevent=data.get('subevent'))
+            new_quotas = set(item.quotas.filter(subevent=data.get('subevent')))
+        elif item and item.has_variations:
+            new_quotas = set(
+                Quota.objects.filter(
+                    pk__in=Quota.variations.through.objects.filter(
+                        itemvariation__item=item,
+                        quota__subevent=data.get('subevent'),
+                    ).values('quota_id')
+                )
+            )
         else:
             raise ValidationError(_('You need to select a specific product or quota if this voucher should reserve '
                                     'tickets.'))
 
-        if avail[0] != Quota.AVAILABILITY_OK or (avail[1] is not None and avail[1] < cnt):
+        if not (new_quotas - old_quotas):
+            return
+
+        lock_objects([q for q in (new_quotas - old_quotas) if q.size is not None], shared_lock_objects=[event])
+
+        qa = QuotaAvailability(count_waitinglist=False)
+        qa.queue(*(new_quotas - old_quotas))
+        qa.compute()
+
+        if any(r[0] != Quota.AVAILABILITY_OK or (r[1] is not None and r[1] < cnt) for r in qa.results.values()):
             raise ValidationError(_('You cannot create a voucher that blocks quota as the selected product or '
                                     'quota is currently sold out or completely reserved.'))
 
     @staticmethod
     def clean_voucher_code(data, event, pk):
-        if 'code' in data and Voucher.objects.filter(Q(code__iexact=data['code']) & Q(event=event) & ~Q(pk=pk)).exists():
+        if 'code' in data and Voucher.objects.filter(Q(code__iexact=data['code'].upper()) & Q(event=event) & ~Q(pk=pk)).exists():
             raise ValidationError(_('A voucher with this code already exists.'))
 
     @staticmethod
@@ -464,19 +515,19 @@ class Voucher(LoggedModel):
         if quota:
             raise ValidationError(_('You need to choose a specific product if you select a seat.'))
 
-        if data.get('max_usages', 1) > 1:
+        if data.get('max_usages', 1) > 1 or data.get('min_usages', 1) > 1:
             raise ValidationError(_('Seat-specific vouchers can only be used once.'))
 
         if item and seat.product != item:
             raise ValidationError(_('You need to choose the product "{prod}" for this seat.').format(prod=seat.product))
 
-        if not seat.is_available(ignore_voucher_id=pk):
-            raise ValidationError(_('The seat "{id}" is already sold or currently blocked.').format(id=seat.seat_guid))
-
         return seat
 
     def save(self, *args, **kwargs):
-        self.code = self.code.upper()
+        if self.code != self.code.upper():
+            self.code = self.code.upper()
+            if 'update_fields' in kwargs:
+                kwargs['update_fields'] = {'code'}.union(kwargs['update_fields'])
         super().save(*args, **kwargs)
         self.event.cache.set('vouchers_exist', True)
 
@@ -567,8 +618,12 @@ class Voucher(LoggedModel):
         else:
             return bool(subevent.seating_plan) if subevent else self.event.seating_plan
 
+    @property
+    def min_usages_remaining(self):
+        return max(1, self.min_usages - self.redeemed)
+
     @classmethod
-    def annotate_budget_used_orders(cls, qs):
+    def annotate_budget_used(cls, qs):
         opq = OrderPosition.objects.filter(
             voucher_id=OuterRef('pk'),
             voucher_budget_use__isnull=False,
@@ -577,7 +632,7 @@ class Voucher(LoggedModel):
                 Order.STATUS_PENDING
             ]
         ).order_by().values('voucher_id').annotate(s=Sum('voucher_budget_use')).values('s')
-        return qs.annotate(budget_used_orders=Coalesce(Subquery(opq, output_field=models.DecimalField(max_digits=10, decimal_places=2)), Decimal('0.00')))
+        return qs.annotate(budget_used=Coalesce(Subquery(opq, output_field=models.DecimalField(max_digits=13, decimal_places=2)), Decimal('0.00')))
 
     def budget_used(self):
         ops = OrderPosition.objects.filter(

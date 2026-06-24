@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -42,15 +42,22 @@ from django.db.models.signals import post_save
 from django.dispatch import receiver
 from django.urls import resolve, reverse
 from django.utils import timezone
+from django.utils.timezone import now
 from django.utils.translation import gettext_lazy as _
 from django_scopes import scope, scopes_disabled
 
+from pretix.base.logentrytypes import (
+    EventLogEntryType, OrderLogEntryType, WaitingListEntryLogEntryType,
+    log_entry_types,
+)
 from pretix.base.models import SubEvent
 from pretix.base.signals import (
-    event_copy_data, logentry_display, periodic_task,
+    EventPluginSignal, event_copy_data, periodic_task,
 )
 from pretix.control.signals import nav_event
-from pretix.plugins.sendmail.models import ScheduledMail
+from pretix.helpers import OF_SELF
+from pretix.plugins.sendmail.models import Rule, ScheduledMail
+from pretix.plugins.sendmail.views import OrderSendView, WaitinglistSendView
 
 logger = logging.getLogger(__name__)
 
@@ -62,18 +69,17 @@ def scheduled_mail_create(sender, **kwargs):
     with scope(organizer=event.organizer):
         existing_rules = ScheduledMail.objects.filter(subevent=subevent).values_list('rule_id', flat=True)
         to_create = []
-        for rule in event.sendmail_rules.all():
-            if rule.pk not in existing_rules and subevent:
-                sm = ScheduledMail(rule=rule, event=event, subevent=subevent)
-                sm.recompute()
-                to_create.append(sm)
+        for rule in event.sendmail_rules.filter(subevent=None).exclude(id__in=existing_rules):
+            sm = ScheduledMail(rule=rule, event=event, subevent=subevent)
+            sm.recompute()
+            to_create.append(sm)
         ScheduledMail.objects.bulk_create(to_create)
 
 
 @receiver(nav_event, dispatch_uid="sendmail_nav")
 def control_nav_import(sender, request=None, **kwargs):
     url = resolve(request.path_info)
-    if not request.user.has_event_permission(request.organizer, request.event, 'can_change_orders', request=request):
+    if not request.user.has_event_permission(request.organizer, request.event, 'event.orders:write', request=request):
         return []
     return [
         {
@@ -90,10 +96,10 @@ def control_nav_import(sender, request=None, **kwargs):
                         'event': request.event.slug,
                         'organizer': request.event.organizer.slug,
                     }),
-                    'active': (url.namespace == 'plugins:sendmail' and url.url_name == 'send'),
+                    'active': (url.namespace == 'plugins:sendmail' and url.url_name.startswith('send')),
                 },
                 {
-                    'label': _('Automated emails'),
+                    'label': _('Scheduled emails'),
                     'url': reverse('plugins:sendmail:rule.list', kwargs={
                         'event': request.event.slug,
                         'organizer': request.event.organizer.slug,
@@ -113,20 +119,33 @@ def control_nav_import(sender, request=None, **kwargs):
     ]
 
 
-@receiver(signal=logentry_display)
-def pretixcontrol_logentry_display(sender, logentry, **kwargs):
-    plains = {
-        'pretix.plugins.sendmail.sent': _('Email was sent'),
-        'pretix.plugins.sendmail.order.email.sent': _('The order received a mass email.'),
-        'pretix.plugins.sendmail.order.email.sent.attendee': _('A ticket holder of this order received a mass email.'),
-        'pretix.plugins.sendmail.rule.added': _('An email rule was created'),
-        'pretix.plugins.sendmail.rule.changed': _('An email rule was updated'),
-        'pretix.plugins.sendmail.rule.order.email.sent': _('A scheduled email was sent to the order'),
-        'pretix.plugins.sendmail.rule.order.position.email.sent': _('A scheduled email was sent to a ticket holder'),
-        'pretix.plugins.sendmail.rule.deleted': _('An email rule was deleted'),
-    }
-    if logentry.action_type in plains:
-        return plains[logentry.action_type]
+@log_entry_types.new('pretix.plugins.sendmail.sent', _('Mass email was sent to customers or attendees.'))
+@log_entry_types.new('pretix.plugins.sendmail.sent.waitinglist', _('Mass email was sent to waiting list entries.'))
+class SendmailPluginLogEntryType(EventLogEntryType):
+    pass
+
+
+@log_entry_types.new('pretix.plugins.sendmail.order.email.sent', _('The order received a mass email.'))
+@log_entry_types.new('pretix.plugins.sendmail.order.email.sent.attendee', _('A ticket holder of this order received a mass email.'))
+class SendmailPluginOrderLogEntryType(OrderLogEntryType):
+    pass
+
+
+@log_entry_types.new('pretix.plugins.sendmail.waitinglist.email.sent', _('The person on the waiting list received a mass email.'))
+class SendmailPluginWaitingListLogEntryType(WaitingListEntryLogEntryType):
+    pass
+
+
+@log_entry_types.new('pretix.plugins.sendmail.rule.added', _('An email rule was created'))
+@log_entry_types.new('pretix.plugins.sendmail.rule.changed', _('An email rule was updated'))
+@log_entry_types.new('pretix.plugins.sendmail.rule.order.email.sent', _('A scheduled email was sent to the order'))
+@log_entry_types.new('pretix.plugins.sendmail.rule.order.position.email.sent', _('A scheduled email was sent to a ticket holder'))
+@log_entry_types.new('pretix.plugins.sendmail.rule.deleted', _('An email rule was deleted'))
+class SendmailPluginRuleLogEntryType(EventLogEntryType):
+    object_type = Rule
+    object_link_wrapper = _('Mail rule {val}')
+    object_link_viewname = 'plugins:sendmail:rule.update'
+    object_link_argname = 'rule'
 
 
 @receiver(periodic_task)
@@ -134,23 +153,37 @@ def sendmail_run_rules(sender, **kwargs):
     with scopes_disabled():
         mails = ScheduledMail.objects.all()
 
+        unchanged = []
         for m in mails.filter(Q(last_computed__isnull=True)
                               | Q(subevent__last_modified__gt=F('last_computed'))
                               | Q(event__last_modified__gt=F('last_computed'))):
             previous = m.computed_datetime
             m.recompute()
             if m.computed_datetime != previous:
-                m.save(update_fields=['last_computed', 'computed_datetime'])
+                m.save(update_fields=['last_computed', 'computed_datetime', 'state'])
+            else:
+                unchanged.append(m.pk)
+
+        if unchanged:
+            # Theoretically, we don't need to write back the unchanged ones to the database… but that will cause us to
+            # recompute them on every run until eternity. So we want to set their last_computed date to something more
+            # recent... but not for all of them at once, in case it's millions, so we don't stress the database without
+            # cause
+            batch_size = max(connection.ops.bulk_batch_size(['id'], unchanged) - 2, 100)
+            for i in range(max(1, 5000 // batch_size)):
+                ScheduledMail.objects.filter(pk__in=unchanged[i * batch_size:batch_size]).update(last_computed=now())
 
         mails.filter(
             state=ScheduledMail.STATE_SCHEDULED,
             computed_datetime__lte=timezone.now() - datetime.timedelta(days=2),
+            event__live=True,
         ).update(
             state=ScheduledMail.STATE_MISSED
         )
         for m_id in mails.filter(
             state__in=(ScheduledMail.STATE_SCHEDULED, ScheduledMail.STATE_FAILED),
             rule__enabled=True,
+            event__live=True,
             computed_datetime__gte=timezone.now() - datetime.timedelta(days=2),
             computed_datetime__lte=timezone.now(),
         ).values_list('pk', flat=True):
@@ -172,6 +205,7 @@ def sendmail_run_rules(sender, **kwargs):
 
             with transaction.atomic(durable=True):
                 m = ScheduledMail.objects.select_for_update(
+                    of=OF_SELF,
                     skip_locked=connection.features.has_select_for_update_skip_locked
                 ).filter(pk=m_id).first()
                 if not m or m.state not in (ScheduledMail.STATE_SCHEDULED, ScheduledMail.STATE_FAILED):
@@ -198,7 +232,7 @@ def sendmail_copy_data_receiver(sender, other, item_map, **kwargs):
     if sender.sendmail_rules.exists():  # idempotency
         return
 
-    for r in other.sendmail_rules.prefetch_related('limit_products'):
+    for r in other.sendmail_rules.filter(subevent__isnull=True).prefetch_related('limit_products'):
         limit_products = list(r.limit_products.all())
         r = copy.copy(r)
         r.pk = None
@@ -206,3 +240,17 @@ def sendmail_copy_data_receiver(sender, other, item_map, **kwargs):
         r.save()
         if limit_products:
             r.limit_products.add(*[item_map[p.id] for p in limit_products if p.id in item_map])
+
+
+sendmail_view_classes = EventPluginSignal()
+"""
+This signal allows you to register subclasses of ``pretix.plugins.sendmail.views.BaseSenderView`` that should be
+discovered by this plugin.
+
+As with all event plugin signals, the ``sender`` keyword will contain the event.
+"""
+
+
+@receiver(signal=sendmail_view_classes, dispatch_uid="sendmail_register_sendmail_view_classes")
+def register_view_classes(sender, **kwargs):
+    return [OrderSendView, WaitinglistSendView]

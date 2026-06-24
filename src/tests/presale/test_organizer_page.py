@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -19,12 +19,11 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from django.utils.timezone import now
 from django_scopes import scopes_disabled
-from pytz import UTC
 
 from pretix.base.models import Event, Organizer
 
@@ -71,6 +70,26 @@ def test_attributes_on_page(env, client):
     assert 'MRMCD2015' not in r.rendered_content
     propval.delete()
     r = client.get('/mrmcd/?attr[loc]=HH')
+    assert 'MRMCD2015' in r.rendered_content
+
+    with scopes_disabled():
+        series = env[0].events.create(
+            name="Workshop Series",
+            has_subevents=True,
+            live=True,
+            date_from=now() + timedelta(days=3)
+        )
+        se = series.subevents.create(name="Future", active=True, date_from=now() + timedelta(days=3))
+        se.meta_values.create(property=prop, value="B")
+
+    r = client.get('/mrmcd/?attr[loc]=B')
+    assert 'Workshop Series' in r.rendered_content
+    r = client.get('/mrmcd/?attr[loc]=MA')
+    assert 'Workshop Series' not in r.rendered_content
+
+    prop.filter_allowed = False
+    prop.save()
+    r = client.get('/mrmcd/?attr[loc]=MA')
     assert 'MRMCD2015' in r.rendered_content
 
 
@@ -144,7 +163,7 @@ def test_calendar(env, client):
     env[0].settings.event_list_type = 'calendar'
     e = Event.objects.create(
         organizer=env[0], name='MRMCD2017', slug='2017',
-        date_from=datetime(now().year + 1, 9, 1, tzinfo=UTC),
+        date_from=datetime(now().year + 1, 9, 1, tzinfo=timezone.utc),
         live=True, is_public=False
     )
     r = client.get('/mrmcd/?style=calendar')
@@ -164,7 +183,7 @@ def test_week_calendar(env, client):
     env[0].settings.event_list_type = 'calendar'
     e = Event.objects.create(
         organizer=env[0], name='MRMCD2017', slug='2017',
-        date_from=datetime(now().year + 1, 9, 1, tzinfo=UTC),
+        date_from=datetime(now().year + 1, 9, 1, tzinfo=timezone.utc),
         live=True, is_public=False
     )
     r = client.get('/mrmcd/?style=week')
@@ -182,7 +201,7 @@ def test_attributes_in_calendar(env, client):
     env[0].settings.event_list_type = 'calendar'
     e = Event.objects.create(
         organizer=env[0], name='MRMCD2017', slug='2017',
-        date_from=datetime(now().year + 1, 9, 1, tzinfo=UTC),
+        date_from=datetime(now().year + 1, 9, 1, tzinfo=timezone.utc),
         live=True, is_public=True
     )
     prop = env[0].meta_properties.create(name='loc')
@@ -198,7 +217,7 @@ def test_attributes_in_calendar(env, client):
 def test_ics(env, client):
     e = Event.objects.create(
         organizer=env[0], name='MRMCD2017', slug='2017',
-        date_from=datetime(now().year + 1, 9, 1, tzinfo=UTC),
+        date_from=datetime(now().year + 1, 9, 1, tzinfo=timezone.utc),
         live=True, is_public=False
     )
     r = client.get('/mrmcd/events/ical/')
@@ -213,7 +232,7 @@ def test_ics(env, client):
 def test_ics_subevents(env, client):
     e = Event.objects.create(
         organizer=env[0], name='MRMCD2017', slug='2017',
-        date_from=datetime(now().year + 1, 9, 1, tzinfo=UTC),
+        date_from=datetime(now().year + 1, 9, 1, tzinfo=timezone.utc),
         live=True, is_public=True, has_subevents=True
     )
     with scopes_disabled():
@@ -227,12 +246,12 @@ def test_ics_subevents(env, client):
 def test_ics_subevents_attributes(env, client):
     e0 = Event.objects.create(
         organizer=env[0], name='DS2017', slug='DS2017',
-        date_from=datetime(now().year + 1, 9, 1, tzinfo=UTC),
+        date_from=datetime(now().year + 1, 9, 1, tzinfo=timezone.utc),
         live=True, is_public=True
     )
     e = Event.objects.create(
         organizer=env[0], name='MRMCD2017', slug='2017',
-        date_from=datetime(now().year + 1, 9, 1, tzinfo=UTC),
+        date_from=datetime(now().year + 1, 9, 1, tzinfo=timezone.utc),
         live=True, is_public=True, has_subevents=True
     )
     with scopes_disabled():

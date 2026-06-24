@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -58,7 +58,7 @@ class VoucherFormTest(SoupTestMixin, TransactionTestCase):
             organizer=self.orga, name='30C3', slug='30c3',
             date_from=datetime.datetime(2013, 12, 26, tzinfo=datetime.timezone.utc),
         )
-        t = Team.objects.create(organizer=self.orga, can_view_vouchers=True, can_change_vouchers=True)
+        t = Team.objects.create(organizer=self.orga, all_event_permissions=True)
         t.members.add(self.user)
         t.limit_events.add(self.event)
         self.client.login(email='dummy@dummy.dummy', password='dummy')
@@ -254,7 +254,7 @@ class VoucherFormTest(SoupTestMixin, TransactionTestCase):
         self._create_voucher({
             'itemvar': '%d' % self.shirt.pk,
             'block_quota': 'on'
-        }, expected_failure=True)
+        })
 
     def test_create_blocking_item_voucher_quota_full_invalid(self):
         self.quota_shirts.size = 0
@@ -364,6 +364,19 @@ class VoucherFormTest(SoupTestMixin, TransactionTestCase):
         }, expected_failure=True)
         v.refresh_from_db()
         assert v.valid_until < now()
+
+    def test_change_voucher_validity_to_valid_quota_full_already_redeemed(self):
+        self.quota_tickets.size = 1
+        self.quota_tickets.save()
+        with scopes_disabled():
+            v = self.event.vouchers.create(item=self.ticket, valid_until=now() - datetime.timedelta(days=3),
+                                           block_quota=True, redeemed=1, max_usages=2)
+        self._change_voucher(v, {
+            'valid_until_0': (now() + datetime.timedelta(days=3)).strftime('%Y-%m-%d'),
+            'valid_until_1': (now() + datetime.timedelta(days=3)).strftime('%H:%M:%S')
+        })
+        v.refresh_from_db()
+        assert v.valid_until > now()
 
     def test_change_voucher_validity_to_valid_quota_free(self):
         with scopes_disabled():
@@ -477,6 +490,10 @@ class VoucherFormTest(SoupTestMixin, TransactionTestCase):
         self._create_bulk_vouchers({
             'codes': 'ABCDE\nDEFGH\nIJKLM\nNOPQR\nSTUVW\nXYZ',
             'itemvar': '%d' % self.ticket.pk,
+        }, expected_failure=True)
+        self._create_bulk_vouchers({
+            'codes': 'ABCDE\nDEFGH\nIJKLM\nNOPQR\nSTUVW',
+            'itemvar': '%d' % self.ticket.pk,
         })
 
     def test_create_blocking_bulk_quota_full(self):
@@ -521,13 +538,11 @@ class VoucherFormTest(SoupTestMixin, TransactionTestCase):
             'send': 'on',
             'send_subject': 'Your voucher',
             'send_message': 'Voucher list: {voucher_list}',
-            'send_recipients': 'foo@example.com\nfoo@example.net'
+            'send_recipients': 'foo@example.com\nbar@example.net'
         })
         assert len(djmail.outbox) == 2
-        assert len([m for m in djmail.outbox if m.to == ['foo@example.com']]) == 1
-        assert len([m for m in djmail.outbox if m.to == ['foo@example.net']]) == 1
-        assert len([m for m in djmail.outbox if 'ABCDE' in m.body]) == 1
-        assert len([m for m in djmail.outbox if 'DEFGH' in m.body]) == 1
+        assert len([m for m in djmail.outbox if 'ABCDE' in m.body and m.to == ['foo@example.com']]) == 1
+        assert len([m for m in djmail.outbox if 'DEFGH' in m.body and m.to == ['bar@example.net']]) == 1
 
     def test_create_bulk_send_csv(self):
         self._create_bulk_vouchers({
@@ -729,6 +744,7 @@ class VoucherFormTest(SoupTestMixin, TransactionTestCase):
                 code='DEDUP', event=self.event, email='dummy@dummy.test',
                 status=Order.STATUS_PAID,
                 datetime=now(), expires=now() + datetime.timedelta(days=10),
+                sales_channel=self.orga.sales_channels.get(identifier="web"),
                 total=0, locale='en'
             )
 

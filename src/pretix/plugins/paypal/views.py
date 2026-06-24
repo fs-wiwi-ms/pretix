@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -42,7 +42,7 @@ from django.contrib import messages
 from django.core import signing
 from django.db.models import Sum
 from django.http import HttpResponse, HttpResponseBadRequest
-from django.shortcuts import redirect, render
+from django.shortcuts import render
 from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.clickjacking import xframe_options_exempt
@@ -53,6 +53,7 @@ from django_scopes import scopes_disabled
 from pretix.base.models import Order, OrderPayment, OrderRefund, Quota
 from pretix.base.payment import PaymentException
 from pretix.control.permissions import event_permission_required
+from pretix.helpers.http import redirect_to_url
 from pretix.multidomain.urlreverse import eventreverse
 from pretix.plugins.paypal.models import ReferencedPayPalObject
 from pretix.plugins.paypal.payment import Paypal
@@ -99,23 +100,23 @@ def success(request, *args, **kwargs):
             except PaymentException as e:
                 messages.error(request, str(e))
                 urlkwargs['step'] = 'payment'
-                return redirect(eventreverse(request.event, 'presale:event.checkout', kwargs=urlkwargs))
+                return redirect_to_url(eventreverse(request.event, 'presale:event.checkout', kwargs=urlkwargs))
             if resp:
                 return resp
     else:
         messages.error(request, _('Invalid response from PayPal received.'))
         logger.error('Session did not contain payment_paypal_id')
         urlkwargs['step'] = 'payment'
-        return redirect(eventreverse(request.event, 'presale:event.checkout', kwargs=urlkwargs))
+        return redirect_to_url(eventreverse(request.event, 'presale:event.checkout', kwargs=urlkwargs))
 
     if payment:
-        return redirect(eventreverse(request.event, 'presale:event.order', kwargs={
+        return redirect_to_url(eventreverse(request.event, 'presale:event.order', kwargs={
             'order': payment.order.code,
             'secret': payment.order.secret
         }) + ('?paid=yes' if payment.order.status == Order.STATUS_PAID else ''))
     else:
         urlkwargs['step'] = 'confirm'
-        return redirect(eventreverse(request.event, 'presale:event.checkout', kwargs=urlkwargs))
+        return redirect_to_url(eventreverse(request.event, 'presale:event.checkout', kwargs=urlkwargs))
 
 
 def abort(request, *args, **kwargs):
@@ -127,12 +128,12 @@ def abort(request, *args, **kwargs):
         payment = None
 
     if payment:
-        return redirect(eventreverse(request.event, 'presale:event.order', kwargs={
+        return redirect_to_url(eventreverse(request.event, 'presale:event.order', kwargs={
             'order': payment.order.code,
             'secret': payment.order.secret
         }) + ('?paid=yes' if payment.order.status == Order.STATUS_PAID else ''))
     else:
-        return redirect(eventreverse(request.event, 'presale:event.checkout', kwargs={'step': 'payment'}))
+        return redirect_to_url(eventreverse(request.event, 'presale:event.checkout', kwargs={'step': 'payment'}))
 
 
 @csrf_exempt
@@ -245,7 +246,7 @@ def webhook(request, *args, **kwargs):
     return HttpResponse(status=200)
 
 
-@event_permission_required('can_change_event_settings')
+@event_permission_required('event.settings.general:write')
 @require_POST
 def oauth_disconnect(request, **kwargs):
     del request.event.settings.payment_paypal_connect_refresh_token
@@ -259,7 +260,7 @@ def oauth_disconnect(request, **kwargs):
     event.enable_plugin("pretix.plugins.paypal2")
     event.save()
 
-    return redirect(reverse('control:event.settings.payment.provider', kwargs={
+    return redirect_to_url(reverse('control:event.settings.payment.provider', kwargs={
         'organizer': request.event.organizer.slug,
         'event': request.event.slug,
         'provider': 'paypal_settings'

@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -33,13 +33,16 @@
 # License for the specific language governing permissions and limitations under the License.
 
 import os
-from datetime import date
+from datetime import datetime
 
 from django import forms
 from django.utils.formats import get_format
 from django.utils.functional import lazy
+from django.utils.html import escape
 from django.utils.timezone import get_current_timezone, now
 from django.utils.translation import gettext_lazy as _
+
+from pretix.helpers.format import PlainHtmlAlternativeString
 
 
 def replace_arabic_numbers(inp):
@@ -58,6 +61,25 @@ def replace_arabic_numbers(inp):
         1641: 57,  # 9
     }
     return inp.translate(table)
+
+
+def format_placeholder_help_text(placeholder_name, sample_value):
+    if isinstance(sample_value, PlainHtmlAlternativeString):
+        sample_value = sample_value.plain
+    title = (_("Sample: %s") % sample_value) if sample_value else ""
+    return ('<button type="button" class="content-placeholder" title="%s">{%s}</button>' % (escape(title), escape(placeholder_name)))
+
+
+def format_placeholders_help_text(placeholders, event=None):
+    placeholders = [(k, v.render_sample(event) if event else v) for k, v in placeholders.items()]
+    placeholders.sort(key=lambda x: x[0])
+    phs = [
+        format_placeholder_help_text(k, v)
+        for k, v in placeholders
+    ]
+    return _('Available placeholders: {list}').format(
+        list=' '.join(phs)
+    )
 
 
 class DatePickerWidget(forms.DateInput):
@@ -176,11 +198,11 @@ class SplitDateTimePickerWidget(forms.SplitDateTimeWidget):
         time_attrs['autocomplete'] = 'off'
         if min_date:
             date_attrs['data-min'] = (
-                min_date if isinstance(min_date, date) else min_date.astimezone(get_current_timezone()).date()
+                min_date if not isinstance(min_date, datetime) else min_date.astimezone(get_current_timezone()).date()
             ).isoformat()
         if max_date:
             date_attrs['data-max'] = (
-                max_date if isinstance(max_date, date) else max_date.astimezone(get_current_timezone()).date()
+                max_date if not isinstance(max_date, datetime) else max_date.astimezone(get_current_timezone()).date()
             ).isoformat()
 
         def date_placeholder():
@@ -197,7 +219,10 @@ class SplitDateTimePickerWidget(forms.SplitDateTimeWidget):
 
         date_attrs['placeholder'] = lazy(date_placeholder, str)
         time_attrs['placeholder'] = lazy(time_placeholder, str)
-
+        date_attrs['aria-label'] = _('Date')
+        time_attrs['aria-label'] = _('Time')
+        if 'aria-label' in attrs:
+            del attrs['aria-label']
         widgets = (
             forms.DateInput(attrs=date_attrs, format=date_format),
             forms.TimeInput(attrs=time_attrs, format=time_format),

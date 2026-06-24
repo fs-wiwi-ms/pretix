@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -24,7 +24,7 @@ Django, for theoretically very valid reasons, creates migrations for *every sing
 we change on a model. Even the `help_text`! This makes sense, as we don't know if any
 database backend unknown to us might actually use this information for its database schema.
 
-However, pretix only supports PostgreSQL, MySQL, MariaDB and SQLite and we can be pretty
+However, pretix only supports PostgreSQL and SQLite and we can be pretty
 certain that some changes to models will never require a change to the database. In this case,
 not creating a migration for certain changes will save us some performance while applying them
 *and* allow for a cleaner git history. Win-win!

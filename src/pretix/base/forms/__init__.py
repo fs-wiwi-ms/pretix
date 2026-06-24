@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -36,11 +36,14 @@ import logging
 
 import i18nfield.forms
 from django import forms
+from django.core.validators import URLValidator
 from django.forms.models import ModelFormMetaclass
 from django.utils.crypto import get_random_string
+from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
 from formtools.wizard.views import SessionWizardView
 from hierarkey.forms import HierarkeyForm
+from i18nfield.strings import LazyI18nString
 
 from pretix.base.reldate import RelativeDateField, RelativeDateTimeField
 
@@ -81,6 +84,43 @@ class I18nInlineFormSet(i18nfield.forms.I18nInlineFormSet):
         if event:
             kwargs['locales'] = event.settings.get('locales')
         super().__init__(*args, **kwargs)
+
+
+class MarkdownTextarea(forms.Textarea):
+
+    def _render(self, template_name, context, renderer=None):
+        return mark_safe(
+            '<div class="i18n-form-group">%s<div class="i18n-field-markdown-note">%s</div></div>' % (
+                super()._render(template_name, context, renderer=None),
+                _("You can use {markup_name} in this field.").format(
+                    markup_name='<a href="https://docs.pretix.eu/guides/markdown/" target="_blank">Markdown</a>'
+                )
+            )
+        )
+
+
+class I18nMarkdownTextarea(i18nfield.forms.I18nTextarea):
+    def format_output(self, rendered_widgets, id_) -> str:
+        rendered_widgets = rendered_widgets + [
+            '<div class="i18n-field-markdown-note">%s</div>' % (
+                _("You can use {markup_name} in this field.").format(
+                    markup_name='<a href="https://docs.pretix.eu/guides/markdown/" target="_blank">Markdown</a>'
+                )
+            )
+        ]
+        return super().format_output(rendered_widgets, id_)
+
+
+class I18nMarkdownTextInput(i18nfield.forms.I18nTextInput):
+    def format_output(self, rendered_widgets, id_) -> str:
+        rendered_widgets = rendered_widgets + [
+            '<div class="i18n-field-markdown-note">%s</div>' % (
+                _("You can use {markup_name} in this field.").format(
+                    markup_name='<a href="https://docs.pretix.eu/guides/markdown/" target="_blank">Markdown</a>'
+                )
+            )
+        ]
+        return super().format_output(rendered_widgets, id_)
 
 
 SECRET_REDACTED = '*****'
@@ -165,6 +205,7 @@ class SettingsForm(i18nfield.forms.I18nFormMixin, HierarkeyForm):
 
 class PrefixForm(forms.Form):
     prefix = forms.CharField(widget=forms.HiddenInput)
+    template_name = "django/forms/table.html"
 
 
 class SafeSessionWizardView(SessionWizardView):
@@ -222,3 +263,17 @@ class SecretKeySettingsField(forms.CharField):
         if value == SECRET_REDACTED:
             return
         return super().run_validators(value)
+
+
+class I18nURLFormField(i18nfield.forms.I18nFormField):
+    def clean(self, value) -> LazyI18nString:
+        value = super().clean(value)
+        if not value:
+            return value
+        if isinstance(value.data, dict):
+            for v in value.data.values():
+                if v:
+                    URLValidator()(v)
+        else:
+            URLValidator()(value.data)
+        return value

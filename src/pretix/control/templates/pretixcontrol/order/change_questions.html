@@ -25,10 +25,10 @@
                             <strong>{% trans "Invoice information" %} {% if not request.event.settings.invoice_address_required %}
                                 {% trans "(optional)" %}
                             {% endif %}</strong>
-                            <i class="fa fa-angle-down collapse-indicator"></i>
                         </h4>
                     </summary>
-                    <div id="invoice">
+                    <div id="invoice"
+                         data-address-information-url="{% url "js_helpers.address_form" %}?invoice=true&organizer={{ request.event.organizer.slug|urlencode }}&event={{ request.event.slug|urlencode }}">
                         <div class="panel-body">
                             {% bootstrap_form invoice_form layout="horizontal" %}
                         </div>
@@ -42,17 +42,18 @@
                             <strong>{{ pos.item }}{% if pos.variation %}
                                 – {{ pos.variation }}
                             {% endif %}</strong>
-                            <i class="fa fa-angle-down collapse-indicator"></i>
                         </h4>
                     </summary>
                     <div id="cp{{ pos.id }}">
                         <div class="panel-body">
                             {% for form in forms %}
-                                {% if form.pos.item != pos.item %}
-                                    {# Add-Ons #}
-                                    <legend>+ {{ form.pos.item }}</legend>
-                                {% endif %}
-                                {% bootstrap_form form layout="control" %}
+                                <div class="profile-scope">
+                                    {% if form.pos.item != pos.item %}
+                                        {# Add-Ons #}
+                                        <legend>+ {{ form.pos.item }}</legend>
+                                    {% endif %}
+                                    {% bootstrap_form form layout="control" %}
+                                </div>
                             {% endfor %}
                         </div>
                     </div>

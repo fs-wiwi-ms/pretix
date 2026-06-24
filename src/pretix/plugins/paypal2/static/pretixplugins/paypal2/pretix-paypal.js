@@ -38,7 +38,7 @@ var pretixpaypal = {
         credit: gettext('PayPal Credit'),
         card: gettext('Credit Card'),
         paylater: gettext('PayPal Pay Later'),
-        ideal: gettext('iDEAL'),
+        ideal: gettext('iDEAL | Wero'),
         sepa: gettext('SEPA Direct Debit'),
         bancontact: gettext('Bancontact'),
         giropay: gettext('giropay'),
@@ -57,6 +57,7 @@ var pretixpaypal = {
         wechatpay: gettext('WeChat Pay'),
         mercadopago: gettext('Mercado Pago')
     },
+    readyToSubmitApproval: false,
 
     load: function () {
         if (pretixpaypal.paypal === null) {
@@ -73,11 +74,26 @@ var pretixpaypal = {
             pretixpaypal.locale = this.guessLocale();
         }
 
-        pretixpaypal.continue_button.prop("disabled", true);
+        $("input[name=payment][value^='paypal']").change(function () {
+            if (pretixpaypal.paypal !== null) {
+                pretixpaypal.renderButton($(this).val());
+            } else {
+                pretixpaypal.continue_button.prop("disabled", true);
+            }
+        });
+
+        $("input[name=payment]").not("[value^='paypal']").change(function () {
+            pretixpaypal.restore();
+        });
+
+        // If paypal is pre-selected, we must disable the continue button and handle it after SDK is loaded
+        if ($("input[name=payment][value^='paypal']").is(':checked')) {
+            pretixpaypal.continue_button.prop("disabled", true);
+        }
 
         // We are setting the cogwheel already here, as the renderAPM() method might take some time to get loaded.
-        let apmtextselector = $("label[for=input_payment_paypal_apm]");
-        apmtextselector.prepend('<span class="fa fa-cog fa-spin"></span> ');
+        const apmtextselector = $("input[name=payment][value=paypal_apm]").closest("label").find(".accordion-label-text");
+        apmtextselector.append(' <span aria-hidden="true" class="fa fa-cog fa-spin"></span>');
 
         let sdk_url = 'https://www.paypal.com/sdk/js' +
             '?client-id=' + pretixpaypal.client_id +
@@ -126,6 +142,8 @@ var pretixpaypal = {
                 }
             }
         };
+
+        document.addEventListener("visibilitychange", this.onApproveSubmit);
     },
 
     ready: function () {
@@ -133,19 +151,11 @@ var pretixpaypal = {
             pretixpaypal.renderAPMs();
         }
 
-        $("input[name=payment][value^='paypal']").change(function () {
-            pretixpaypal.renderButton($(this).val());
-        });
-
-        $("input[name=payment]").not("[value^='paypal']").change(function () {
-            pretixpaypal.restore();
-        });
-
-        if ($("input[name=payment][value^='paypal']").is(':checked') || $(".payment-redo-form").length) {
+        if ($("input[name=payment][value^='paypal']").is(':checked')) {
             pretixpaypal.renderButton($("input[name=payment][value^='paypal']:checked").val());
-        }
-
-        if ($('#paypal-button-container').data('paypage')) {
+        } else if ($(".payment-redo-form").length) {
+            pretixpaypal.renderButton($("input[name=payment][value^='paypal']").val());
+        } else if ($('#paypal-button-container').data('paypage')) {
             pretixpaypal.renderButton('paypal_apm');
         }
     },
@@ -156,8 +166,8 @@ var pretixpaypal = {
             $('#paypal-button-container').empty()
             pretixpaypal.continue_button.text(gettext('Continue'));
             pretixpaypal.continue_button.show();
-            pretixpaypal.continue_button.prop("disabled", false);
         }
+        pretixpaypal.continue_button.prop("disabled", false);
     },
 
     renderButton: function (method) {
@@ -218,12 +228,16 @@ var pretixpaypal = {
 
                 let method = pretixpaypal.paypage ? "wallet" : pretixpaypal.method.method;
                 let selectorstub = "#payment_paypal_" + method;
-                var $form = $(selectorstub + "_oid").closest("form");
-                // Insert the tokens into the form so it gets submitted to the server
+                // Insert the tokens into the form, so it gets submitted to the server
                 $(selectorstub + "_oid").val(pretixpaypal.order_id);
                 $(selectorstub + "_payer").val(pretixpaypal.payer_id);
-                // and submit
-                $form.get(0).submit();
+
+                // We are moving the submission to a separate function, which is also an EventListener, since
+                // SFSafariView refuses to submit a form that is not visible. Unfortunately, that is exactly the case
+                // when the ticket shop is used on iOS within an SFSafariView and the PayPal payment popup has not
+                // closed itself quickly enough.
+                pretixpaypal.readyToSubmitApproval = true;
+                pretixpaypal.onApproveSubmit();
 
                 // billingToken: null
                 // facilitatorAccessToken: "A21AAL_fEu0gDD-sIXyOy65a6MjgSJJrhmxuPcxxUGnL5gW2DzTxiiAksfoC4x8hD-BjeY1LsFVKl7ceuO7UR1a9pQr8Q_AVw"
@@ -242,14 +256,20 @@ var pretixpaypal = {
         }
     },
 
+    onApproveSubmit: function() {
+        if (document.visibilityState === "visible" && pretixpaypal.readyToSubmitApproval === true) {
+            let method = pretixpaypal.paypage ? "wallet" : pretixpaypal.method.method;
+            let selectorstub = "#payment_paypal_" + method;
+            var $form = $(selectorstub + "_oid").closest("form");
+
+            $form.get(0).submit();
+        }
+    },
+
     renderAPMs: function () {
         pretixpaypal.restore();
         let inputselector = $("input[name=payment][value=paypal_apm]");
-        // The first selector is used on the regular payment-step of the checkout flow
-        // The second selector is used for the payment method change view.
-        // In the long run, the layout of both pages should be adjusted to be one.
-        let textselector = $("label[for=input_payment_paypal_apm]");
-        let textselector2 = inputselector.next("strong");
+        let textselector = inputselector.closest("label").find('.accordion-label-text');
         let eligibles = [];
 
         pretixpaypal.paypal.getFundingSources().forEach(function (fundingSource) {
@@ -272,10 +292,6 @@ var pretixpaypal = {
         textselector.fadeOut(300, function () {
             textselector.text(eligibles.join(', '));
             textselector.fadeIn(300);
-        });
-        textselector2.fadeOut(300, function () {
-            textselector2[0].textContent = eligibles.join(', ');
-            textselector2.fadeIn(300);
         });
     },
 
@@ -310,12 +326,20 @@ var pretixpaypal = {
             'tr_TR',
         ]
         let lang = $("body").attr("data-locale").split('-')[0];
-        console.log(allowed_locales.find(element => element.startsWith(lang)));
         return allowed_locales.find(element => element.startsWith(lang));
     }
 };
 
 $(function () {
+    // This script is always loaded if paypal is enabled as a payment method, regardless of
+    // whether it is available (it could e.g. be hidden or limited to certain countries).
+    // We do not want to unnecessarily load the sdk.
+    // If no paypal/paypal_apm payment option is present and we are not on
+    // the (APM) PayView, then we do not need the SDK.
+    if (!$("input[name=payment][value^='paypal']").length && !$('#paypal-button-container').data('paypage')) {
+        return
+    }
+
     pretixpaypal.load();
 
     (async() => {

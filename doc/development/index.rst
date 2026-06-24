@@ -1,5 +1,5 @@
-Developer documentation
-=======================
+Plugin & core development
+=========================
 
 .. toctree::
    :maxdepth: 2
@@ -12,3 +12,4 @@ Developer documentation
    api/index
    structure
    translation/index
+   nfc/index

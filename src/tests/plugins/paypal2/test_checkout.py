@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -137,5 +137,4 @@ def test_payment(env, monkeypatch):
         'payment_paypal_wallet_oid': '04F89033701558004',
         'payment_paypal_wallet_payer': 'Q739JNKWH67HE',
     })
-    print(response.content.decode())
     assert response['Location'] == '/ccc/30c3/checkout/confirm/'

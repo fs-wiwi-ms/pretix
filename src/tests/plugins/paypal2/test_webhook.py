@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -26,6 +26,7 @@ from decimal import Decimal
 import pytest
 from django.utils.timezone import now
 from django_scopes import scopes_disabled
+from paypalhttp.http_response import Result
 
 from pretix.base.models import (
     Event, Order, OrderPayment, OrderRefund, Organizer, Team, User,
@@ -41,7 +42,7 @@ def env():
         organizer=o, name='Dummy', slug='dummy', plugins='pretix.plugins.paypal2',
         date_from=now(), live=True
     )
-    t = Team.objects.create(organizer=event.organizer, can_view_orders=True, can_change_orders=True)
+    t = Team.objects.create(organizer=event.organizer, all_event_permissions=True)
     t.members.add(user)
     t.limit_events.add(event)
     o1 = Order.objects.create(
@@ -49,6 +50,7 @@ def env():
         status=Order.STATUS_PAID,
         datetime=now(), expires=now() + timedelta(days=10),
         total=Decimal('43.59'),
+        sales_channel=o.sales_channels.get(identifier="web"),
     )
     o1.payments.create(
         amount=o1.total,
@@ -262,7 +264,7 @@ def init_api(self):
 @pytest.mark.django_db
 def test_webhook_all_good(env, client, monkeypatch):
     order = env[1]
-    pp_order = get_test_order()
+    pp_order = Result(get_test_order())
     monkeypatch.setattr("paypalcheckoutsdk.orders.OrdersGetRequest", lambda *args: pp_order)
     monkeypatch.setattr("pretix.plugins.paypal2.payment.PaypalMethod.init_api", init_api)
 
@@ -406,7 +408,7 @@ def test_webhook_mark_paid(env, client, monkeypatch):
     with scopes_disabled():
         order.payments.update(state=OrderPayment.PAYMENT_STATE_PENDING)
 
-    pp_order = get_test_order()
+    pp_order = Result(get_test_order())
     monkeypatch.setattr("paypalcheckoutsdk.orders.OrdersGetRequest", lambda *args: pp_order)
     monkeypatch.setattr("pretix.plugins.paypal2.payment.PaypalMethod.init_api", init_api)
     with scopes_disabled():
@@ -503,8 +505,8 @@ def test_webhook_mark_paid(env, client, monkeypatch):
 @pytest.mark.django_db
 def test_webhook_refund1(env, client, monkeypatch):
     order = env[1]
-    pp_order = get_test_order()
-    pp_refund = get_test_refund()
+    pp_order = Result(get_test_order())
+    pp_refund = Result(get_test_refund())
 
     monkeypatch.setattr("paypalcheckoutsdk.orders.OrdersGetRequest", lambda *args: pp_order)
     monkeypatch.setattr("paypalcheckoutsdk.payments.RefundsGetRequest", lambda *args: pp_refund)
@@ -597,8 +599,8 @@ def test_webhook_refund1(env, client, monkeypatch):
 @pytest.mark.django_db
 def test_webhook_refund2(env, client, monkeypatch):
     order = env[1]
-    pp_order = get_test_order()
-    pp_refund = get_test_refund()
+    pp_order = Result(get_test_order())
+    pp_refund = Result(get_test_refund())
 
     monkeypatch.setattr("paypalcheckoutsdk.orders.OrdersGetRequest", lambda *args: pp_order)
     monkeypatch.setattr("paypalcheckoutsdk.payments.RefundsGetRequest", lambda *args: pp_refund)

@@ -12,14 +12,15 @@ $(function () {
         var validity_error = false;
         $form.find("fieldset").each(function () {
             var $fieldset = $(this);
-            var tid = "tab-" + j + "-" + i;
+            var tid = $fieldset.attr("id");
+            if (!tid) tid = "tab-" + j + "-" + i;
             var $tabli = $("<li>").appendTo($tabs);
             var $tablink = $("<a>").attr("role", "tab")
                 .attr("data-toggle", "tab")
                 .attr("href", "#" + tid)
                 .text($fieldset.find("legend").text())
                 .appendTo($tabli);
-            if ($fieldset.find(".has-error, .alert-danger").length > 0) {
+            if ($fieldset.find(".has-error, .alert-danger:not(.dynamic)").length > 0) {
                 $tablink.append(" ");
                 $tablink.append($("<span>").addClass("fa fa-warning text-danger"));
                 if (preselect === null) {

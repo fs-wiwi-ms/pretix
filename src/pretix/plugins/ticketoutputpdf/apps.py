@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -34,7 +34,7 @@
 
 from django.apps import AppConfig
 from django.utils.functional import cached_property
-from django.utils.translation import gettext_lazy as _
+from django.utils.translation import gettext, gettext_lazy as _
 
 from pretix import __version__ as version
 
@@ -51,6 +51,9 @@ class TicketOutputPdfApp(AppConfig):
         featured = True
         description = _("Issue tickets as PDF files, usable on any device. Our drag-and-drop editor allows you to "
                         "customize the layout of the PDF files to your brand.")
+        settings_links = [
+            ((_("Settings"), _("Tickets")), "control:event.settings.tickets", {}),
+        ]
 
     def ready(self):
         from . import signals  # NOQA
@@ -63,3 +66,11 @@ class TicketOutputPdfApp(AppConfig):
         except ImportError:
             errs.append("Python package 'reportlab' is not installed.")
         return errs
+
+    def installed(self, event):
+        event.ticket_layouts.get_or_create(
+            default=True,
+            defaults={
+                'name': gettext('Default layout'),
+            }
+        )

@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -24,15 +24,16 @@ import os
 
 import pycountry
 from django.core.files import File
+from django.core.validators import RegexValidator
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 
 from pretix.api.serializers.order import (
     AnswerCreateSerializer, AnswerSerializer, CompatibleCountryField,
-    OrderPositionCreateSerializer,
+    OrderFeeCreateSerializer, OrderPositionCreateSerializer,
 )
 from pretix.base.models import ItemVariation, Order, OrderFee, OrderPosition
-from pretix.base.services.orders import OrderError
+from pretix.base.services.orders import OrderChangeManager, OrderError
 from pretix.base.settings import COUNTRIES_WITH_STATE_IN_ADDRESS
 
 logger = logging.getLogger(__name__)
@@ -46,14 +47,14 @@ class OrderPositionCreateForExistingOrderSerializer(OrderPositionCreateSerialize
     attendee_name = serializers.CharField(required=False, allow_null=True)
     seat = serializers.CharField(required=False, allow_null=True)
     price = serializers.DecimalField(required=False, allow_null=True, decimal_places=2,
-                                     max_digits=10)
+                                     max_digits=13)
     country = CompatibleCountryField(source='*')
 
     class Meta:
         model = OrderPosition
         fields = ('order', 'item', 'variation', 'price', 'attendee_name', 'attendee_name_parts', 'attendee_email',
                   'company', 'street', 'zipcode', 'city', 'country', 'state',
-                  'secret', 'addon_to', 'subevent', 'answers', 'seat')
+                  'secret', 'addon_to', 'subevent', 'answers', 'seat', 'valid_from', 'valid_until')
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -69,6 +70,8 @@ class OrderPositionCreateForExistingOrderSerializer(OrderPositionCreateSerialize
 
     def validate(self, data):
         data = super().validate(data)
+        if 'order' in self.context:
+            data['order'] = self.context['order']
         if data.get('addon_to'):
             try:
                 data['addon_to'] = data['order'].positions.get(positionid=data['addon_to'])
@@ -79,22 +82,73 @@ class OrderPositionCreateForExistingOrderSerializer(OrderPositionCreateSerialize
         return data
 
     def create(self, validated_data):
-        ocm = self.context['ocm']
+        ocm: OrderChangeManager = self.context['ocm']
+        check_quotas = self.context.get('check_quotas', True)
 
         try:
-            ocm.add_position(
+            new_position = ocm.add_position(
                 item=validated_data['item'],
                 variation=validated_data.get('variation'),
                 price=validated_data.get('price'),
                 addon_to=validated_data.get('addon_to'),
                 subevent=validated_data.get('subevent'),
                 seat=validated_data.get('seat'),
+                valid_from=validated_data.get('valid_from'),
+                valid_until=validated_data.get('valid_until'),
             )
             if self.context.get('commit', True):
-                ocm.commit()
-                return validated_data['order'].positions.order_by('-positionid').first()
+                ocm.commit(check_quotas=check_quotas)
+                return new_position.position
             else:
                 return OrderPosition()  # fake to appease DRF
+        except OrderError as e:
+            raise ValidationError(str(e))
+
+
+class OrderFeeCreateForExistingOrderSerializer(OrderFeeCreateSerializer):
+    order = serializers.SlugRelatedField(slug_field='code', queryset=Order.objects.none(), required=True, allow_null=False)
+    value = serializers.DecimalField(required=True, allow_null=False, decimal_places=2,
+                                     max_digits=13)
+    internal_type = serializers.CharField(required=False, default="")
+
+    class Meta:
+        model = OrderFee
+        fields = ('order', 'fee_type', 'value', 'description', 'internal_type', 'tax_rule')
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not self.context:
+            return
+        self.fields['order'].queryset = self.context['event'].orders.all()
+        self.fields['tax_rule'].queryset = self.context['event'].tax_rules.all()
+        if 'order' in self.context:
+            del self.fields['order']
+
+    def validate(self, data):
+        data = super().validate(data)
+        if 'order' in self.context:
+            data['order'] = self.context['order']
+        return data
+
+    def create(self, validated_data):
+        ocm: OrderChangeManager = self.context['ocm']
+
+        try:
+            f = OrderFee(
+                order=validated_data['order'],
+                fee_type=validated_data['fee_type'],
+                value=validated_data.get('value'),
+                description=validated_data.get('description'),
+                internal_type=validated_data.get('internal_type'),
+                tax_rule=validated_data.get('tax_rule'),
+            )
+            f._calculate_tax()
+            ocm.add_fee(f)
+            if self.context.get('commit', True):
+                ocm.commit()
+                return f
+            else:
+                return OrderFee()  # fake to appease DRF
         except OrderError as e:
             raise ValidationError(str(e))
 
@@ -158,12 +212,14 @@ class OrderPositionInfoPatchSerializer(serializers.ModelSerializer):
                 a.question_id: a for a in instance.answers.all()
             }
             for answ_data in answers_data:
+                if not answ_data.get('answer'):
+                    continue
                 options = answ_data.pop('options', [])
                 if answ_data['question'].pk in qs_seen:
                     raise ValidationError(f'Question {answ_data["question"]} was sent twice.')
                 if answ_data['question'].pk in answercache:
                     a = answercache[answ_data['question'].pk]
-                    if isinstance(answ_data['answer'], File):
+                    if isinstance(answ_data.get('answer'), File):
                         a.file.save(answ_data['answer'].name, answ_data['answer'], save=False)
                         a.answer = 'file://' + a.file.name
                     elif a.answer.startswith('file://') and answ_data['answer'] == "file:keep":
@@ -173,7 +229,7 @@ class OrderPositionInfoPatchSerializer(serializers.ModelSerializer):
                             setattr(a, attr, value)
                     a.save()
                 else:
-                    if isinstance(answ_data['answer'], File):
+                    if isinstance(answ_data.get('answer'), File):
                         an = answ_data.pop('answer')
                         a = instance.answers.create(**answ_data, answer='')
                         a.file.save(os.path.basename(an.name), an, save=False)
@@ -196,7 +252,7 @@ class OrderPositionChangeSerializer(serializers.ModelSerializer):
     class Meta:
         model = OrderPosition
         fields = (
-            'item', 'variation', 'subevent', 'seat', 'price', 'tax_rule',
+            'item', 'variation', 'subevent', 'seat', 'price', 'tax_rule', 'valid_from', 'valid_until', 'secret'
         )
 
     def __init__(self, *args, **kwargs):
@@ -254,7 +310,8 @@ class OrderPositionChangeSerializer(serializers.ModelSerializer):
         return data
 
     def update(self, instance, validated_data):
-        ocm = self.context['ocm']
+        ocm: OrderChangeManager = self.context['ocm']
+        check_quotas = self.context.get('check_quotas', True)
         current_seat = {'seat_guid': instance.seat.seat_guid} if instance.seat else None
         item = validated_data.get('item', instance.item)
         variation = validated_data.get('variation', instance.variation)
@@ -262,6 +319,9 @@ class OrderPositionChangeSerializer(serializers.ModelSerializer):
         price = validated_data.get('price', instance.price)
         seat = validated_data.get('seat', current_seat)
         tax_rule = validated_data.get('tax_rule', instance.tax_rule)
+        valid_from = validated_data.get('valid_from', instance.valid_from)
+        valid_until = validated_data.get('valid_until', instance.valid_until)
+        secret = validated_data.get('secret', instance.secret)
 
         change_item = None
         if item != instance.item or variation != instance.variation:
@@ -288,8 +348,17 @@ class OrderPositionChangeSerializer(serializers.ModelSerializer):
             if tax_rule != instance.tax_rule:
                 ocm.change_tax_rule(instance, tax_rule)
 
+            if valid_from != instance.valid_from:
+                ocm.change_valid_from(instance, valid_from)
+
+            if valid_until != instance.valid_until:
+                ocm.change_valid_until(instance, valid_until)
+
+            if secret != instance.secret:
+                ocm.change_ticket_secret(instance, secret)
+
             if self.context.get('commit', True):
-                ocm.commit()
+                ocm.commit(check_quotas=check_quotas)
                 instance.refresh_from_db()
         except OrderError as e:
             raise ValidationError(str(e))
@@ -330,7 +399,7 @@ class OrderFeeChangeSerializer(serializers.ModelSerializer):
         )
 
     def update(self, instance, validated_data):
-        ocm = self.context['ocm']
+        ocm: OrderChangeManager = self.context['ocm']
         value = validated_data.get('value', instance.value)
 
         try:
@@ -386,6 +455,9 @@ class OrderChangeOperationSerializer(serializers.Serializer):
         self.fields['split_positions'] = SelectPositionSerializer(
             many=True, required=False, context=self.context
         )
+        self.fields['create_fees'] = OrderFeeCreateForExistingOrderSerializer(
+            many=True, required=False, context=self.context
+        )
         self.fields['patch_fees'] = PatchFeeSerializer(
             many=True, required=False, context=self.context
         )
@@ -396,7 +468,6 @@ class OrderChangeOperationSerializer(serializers.Serializer):
     def validate(self, data):
         seen_positions = set()
         for d in data.get('patch_positions', []):
-            print(d, seen_positions)
             if d['position'] in seen_positions:
                 raise ValidationError({'patch_positions': ['You have specified the same object twice.']})
             seen_positions.add(d['position'])
@@ -422,3 +493,7 @@ class OrderChangeOperationSerializer(serializers.Serializer):
             seen_positions.add(d['fee'])
 
         return data
+
+
+class BlockNameSerializer(serializers.Serializer):
+    name = serializers.CharField(validators=[RegexValidator('^(admin|api:[a-zA-Z0-9._]+)$')])

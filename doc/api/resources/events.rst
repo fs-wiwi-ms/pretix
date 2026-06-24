@@ -1,4 +1,4 @@
-.. spelling::
+.. spelling:word-list::
 
    geo
    lat
@@ -36,6 +36,8 @@ geo_lon                               float                      Longitude of th
 has_subevents                         boolean                    ``true`` if the event series feature is active for this
                                                                  event. Cannot change after event is created.
 meta_data                             object                     Values set for organizer-specific meta data parameters.
+                                                                 The allowed keys need to be set up as meta properties
+                                                                 in the organizer configuration.
 plugins                               list                       A list of package names of the enabled plugins for this
                                                                  event.
 seating_plan                          integer                    If reserved seating is in use, the ID of a seating
@@ -47,54 +49,21 @@ item_meta_properties                  object                     Item-specific m
 valid_keys                            object                     Cryptographic keys for non-default signature schemes.
                                                                  For performance reason, value is omitted in lists and
                                                                  only contained in detail views. Value can be cached.
-sales_channels                        list                       A list of sales channels this event is available for
-                                                                 sale on.
+all_sales_channels                    boolean                    If ``true`` (default), the event is available on all sales channels.
+limit_sales_channels                  list of strings            List of sales channel identifiers the event is available on
+                                                                 if ``all_sales_channels`` is ``false``.
+sales_channels                        list of strings            **DEPRECATED.** Legacy interface, use ``all_sales_channels``
+                                                                 and ``limit_sales_channels`` instead.
+public_url                            string                     The public, customer-facing URL of the event (read-only).
 ===================================== ========================== =======================================================
-
-
-.. versionchanged:: 3.3
-
-   The attributes ``geo_lat`` and ``geo_lon`` have been added.
-
-.. versionchanged:: 3.4
-
-   The attribute ``timezone`` has been added.
-
-.. versionchanged:: 3.7
-
-   The attribute ``item_meta_properties`` has been added.
-
-.. versionchanged:: 3.12
-
-   The attribute ``valid_keys`` has been added.
-
-.. versionchanged:: 3.14
-
-    The attribute ``sales_channels`` has been added.
 
 
 Endpoints
 ---------
 
-.. versionchanged:: 3.3
-
-    The events resource can now be filtered by meta data attributes.
-
-.. versionchanged:: 4.0
-
-    The ``clone_from`` parameter has been added to the event creation endpoint.
-
-.. versionchanged:: 4.1
-
-    The ``with_availability_for`` parameter has been added.
-
-    The ``search`` query parameter has been added to filter events by their slug, name, or location in any language.
-
 .. http:get:: /api/v1/organizers/(organizer)/events/
 
    Returns a list of all events within a given organizer the authenticated user/token has access to.
-
-   Permission required: "Can change event settings"
 
    **Example request**:
 
@@ -144,11 +113,14 @@ Endpoints
               "pretix.plugins.paypal",
               "pretix.plugins.ticketoutputpdf"
             ],
-            "sales_channels": [
+            "all_sales_channels": false,
+            "limit_sales_channels": [
               "web",
               "pretixpos",
               "resellers"
-            ]
+            ],
+            "sales_channels": [],
+            "public_url": "https://pretix.eu/bigevents/sampleconf/"
           }
         ]
       }
@@ -156,9 +128,14 @@ Endpoints
    :query page: The page number in case of a multi-page result set, default is 1
    :query is_public: If set to ``true``/``false``, only events with a matching value of ``is_public`` are returned.
    :query live: If set to ``true``/``false``, only events with a matching value of ``live`` are returned.
+   :query testmode: If set to ``true``/``false``, only events with a matching value of ``testmode`` are returned.
    :query has_subevents: If set to ``true``/``false``, only events with a matching value of ``has_subevents`` are returned.
    :query is_future: If set to ``true`` (``false``), only events that happen currently or in the future are (not) returned. Event series are never (always) returned.
    :query is_past: If set to ``true`` (``false``), only events that are over are (not) returned. Event series are never (always) returned.
+   :query date_from_after: If set to a date and time, only events that start at or after the given time are returned.
+   :query date_from_before: If set to a date and time, only events that start at or before the given time are returned.
+   :query date_to_after: If set to a date and time, only events that have an end date and end at or after the given time are returned.
+   :query date_to_before: If set to a date and time, only events that have an end date and end at or before the given time are returned.
    :query ends_after: If set to a date and time, only events that happen during of after the given time are returned. Event series are never returned.
    :query string ordering: Manually set the ordering of results. Valid fields to be used are ``date_from`` and
                            ``slug``. Keep in mind that ``date_from`` of event series does not really tell you anything.
@@ -181,8 +158,6 @@ Endpoints
 .. http:get:: /api/v1/organizers/(organizer)/events/(event)/
 
    Returns information on one event, identified by its slug.
-
-   Permission required: "Can change event settings"
 
    **Example request**:
 
@@ -232,11 +207,14 @@ Endpoints
             "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUNvd0JRWURLMlZ3QXlFQTdBRDcvdkZBMzNFc1k0ejJQSHI3aVpQc1o4bjVkaDBhalA4Z3l6Tm1tSXM9Ci0tLS0tRU5EIFBVQkxJQyBLRVktLS0tLQo="
           ]
         },
+        "all_sales_channels": true,
+        "limit_sales_channels": [],
         "sales_channels": [
           "web",
           "pretixpos",
           "resellers"
-        ]
+        ],
+        "public_url": "https://pretix.eu/bigevents/sampleconf/"
       }
 
    :param organizer: The ``slug`` field of the organizer to fetch
@@ -251,8 +229,6 @@ Endpoints
 
    Please note that events cannot be created as 'live' using this endpoint. Quotas and payment must be added to the
    event before sales can go live.
-
-   Permission required: "Can create events"
 
    **Example request**:
 
@@ -288,11 +264,8 @@ Endpoints
           "pretix.plugins.stripe",
           "pretix.plugins.paypal"
         ],
-        "sales_channels": [
-          "web",
-          "pretixpos",
-          "resellers"
-        ]
+        "all_sales_channels": true,
+        "limit_sales_channels": []
       }
 
    **Example response**:
@@ -328,11 +301,14 @@ Endpoints
           "pretix.plugins.stripe",
           "pretix.plugins.paypal"
         ],
+        "all_sales_channels": true,
+        "limit_sales_channels": [],
         "sales_channels": [
           "web",
           "pretixpos",
           "resellers"
-        ]
+        ],
+        "public_url": "https://pretix.eu/bigevents/sampleconf/"
       }
 
    :param organizer: The ``slug`` field of the organizer of the event to create.
@@ -350,13 +326,11 @@ Endpoints
    Creates a new event with properties as set in the request body. The properties that are copied are: ``is_public``,
    ``testmode``, ``has_subevents``, settings, plugin settings, items, variations, add-ons, quotas, categories, tax rules, questions.
 
-   If the ``plugins``, ``has_subevents`` and/or ``is_public`` fields are present in the post body this will determine their
-   value. Otherwise their value will be copied from the existing event.
+   If the ``plugins``, ``has_subevents``, ``meta_data`` and/or ``is_public`` fields are present in the post body this will
+   determine their  value. Otherwise their value will be copied from the existing event.
 
    Please note that you can only copy from events under the same organizer this way. Use the ``clone_from`` parameter
    when creating a new event for this instead.
-
-   Permission required: "Can create events"
 
    **Example request**:
 
@@ -392,11 +366,8 @@ Endpoints
           "pretix.plugins.stripe",
           "pretix.plugins.paypal"
         ],
-        "sales_channels": [
-          "web",
-          "pretixpos",
-          "resellers"
-        ]
+        "all_sales_channels": true,
+        "limit_sales_channels": []
       }
 
    **Example response**:
@@ -432,26 +403,27 @@ Endpoints
           "pretix.plugins.stripe",
           "pretix.plugins.paypal"
         ],
+        "all_sales_channels": true,
+        "limit_sales_channels": [],
         "sales_channels": [
           "web",
           "pretixpos",
           "resellers"
-        ]
+        ],
+        "public_url": "https://pretix.eu/bigevents/sampleconf/"
       }
 
    :param organizer: The ``slug`` field of the organizer of the event to create.
    :param event: The ``slug`` field of the event to copy settings and items from.
    :statuscode 201: no error
-   :statuscode 400: The event could not be created due to invalid submitted data.
+   :statuscode 400: The event could not be updated due to invalid submitted data.
    :statuscode 401: Authentication failure
-   :statuscode 403: The requested organizer does not exist **or** you have no permission to create this resource.
+   :statuscode 403: The requested organizer does not exist **or** you have no permission to update this resource.
 
 
 .. http:patch:: /api/v1/organizers/(organizer)/events/(event)/
 
    Updates an event
-
-   Permission required: "Can change event settings"
 
    **Example request**:
 
@@ -506,11 +478,14 @@ Endpoints
           "pretix.plugins.paypal",
           "pretix.plugins.pretixdroid"
         ],
+        "all_sales_channels": true,
+        "limit_sales_channels": [],
         "sales_channels": [
           "web",
           "pretixpos",
           "resellers"
-        ]
+        ],
+        "public_url": "https://pretix.eu/bigevents/sampleconf/"
       }
 
    :param organizer: The ``slug`` field of the organizer of the event to update
@@ -524,8 +499,6 @@ Endpoints
 .. http:delete:: /api/v1/organizers/(organizer)/events/(event)/
 
    Delete an event. Note that events with orders cannot be deleted to ensure data integrity.
-
-   Permission required: "Can change event settings"
 
    **Example request**:
 
@@ -561,21 +534,20 @@ Therefore, we're also not including a list of the options here, but instead reco
 to see available options. The ``explain=true`` flag enables a verbose mode that provides you with human-readable
 information about the properties.
 
+Note that some settings are read-only, e.g. because they can be read on event level but currently only be changed on
+organizer level.
+
 .. note:: Please note that this is not a complete representation of all event settings. You will find more settings
           in the web interface.
 
 .. warning:: This API is intended for advanced users. Even though we take care to validate your input, you will be
              able to break your event using this API by creating situations of conflicting settings. Please take care.
 
-.. versionchanged:: 3.6
-
-   Initial support for settings has been added to the API.
+.. note:: When authenticating with :ref:`rest-deviceauth`, only a limited subset of settings is available.
 
 .. http:get:: /api/v1/organizers/(organizer)/events/(event)/settings/
 
    Get current values of event settings.
-
-   Permission required: "Can change event settings" (Exception: with device auth, *some* settings can always be *read*.)
 
    **Example request**:
 
@@ -611,6 +583,7 @@ information about the properties.
           {
             "value": "https://pretix.eu",
             "label": "Imprint URL",
+            "readonly": false,
             "help_text": "This should point e.g. to a part of your website that has your contact details and legal information."
           }
         },
@@ -627,6 +600,8 @@ information about the properties.
 .. http:patch:: /api/v1/organizers/(organizer)/events/(event)/settings/
 
    Updates event settings. Note that ``PUT`` is not allowed here, only ``PATCH``.
+
+   Permission "Can change event settings" is always required. Some keys require additional permissions.
 
     .. warning::
 

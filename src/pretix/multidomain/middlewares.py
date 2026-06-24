@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -32,7 +32,10 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under the License.
 
+import logging
 import time
+from datetime import datetime
+from http.cookies import Morsel
 from urllib.parse import urlparse
 
 from django.conf import settings
@@ -40,9 +43,14 @@ from django.contrib.sessions.middleware import (
     SessionMiddleware as BaseSessionMiddleware,
 )
 from django.core.cache import cache
-from django.core.exceptions import DisallowedHost
+from django.core.exceptions import DisallowedHost, ImproperlyConfigured
 from django.http.request import split_domain_port
-from django.middleware.csrf import CsrfViewMiddleware as BaseCsrfMiddleware
+from django.middleware.csrf import (
+    CSRF_SESSION_KEY, CSRF_TOKEN_LENGTH,
+    CsrfViewMiddleware as BaseCsrfMiddleware, _check_token_format,
+    _unmask_cipher_token,
+)
+from django.shortcuts import render
 from django.urls import set_urlconf
 from django.utils.cache import patch_vary_headers
 from django.utils.deprecation import MiddlewareMixin
@@ -52,6 +60,8 @@ from django_scopes import scopes_disabled
 from pretix.base.models import Event, Organizer
 from pretix.helpers.cookies import set_cookie_without_samesite
 from pretix.multidomain.models import KnownDomain
+
+logger = logging.getLogger(__name__)
 
 LOCAL_HOST_NAMES = ('testserver', 'localhost')
 
@@ -75,28 +85,32 @@ class MultiDomainMiddleware(MiddlewareMixin):
         request.port = int(port) if port else None
         request.host = domain
         if domain == default_domain:
+            request.domain_mode = "system"
             request.urlconf = "pretix.multidomain.maindomain_urlconf"
         elif domain:
-            cached = cache.get('pretix_multidomain_instance_{}'.format(domain))
+            cached = cache.get('pretix_multidomain_instances_{}'.format(domain))
 
             if cached is None:
                 try:
                     kd = KnownDomain.objects.select_related('organizer', 'event').get(domainname=domain)  # noqa
                     orga = kd.organizer
                     event = kd.event
+                    mode = kd.mode
                 except KnownDomain.DoesNotExist:
                     orga = False
                     event = False
+                    mode = "system"
                 cache.set(
-                    'pretix_multidomain_instance_{}'.format(domain),
-                    (orga.pk if orga else None, event.pk if event else None),
+                    'pretix_multidomain_instances_{}'.format(domain),
+                    (orga.pk if orga else None, event.pk if event else None, mode),
                     3600
                 )
             else:
-                orga, event = cached
+                orga, event, mode = cached
 
-            if event:
+            if mode == KnownDomain.MODE_EVENT_DOMAIN:
                 request.event_domain = True
+                request.domain_mode = KnownDomain.MODE_EVENT_DOMAIN
                 if isinstance(event, Event):
                     request.organizer = orga
                     request.event = event
@@ -105,14 +119,29 @@ class MultiDomainMiddleware(MiddlewareMixin):
                         request.event = Event.objects.select_related('organizer').get(pk=event)
                         request.organizer = request.event.organizer
                 request.urlconf = "pretix.multidomain.event_domain_urlconf"
-            elif orga:
+            elif mode == KnownDomain.MODE_ORG_ALT_DOMAIN:
                 request.organizer_domain = True
+                request.domain_mode = KnownDomain.MODE_ORG_ALT_DOMAIN
+                request.organizer = orga if isinstance(orga, Organizer) else Organizer.objects.get(pk=orga)
+                request.urlconf = "pretix.multidomain.organizer_alternative_domain_urlconf"
+            elif mode == KnownDomain.MODE_ORG_DOMAIN:
+                request.organizer_domain = True
+                request.domain_mode = KnownDomain.MODE_ORG_DOMAIN
                 request.organizer = orga if isinstance(orga, Organizer) else Organizer.objects.get(pk=orga)
                 request.urlconf = "pretix.multidomain.organizer_domain_urlconf"
             elif settings.DEBUG or domain in LOCAL_HOST_NAMES:
+                request.domain_mode = "system"
                 request.urlconf = "pretix.multidomain.maindomain_urlconf"
             else:
-                raise DisallowedHost("Unknown host: %r" % host)
+                with scopes_disabled():
+                    is_fresh_install = not Event.objects.exists()
+                return render(request, '400_hostname.html', {
+                    'header_host': domain,
+                    'site_host': default_domain,
+                    'settings': settings,
+                    'xfh': request.headers.get('X-Forwarded-Host'),
+                    'is_fresh_install': is_fresh_install,
+                }, status=400)
         else:
             raise DisallowedHost("Invalid HTTP_HOST header: %r." % host)
 
@@ -133,6 +162,13 @@ class SessionMiddleware(BaseSessionMiddleware):
     a custom domain.
     """
 
+    def process_request(self, request):
+        session_key = request.COOKIES.get(
+            '__Host-' + settings.SESSION_COOKIE_NAME,
+            request.COOKIES.get(settings.SESSION_COOKIE_NAME)
+        )
+        request.session = self.SessionStore(session_key)
+
     def process_response(self, request, response):
         try:
             accessed = request.session.accessed
@@ -143,7 +179,10 @@ class SessionMiddleware(BaseSessionMiddleware):
         else:
             # First check if we need to delete this cookie.
             # The session should be deleted only if the session is entirely empty
-            if settings.SESSION_COOKIE_NAME in request.COOKIES and empty:
+            is_secure = request.scheme == 'https'
+            if '__Host-' + settings.SESSION_COOKIE_NAME in request.COOKIES and empty:
+                response.delete_cookie('__Host-' + settings.SESSION_COOKIE_NAME)
+            elif settings.SESSION_COOKIE_NAME in request.COOKIES and empty:
                 response.delete_cookie(settings.SESSION_COOKIE_NAME)
             else:
                 if accessed:
@@ -160,12 +199,14 @@ class SessionMiddleware(BaseSessionMiddleware):
                     # Skip session save for 500 responses, refs #3881.
                     if response.status_code != 500:
                         request.session.save()
+                        if is_secure and settings.SESSION_COOKIE_NAME in request.COOKIES:  # remove legacy cookie
+                            response.delete_cookie(settings.SESSION_COOKIE_NAME)
+                            response.delete_cookie(settings.SESSION_COOKIE_NAME, samesite="None")
                         set_cookie_without_samesite(
                             request, response,
-                            settings.SESSION_COOKIE_NAME,
+                            '__Host-' + settings.SESSION_COOKIE_NAME if is_secure else settings.SESSION_COOKIE_NAME,
                             request.session.session_key, max_age=max_age,
                             expires=expires,
-                            domain=get_cookie_domain(request),
                             path=settings.SESSION_COOKIE_PATH,
                             secure=request.scheme == 'https',
                             httponly=settings.SESSION_COOKIE_HTTPONLY or None
@@ -180,48 +221,107 @@ class CsrfViewMiddleware(BaseCsrfMiddleware):
     a custom domain.
     """
 
-    def process_response(self, request, response):
-        if getattr(response, 'csrf_processing_done', False):
-            return response
+    def _get_secret(self, request):
+        if settings.CSRF_USE_SESSIONS:
+            try:
+                csrf_secret = request.session.get(CSRF_SESSION_KEY)
+            except AttributeError:
+                raise ImproperlyConfigured(
+                    "CSRF_USE_SESSIONS is enabled, but request.session is not "
+                    "set. SessionMiddleware must appear before CsrfViewMiddleware "
+                    "in MIDDLEWARE."
+                )
+        else:
+            try:
+                csrf_secret = request.COOKIES.get('__Host-' + settings.CSRF_COOKIE_NAME)
+                if not csrf_secret:
+                    csrf_secret = request.COOKIES[settings.CSRF_COOKIE_NAME]
+            except KeyError:
+                csrf_secret = None
+            else:
+                # This can raise InvalidTokenFormat.
+                _check_token_format(csrf_secret)
+        if csrf_secret is None:
+            return None
+        # Django versions before 4.0 masked the secret before storing.
+        if len(csrf_secret) == CSRF_TOKEN_LENGTH:
+            csrf_secret = _unmask_cipher_token(csrf_secret)
+        return csrf_secret
 
-        # If CSRF_COOKIE is unset, then CsrfViewMiddleware.process_view was
-        # never called, probably because a request middleware returned a response
-        # (for example, contrib.auth redirecting to a login page).
-        if request.META.get("CSRF_COOKIE") is None:
-            return response
+    def _set_csrf_cookie(self, request, response):
+        if settings.CSRF_USE_SESSIONS:
+            if request.session.get(CSRF_SESSION_KEY) != request.META["CSRF_COOKIE"]:
+                request.session[CSRF_SESSION_KEY] = request.META["CSRF_COOKIE"]
+        else:
+            is_secure = request.scheme == 'https'
+            # Set the CSRF cookie even if it's already set, so we renew
+            # the expiry timer.
+            if is_secure and settings.CSRF_COOKIE_NAME in request.COOKIES:  # remove legacy cookie
+                response.delete_cookie(settings.CSRF_COOKIE_NAME)
+                response.delete_cookie(settings.CSRF_COOKIE_NAME, samesite="None")
 
-        if not request.META.get("CSRF_COOKIE_USED", False):
-            return response
+            handle_duplicated_csrftoken(request, response)
 
-        # Set the CSRF cookie even if it's already set, so we renew
-        # the expiry timer.
-        set_cookie_without_samesite(
-            request, response,
-            settings.CSRF_COOKIE_NAME,
-            request.META["CSRF_COOKIE"],
-            max_age=settings.CSRF_COOKIE_AGE,
-            domain=get_cookie_domain(request),
-            path=settings.CSRF_COOKIE_PATH,
-            secure=request.scheme == 'https',
-            httponly=settings.CSRF_COOKIE_HTTPONLY
-        )
-        # Content varies with the CSRF cookie, so set the Vary header.
-        patch_vary_headers(response, ('Cookie',))
-        response.csrf_processing_done = True
-        return response
+            set_cookie_without_samesite(
+                request, response,
+                '__Host-' + settings.CSRF_COOKIE_NAME if is_secure else settings.CSRF_COOKIE_NAME,
+                request.META["CSRF_COOKIE"],
+                max_age=settings.CSRF_COOKIE_AGE,
+                path=settings.CSRF_COOKIE_PATH,
+                secure=is_secure,
+                httponly=settings.CSRF_COOKIE_HTTPONLY
+            )
+            # Content varies with the CSRF cookie, so set the Vary header.
+            patch_vary_headers(response, ('Cookie',))
 
 
-def get_cookie_domain(request):
-    if '.' not in request.host:
-        # As per spec, browsers do not accept cookie domains without dots in it,
-        # e.g. "localhost", see http://curl.haxx.se/rfc/cookie_spec.html
-        return None
-    default_domain, default_port = split_domain_port(urlparse(settings.SITE_URL).netloc)
-    if request.host == default_domain:
-        # We are on our main domain, set the cookie domain the user has chosen
-        return settings.SESSION_COOKIE_DOMAIN
-    else:
-        # We are on an organizer's custom domain, set no cookie domain, as we do not want
-        # the cookies to be present on any other domain. Setting an explicit value can be
-        # dangerous, see http://erik.io/blog/2014/03/04/definitive-guide-to-cookie-domains/
-        return None
+def handle_duplicated_csrftoken(request, response):
+    # Due to a Safari bug, in some browser, two csrftoken cookies with different values
+    # exist: one unpartitioned, one partitioned. This function generates an additional
+    # Set-Cookie header to get rid of the unpartitioned one.
+
+    cookie_name = '__Host-' + settings.CSRF_COOKIE_NAME
+
+    if request.scheme == 'https' and cookie_name in request.COOKIES:
+        values = get_all_values_of_cookie(request.headers.get('Cookie'), cookie_name)
+        if len(values) > 1:
+            logger.info('Trying to remove duplicated %s cookies: %r', cookie_name, values)
+
+            # Make sure the set_cookie_without_samesite below will add a new item in the dictionary, placing
+            # it below our deletion header.
+            response.cookies.pop(cookie_name, None)
+
+            # Add the deletion Set-Cookie header to the cookie dict under a wrong name, so it doesn't get
+            # overwritten by the set_cookie_without_samesite call below.  This works because the code in
+            # django.core.handlers.wsgi/asgi, that generates the actual Set-Cookie headers, only iterates
+            # over cookie.values(), ignoring the keys.
+            response.cookies['___DELETECOOKIE___' + cookie_name] = make_delete_morsel(cookie_name)
+
+
+def get_all_values_of_cookie(cookie_header, cookie_name):
+    # like django.http.cookie.parse_cookie, but returns all values of duplicated cookies instead of only the last
+    values = list()
+    if not cookie_header:
+        return values
+    for chunk in cookie_header.split(";"):
+        if "=" in chunk:
+            key, val = chunk.split("=", 1)
+        else:
+            # Assume an empty name per
+            # https://bugzilla.mozilla.org/show_bug.cgi?id=169091
+            key, val = "", chunk
+        key, val = key.strip(), val.strip()
+        if key == cookie_name:
+            values.append(val)
+    return values
+
+
+def make_delete_morsel(name):
+    m = Morsel()
+    m.set(name, '', '')
+    m['expires'] = datetime.utcfromtimestamp(0).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    m['samesite'] = 'None'
+    m['secure'] = True
+    m['path'] = settings.CSRF_COOKIE_PATH
+    m['httponly'] = settings.CSRF_COOKIE_HTTPONLY
+    return m

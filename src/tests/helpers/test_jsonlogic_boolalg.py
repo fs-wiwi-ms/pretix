@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -63,7 +63,6 @@ def compare_ignoring_order(data1, data2):
         try:
             assert set(data1) == set(data2)
         except:
-            print(data1, data2)
             assert len(data1) == len(data2) and all(data1.count(i) == data2.count(i) for i in data1)
     elif isinstance(data1, dict) and isinstance(data2, dict):
         assert set(data1.keys()) == set(data2.keys())

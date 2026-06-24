@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -31,7 +31,6 @@
 # Unless required by applicable law or agreed to in writing, software distributed under the Apache License 2.0 is
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under the License.
-import hashlib
 import json
 import logging
 from decimal import Decimal
@@ -39,6 +38,7 @@ from decimal import Decimal
 from django.contrib import messages
 from django.core import signing
 from django.core.cache import cache
+from django.db import transaction
 from django.db.models import Sum
 from django.http import (
     Http404, HttpResponse, HttpResponseBadRequest, JsonResponse,
@@ -56,18 +56,25 @@ from django.views.generic import TemplateView
 from django_scopes import scopes_disabled
 from paypalcheckoutsdk import orders as pp_orders, payments as pp_payments
 
-from pretix.base.models import Event, Order, OrderPayment, OrderRefund, Quota
+from pretix.base.models import (
+    Event, Order, OrderPayment, OrderRefund, Quota, TaxRule,
+)
 from pretix.base.payment import PaymentException
-from pretix.base.services.cart import get_fees
+from pretix.base.services.cart import add_payment_to_cart, get_fees
 from pretix.base.settings import GlobalSettingsObject
 from pretix.control.permissions import event_permission_required
+from pretix.helpers import OF_SELF
+from pretix.helpers.http import redirect_to_url
 from pretix.multidomain.urlreverse import eventreverse
 from pretix.plugins.paypal2.client.customer.partners_merchantintegrations_get_request import (
     PartnersMerchantIntegrationsGetRequest,
 )
-from pretix.plugins.paypal2.payment import PaypalMethod, PaypalMethod as Paypal
+from pretix.plugins.paypal2.payment import (
+    PaypalMethod, PaypalMethod as Paypal, PaypalWallet,
+)
 from pretix.plugins.paypal.models import ReferencedPayPalObject
-from pretix.presale.views import get_cart, get_cart_total
+from pretix.presale.views import get_cart
+from pretix.presale.views.cart import cart_session
 
 logger = logging.getLogger('pretix.plugins.paypal2')
 
@@ -75,15 +82,11 @@ logger = logging.getLogger('pretix.plugins.paypal2')
 class PaypalOrderView:
     def dispatch(self, request, *args, **kwargs):
         try:
-            self.order = request.event.orders.get(code=kwargs['order'])
-            if hashlib.sha1(self.order.secret.lower().encode()).hexdigest() != kwargs['hash'].lower():
-                raise Http404('Unknown order')
+            self.order = request.event.orders.get_with_secret_check(
+                code=kwargs['order'], received_secret=kwargs['hash'].lower(), tag='plugins:paypal2:pay'
+            )
         except Order.DoesNotExist:
-            # Do a hash comparison as well to harden timing attacks
-            if 'abcdefghijklmnopq'.lower() == hashlib.sha1('abcdefghijklmnopq'.encode()).hexdigest():
-                raise Http404('Unknown order')
-            else:
-                raise Http404('Unknown order')
+            raise Http404('Unknown order')
         return super().dispatch(request, *args, **kwargs)
 
     @cached_property
@@ -142,26 +145,40 @@ class XHRView(View):
             else:
                 fee = prov.calculate_fee(order.pending_sum)
 
-            cart = {
-                'positions': order.positions,
-                'cart_total': order.pending_sum,
-                'cart_fees': Decimal('0.00'),
-                'payment_fee': fee,
-            }
+            cart_total = order.pending_sum + fee
         else:
-            cart_total = get_cart_total(request)
-            cart_fees = Decimal('0.00')
-            for fee in get_fees(request.event, request, cart_total, None, None, get_cart(request)):
-                cart_fees += fee.value
+            cart = get_cart(request)
+            cart_payments = cart_session(request).get('payments', [])
+            multi_use_cart_payments = [p for p in cart_payments if p.get('multi_use_supported')]
+            simulated_payments = multi_use_cart_payments + [{
+                'provider': 'paypal',
+                'multi_use_supported': False,
+                'min_value': None,
+                'max_value': None,
+                'info_data': {},
+            }]
 
-            cart = {
-                'positions': get_cart(request),
-                'cart_total': cart_total,
-                'cart_fees': cart_fees,
-                'payment_fee': prov.calculate_fee(cart_total + cart_fees),
-            }
+            try:
+                fees = get_fees(event=request.event, request=request, invoice_address=None,
+                                payments=simulated_payments, positions=cart)
+            except TaxRule.SaleNotAllowed:
+                # ignore for now, will fail on order creation
+                fees = []
 
-        paypal_order = prov._create_paypal_order(request, None, cart)
+            cart_total = sum([c.price for c in cart]) + sum([f.value for f in fees])
+            total_remaining = cart_total
+            for p in multi_use_cart_payments:
+                if p.get('min_value') and total_remaining < Decimal(p['min_value']):
+                    continue
+
+                to_pay = total_remaining
+                if p.get('max_value') and to_pay > Decimal(p['max_value']):
+                    to_pay = min(to_pay, Decimal(p['max_value']))
+                total_remaining -= to_pay
+
+            cart_total = total_remaining
+
+        paypal_order = prov._create_paypal_order(request, None, cart_total)
         r = JsonResponse(paypal_order.dict() if paypal_order else {})
         r._csp_ignore = True
         return r
@@ -171,6 +188,10 @@ class XHRView(View):
 class PayView(PaypalOrderView, TemplateView):
     template_name = ''
 
+    def dispatch(self, request, *args, **kwargs):
+        self.request.pci_dss_payment_page = True
+        return super().dispatch(request, *args, **kwargs)
+
     def get(self, request, *args, **kwargs):
         if self.payment.state != OrderPayment.PAYMENT_STATE_CREATED:
             return self._redirect_to_order()
@@ -179,7 +200,10 @@ class PayView(PaypalOrderView, TemplateView):
             return r
 
     def post(self, request, *args, **kwargs):
-        self.payment.payment_provider.execute_payment(request, self.payment)
+        try:
+            self.payment.payment_provider.execute_payment(request, self.payment)
+        except PaymentException as e:
+            messages.error(request, str(e))
         return self._redirect_to_order()
 
     def get_context_data(self, **kwargs):
@@ -192,16 +216,16 @@ class PayView(PaypalOrderView, TemplateView):
 
 
 @scopes_disabled()
-@event_permission_required('can_change_event_settings')
+@event_permission_required('event.settings.payment:write')
 def isu_return(request, *args, **kwargs):
     getparams = ['merchantId', 'merchantIdInPayPal', 'permissionsGranted', 'accountStatus', 'consentStatus', 'productIntentID', 'isEmailConfirmed']
     sessionparams = ['payment_paypal_isu_event', 'payment_paypal_isu_tracking_id']
     if not any(k in request.GET for k in getparams) or not any(k in request.session for k in sessionparams):
         messages.error(request, _('An error occurred returning from PayPal: request parameters missing. Please try again.'))
         missing_getparams = set(getparams) - set(request.GET)
-        missing_sessionparams = set(sessionparams) - set(request.session)
+        missing_sessionparams = {p for p in sessionparams if p not in request.session}
         logger.exception('PayPal2 - Missing params in GET {} and/or Session {}'.format(missing_getparams, missing_sessionparams))
-        return redirect(reverse('control:index'))
+        return redirect('control:index')
 
     event = get_object_or_404(Event, pk=request.session['payment_paypal_isu_event'])
 
@@ -211,7 +235,7 @@ def isu_return(request, *args, **kwargs):
     try:
         cache.incr('pretix_paypal_token_hash_cycle')
     except ValueError:
-        cache.set('pretix_paypal_token_hash_cycle', 0)
+        cache.set('pretix_paypal_token_hash_cycle', 1, None)
 
     gs = GlobalSettingsObject()
     prov = Paypal(event)
@@ -240,13 +264,13 @@ def isu_return(request, *args, **kwargs):
             if response.result.tracking_id != request.session['payment_paypal_isu_tracking_id']:
                 messages.error(request, _('An error occurred returning from PayPal: session parameter not matching. Please try again.'))
                 logger.exception('PayPal2 - tracking_id not matching session.payment_paypal_isu_tracking_id')
+            elif request.GET.get("isEmailConfirmed") == "false":  # Yes - literal!
+                messages.error(
+                    request,
+                    _('The email address on your PayPal account has not yet been confirmed. You will need to do '
+                      'this before you can start accepting payments.')
+                )
             else:
-                if request.GET.get("isEmailConfirmed") == "false":  # Yes - literal!
-                    messages.warning(
-                        request,
-                        _('The e-mail address on your PayPal account has not yet been confirmed. You will need to do '
-                          'this before you can start accepting payments.')
-                    )
                 messages.success(
                     request,
                     _('Your PayPal account is now connected to pretix. You can change the settings in detail below.')
@@ -261,7 +285,7 @@ def isu_return(request, *args, **kwargs):
                             if third_party.partner_client_id == prov.client.environment.client_id:
                                 event.settings.payment_paypal_isu_scopes = third_party.scopes
 
-    return redirect(reverse('control:event.settings.payment.provider', kwargs={
+    return redirect_to_url(reverse('control:event.settings.payment.provider', kwargs={
         'organizer': event.organizer.slug,
         'event': event.slug,
         'provider': 'paypal_settings'
@@ -283,7 +307,7 @@ def success(request, *args, **kwargs):
     else:
         payment = None
 
-    if request.session.get('payment_paypal_id', None):
+    if request.session.get('payment_paypal_oid', None):
         if payment:
             prov = Paypal(request.event)
             try:
@@ -296,7 +320,7 @@ def success(request, *args, **kwargs):
                 return resp
     else:
         messages.error(request, _('Invalid response from PayPal received.'))
-        logger.error('Session did not contain payment_paypal_id')
+        logger.error('Session did not contain payment_paypal_oid')
         urlkwargs['step'] = 'payment'
         return redirect(eventreverse(request.event, 'presale:event.checkout', kwargs=urlkwargs))
 
@@ -306,6 +330,11 @@ def success(request, *args, **kwargs):
             'secret': payment.order.secret
         }) + ('?paid=yes' if payment.order.status == Order.STATUS_PAID else ''))
     else:
+        # There can only be one payment method that does not have multi_use_supported, remove all
+        # previous ones.
+        cs = cart_session(request)
+        cs['payments'] = [p for p in cs.get('payments', []) if p.get('multi_use_supported')]
+        add_payment_to_cart(request, PaypalWallet(request.event), None, None, None)
         urlkwargs['step'] = 'confirm'
         return redirect(eventreverse(request.event, 'presale:event.checkout', kwargs=urlkwargs))
 
@@ -319,12 +348,12 @@ def abort(request, *args, **kwargs):
         payment = None
 
     if payment:
-        return redirect(eventreverse(request.event, 'presale:event.order', kwargs={
+        return redirect_to_url(eventreverse(request.event, 'presale:event.order', kwargs={
             'order': payment.order.code,
             'secret': payment.order.secret
         }) + ('?paid=yes' if payment.order.status == Order.STATUS_PAID else ''))
     else:
-        return redirect(eventreverse(request.event, 'presale:event.checkout', kwargs={'step': 'payment'}))
+        return redirect_to_url(eventreverse(request.event, 'presale:event.checkout', kwargs={'step': 'payment'}))
 
 
 @csrf_exempt
@@ -376,7 +405,7 @@ def webhook(request, *args, **kwargs):
     prov.init_api()
 
     try:
-        if rso:
+        if rso and 'id' in rso.payment.info_data:
             payloadid = rso.payment.info_data['id']
         sale = prov.client.execute(pp_orders.OrdersGetRequest(payloadid)).result
     except IOError:
@@ -410,7 +439,10 @@ def webhook(request, *args, **kwargs):
     if not payment:
         return HttpResponse('Payment not found', status=200)
 
-    payment.order.log_action('pretix.plugins.paypal.event', data=event_json)
+    payment.order.log_action('pretix.plugins.paypal.event', data={
+        **event_json,
+        '_order_state': sale.dict(),
+    })
 
     if payment.state == OrderPayment.PAYMENT_STATE_CONFIRMED and sale['status'] in ('PARTIALLY_REFUNDED', 'REFUNDED', 'COMPLETED'):
         if event_json['resource_type'] == 'refund':
@@ -421,26 +453,29 @@ def webhook(request, *args, **kwargs):
                 logger.exception('PayPal error on webhook. Event data: %s' % str(event_json))
                 return HttpResponse('Refund not found', status=500)
 
-            known_refunds = {r.info_data.get('id'): r for r in payment.refunds.all()}
-            if refund['id'] not in known_refunds:
-                payment.create_external_refund(
-                    amount=abs(Decimal(refund['amount']['value'])),
-                    info=json.dumps(refund.dict() if not isinstance(refund, dict) else refund)
-                )
-            elif known_refunds.get(refund['id']).state in (
-                    OrderRefund.REFUND_STATE_CREATED, OrderRefund.REFUND_STATE_TRANSIT) and refund['status'] == 'COMPLETED':
-                known_refunds.get(refund['id']).done()
-
-            if 'seller_payable_breakdown' in refund and 'total_refunded_amount' in refund['seller_payable_breakdown']:
-                known_sum = payment.refunds.filter(
-                    state__in=(OrderRefund.REFUND_STATE_DONE, OrderRefund.REFUND_STATE_TRANSIT,
-                               OrderRefund.REFUND_STATE_CREATED, OrderRefund.REFUND_SOURCE_EXTERNAL)
-                ).aggregate(s=Sum('amount'))['s'] or Decimal('0.00')
-                total_refunded_amount = Decimal(refund['seller_payable_breakdown']['total_refunded_amount']['value'])
-                if known_sum < total_refunded_amount:
+            with transaction.atomic():
+                # Lock payment in case a refund is currently still running
+                payment = OrderPayment.objects.select_for_update(of=OF_SELF).get(pk=payment.pk)
+                known_refunds = {r.info_data.get('id'): r for r in payment.refunds.all()}
+                if refund['id'] not in known_refunds:
                     payment.create_external_refund(
-                        amount=total_refunded_amount - known_sum
+                        amount=abs(Decimal(refund['amount']['value'])),
+                        info=json.dumps(refund.dict() if not isinstance(refund, dict) else refund)
                     )
+                elif known_refunds.get(refund['id']).state in (
+                        OrderRefund.REFUND_STATE_CREATED, OrderRefund.REFUND_STATE_TRANSIT) and refund['status'] == 'COMPLETED':
+                    known_refunds.get(refund['id']).done()
+
+                if 'seller_payable_breakdown' in refund and 'total_refunded_amount' in refund['seller_payable_breakdown']:
+                    known_sum = payment.refunds.filter(
+                        state__in=(OrderRefund.REFUND_STATE_DONE, OrderRefund.REFUND_STATE_TRANSIT,
+                                   OrderRefund.REFUND_STATE_CREATED, OrderRefund.REFUND_SOURCE_EXTERNAL)
+                    ).aggregate(s=Sum('amount'))['s'] or Decimal('0.00')
+                    total_refunded_amount = Decimal(refund['seller_payable_breakdown']['total_refunded_amount']['value'])
+                    if known_sum < total_refunded_amount:
+                        payment.create_external_refund(
+                            amount=total_refunded_amount - known_sum
+                        )
         elif sale['status'] == 'REFUNDED':
             known_sum = payment.refunds.filter(
                 state__in=(OrderRefund.REFUND_STATE_DONE, OrderRefund.REFUND_STATE_TRANSIT,
@@ -452,17 +487,46 @@ def webhook(request, *args, **kwargs):
                     amount=payment.amount - known_sum
                 )
     elif payment.state in (OrderPayment.PAYMENT_STATE_PENDING, OrderPayment.PAYMENT_STATE_CREATED,
-                           OrderPayment.PAYMENT_STATE_CANCELED, OrderPayment.PAYMENT_STATE_FAILED) \
-            and sale['status'] == 'COMPLETED':
-        try:
-            payment.confirm()
-        except Quota.QuotaExceededException:
-            pass
+                           OrderPayment.PAYMENT_STATE_CANCELED, OrderPayment.PAYMENT_STATE_FAILED):
+        if sale['status'] == 'COMPLETED':
+            any_captures = False
+            all_captures_completed = True
+            for purchaseunit in sale['purchase_units']:
+                for capture in purchaseunit['payments']['captures']:
+                    try:
+                        ReferencedPayPalObject.objects.get_or_create(order=payment.order, payment=payment,
+                                                                     reference=capture['id'])
+                    except ReferencedPayPalObject.MultipleObjectsReturned:
+                        pass
+
+                    if capture['status'] not in ('COMPLETED', 'REFUNDED', 'PARTIALLY_REFUNDED'):
+                        all_captures_completed = False
+                    else:
+                        any_captures = True
+            if any_captures and all_captures_completed:
+                try:
+                    payment.info = json.dumps(sale.dict())
+                    payment.save(update_fields=['info'])
+                    payment.confirm()
+                except Quota.QuotaExceededException:
+                    pass
+        elif sale['status'] == 'APPROVED':
+            try:
+                request.session['payment_paypal_oid'] = payment.info_data['id']
+                payment.payment_provider.execute_payment(request, payment)
+            except KeyError:
+                # We might receive the CHECKOUT.ORDER.APPROVED webhook early if the user approves the payment but
+                # the order has not been created yet. In these cases, we will skip the immediate capture until
+                # the Order and OrderPayment has been created, and we can capture the payment in the regular
+                # execute_payment run.
+                logger.info('PayPal2 - Did not capture/execute_payment from Webhook: payment was not yet populated.')
+            except PaymentException as e:
+                logger.exception('PayPal2 - Could not capture/execute_payment from Webhook: {}'.format(str(e)))
 
     return HttpResponse(status=200)
 
 
-@event_permission_required('can_change_event_settings')
+@event_permission_required('event.settings.payment:write')
 @require_POST
 def isu_disconnect(request, **kwargs):
     del request.event.settings.payment_paypal_connect_refresh_token
@@ -472,7 +536,7 @@ def isu_disconnect(request, **kwargs):
     request.event.settings.payment_paypal__enabled = False
     messages.success(request, _('Your PayPal account has been disconnected.'))
 
-    return redirect(reverse('control:event.settings.payment.provider', kwargs={
+    return redirect_to_url(reverse('control:event.settings.payment.provider', kwargs={
         'organizer': request.event.organizer.slug,
         'event': request.event.slug,
         'provider': 'paypal_settings'

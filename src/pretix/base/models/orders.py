@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -35,17 +35,22 @@
 
 import copy
 import hashlib
+import hmac
 import json
 import logging
+import operator
 import string
+import warnings
 from collections import Counter
 from datetime import datetime, time, timedelta
 from decimal import Decimal
-from typing import Any, Dict, List, Union
+from functools import reduce
+from time import sleep
+from typing import Any, Dict, Iterable, List, Union
+from zoneinfo import ZoneInfo
 
 import dateutil
 import pycountry
-import pytz
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
@@ -56,10 +61,11 @@ from django.db.models.functions import Coalesce, Greatest
 from django.db.models.signals import post_delete
 from django.dispatch import receiver
 from django.urls import reverse
-from django.utils.crypto import get_random_string
-from django.utils.encoding import escape_uri_path
+from django.utils.crypto import get_random_string, salted_hmac
+from django.utils.encoding import escape_uri_path, force_str
 from django.utils.formats import date_format
 from django.utils.functional import cached_property
+from django.utils.hashable import make_hashable
 from django.utils.timezone import get_current_timezone, make_aware, now
 from django.utils.translation import gettext_lazy as _, pgettext_lazy
 from django_countries.fields import Country
@@ -75,11 +81,14 @@ from pretix.base.email import get_email_context
 from pretix.base.i18n import language
 from pretix.base.models import Customer, User
 from pretix.base.reldate import RelativeDateWrapper
-from pretix.base.services.locking import LOCK_TIMEOUT, NoLockManager
-from pretix.base.settings import PERSON_NAME_SCHEMES
-from pretix.base.signals import order_gracefully_delete
+from pretix.base.settings import PERSON_NAME_SCHEMES, ROUNDING_MODES
+from pretix.base.signals import allow_ticket_download, order_gracefully_delete
+from pretix.base.timemachine import time_machine_now
 
+from ...helpers import OF_SELF
 from ...helpers.countries import CachedCountries, FastCountryField
+from ...helpers.names import build_name
+from ...testutils.middleware import debugflags_var
 from ._transactions import (
     _fail, _transactions_mark_order_clean, _transactions_mark_order_dirty,
 )
@@ -96,6 +105,34 @@ def generate_secret():
 
 def generate_position_secret():
     raise TypeError("Function no longer exists, use secret generators")
+
+
+class OrderQuerySet(models.QuerySet):
+    def get_with_secret_check(self, code, received_secret, tag, secret_length=64):
+        dummy = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"[:secret_length]
+        try:
+            order = self.get(code=code)
+        except Order.DoesNotExist:
+            # Do a hash comparison as well to harden against timing attacks
+            hmac.compare_digest(
+                salted_hmac(key_salt=b"", value=tag, algorithm="sha256",
+                            secret=dummy).hexdigest()[:secret_length],
+                received_secret[:secret_length]
+            )
+            raise Order.DoesNotExist
+
+        if not hmac.compare_digest(
+            order.tagged_secret(tag, secret_length) if tag else order.secret,
+            received_secret[:secret_length].lower() if tag else received_secret.lower()
+        ) and not (
+                # TODO: remove this clause after a while (compatibility with old secrets currently in flight)
+                tag and hmac.compare_digest(
+                    hashlib.sha1(order.secret.lower().encode()).hexdigest(),
+                    received_secret.lower()
+                )
+        ):
+            raise Order.DoesNotExist
+        return order
 
 
 class Order(LockModel, LoggedModel):
@@ -120,6 +157,9 @@ class Order(LockModel, LoggedModel):
         * ``STATUS_EXPIRED``
         * ``STATUS_CANCELED``
 
+    :param valid_if_pending: Treat this order like a paid order for most purposes (such as check-in), even if it is
+                             still unpaid.
+    :type valid_if_pending: bool
     :param event: The event this order belongs to
     :type event: Event
     :param customer: The customer this order belongs to
@@ -148,8 +188,8 @@ class Order(LockModel, LoggedModel):
     :type require_approval: bool
     :param meta_info: Additional meta information on the order, JSON-encoded.
     :type meta_info: str
-    :param sales_channel: Identifier of the sales channel this order was created through.
-    :type sales_channel: str
+    :param sales_channel: Foreign key to the sales channel this order was created through.
+    :type sales_channel: SalesChannel
     """
 
     STATUS_PENDING = "n"
@@ -175,7 +215,18 @@ class Order(LockModel, LoggedModel):
         verbose_name=_("Status"),
         db_index=True
     )
+    valid_if_pending = models.BooleanField(
+        default=False,
+    )
     testmode = models.BooleanField(default=False)
+    organizer = models.ForeignKey(
+        # Redundant foreign key, but is required for a uniqueness constraint
+        "Organizer",
+        related_name="orders",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+    )
     event = models.ForeignKey(
         Event,
         verbose_name=_("Event"),
@@ -191,7 +242,7 @@ class Order(LockModel, LoggedModel):
     )
     email = models.EmailField(
         null=True, blank=True,
-        verbose_name=_('E-mail')
+        verbose_name=_('Email')
     )
     phone = PhoneNumberField(
         null=True, blank=True,
@@ -202,8 +253,9 @@ class Order(LockModel, LoggedModel):
         verbose_name=_('Locale')
     )
     secret = models.CharField(max_length=32, default=generate_secret)
+    internal_secret = models.CharField(null=True, blank=True, max_length=32, default=generate_secret)
     datetime = models.DateTimeField(
-        verbose_name=_("Date"), db_index=True
+        verbose_name=_("Date"), db_index=False
     )
     cancellation_date = models.DateTimeField(
         null=True, blank=True
@@ -212,7 +264,7 @@ class Order(LockModel, LoggedModel):
         verbose_name=_("Expiration date")
     )
     total = models.DecimalField(
-        decimal_places=2, max_digits=10,
+        decimal_places=2, max_digits=13,
         verbose_name=_("Total amount")
     )
     comment = models.TextField(
@@ -232,6 +284,11 @@ class Order(LockModel, LoggedModel):
                     'special attention. This will not show any details or custom message, so you need to brief your '
                     'check-in staff how to handle these cases.')
     )
+    checkin_text = models.TextField(
+        verbose_name=_('Check-in text'),
+        null=True, blank=True,
+        help_text=_('This text will be shown by the check-in app if a ticket of this order is scanned.')
+    )
     expiry_reminder_sent = models.BooleanField(
         default=False
     )
@@ -243,24 +300,48 @@ class Order(LockModel, LoggedModel):
         verbose_name=_("Meta information"),
         null=True, blank=True
     )
+    api_meta = models.JSONField(
+        verbose_name=_("API meta information"),
+        null=False, blank=True,
+        default=dict
+    )
     last_modified = models.DateTimeField(
-        auto_now=True, db_index=True
+        auto_now=True, db_index=False
     )
     require_approval = models.BooleanField(
         default=False
     )
-    sales_channel = models.CharField(max_length=190, default="web")
+    sales_channel = models.ForeignKey(
+        "SalesChannel",
+        on_delete=models.PROTECT,
+    )
     email_known_to_work = models.BooleanField(
         default=False,
-        verbose_name=_('E-mail address verified')
+        verbose_name=_('Email address verified')
+    )
+    invoice_dirty = models.BooleanField(
+        # Invoice needs to be re-issued when the order is paid again
+        default=False,
+    )
+    tax_rounding_mode = models.CharField(
+        max_length=100,
+        choices=ROUNDING_MODES,
+        default="line",
     )
 
-    objects = ScopedManager(organizer='event__organizer')
+    objects = ScopedManager(OrderQuerySet.as_manager().__class__, organizer='event__organizer')
 
     class Meta:
         verbose_name = _("Order")
         verbose_name_plural = _("Orders")
-        ordering = ("-datetime",)
+        ordering = ("-datetime", "-pk")
+        indexes = [
+            models.Index(fields=["datetime", "id"], name="pretixbase__datetim_66aff0_idx"),
+            models.Index(fields=["last_modified", "id"], name="pretixbase__last_mo_4ebf8b_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=["organizer", "code"], name="order_organizer_code_uniq"),
+        ]
 
     def __str__(self):
         return self.full_code
@@ -268,43 +349,100 @@ class Order(LockModel, LoggedModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if 'require_approval' not in self.get_deferred_fields() and 'status' not in self.get_deferred_fields():
-            self.__initial_status_paid_or_pending = self.status in (Order.STATUS_PENDING, Order.STATUS_PAID) and not self.require_approval
+            self._transaction_key_reset()
 
-    def gracefully_delete(self, user=None, auth=None):
-        from . import GiftCard, GiftCardTransaction, Membership, Voucher
+    def _transaction_key_reset(self):
+        self.__initial_status_paid_or_pending = self.status in (Order.STATUS_PENDING, Order.STATUS_PAID) and not self.require_approval
 
-        if not self.testmode:
-            raise TypeError("Only test mode orders can be deleted.")
-        self.event.log_action(
-            'pretix.event.order.deleted', user=user, auth=auth,
-            data={
-                'code': self.code,
-            }
+    @classmethod
+    def gracefully_delete_bulk(cls, event, orders, user=None, auth=None):
+        # Expects to be called in a transaction
+        from . import (
+            GiftCard, GiftCardTransaction, LogEntry, Membership, Voucher,
         )
 
-        order_gracefully_delete.send(self.event, order=self)
+        if not transaction.get_connection().in_atomic_block:
+            raise Exception('gracefully_delete_bulk should only be called in atomic transaction!')
 
-        if self.status != Order.STATUS_CANCELED:
-            for position in self.positions.all():
-                if position.voucher:
-                    Voucher.objects.filter(pk=position.voucher.pk).update(redeemed=Greatest(0, F('redeemed') - 1))
+        logs_create = []
+        for o in orders:
+            if not o.testmode:
+                raise TypeError("Only test mode orders can be deleted.")
+            order_gracefully_delete.send(event, order=o)
+            logs_create.append(o.log_action(
+                'pretix.event.order.deleted', user=user, auth=auth,
+                data={
+                    'code': o.code,
+                },
+                save=False,
+            ))
+        LogEntry.bulk_create_and_postprocess(logs_create)
 
-        GiftCardTransaction.objects.filter(payment__in=self.payments.all()).update(payment=None)
-        GiftCardTransaction.objects.filter(refund__in=self.refunds.all()).update(refund=None)
-        GiftCardTransaction.objects.filter(order=self).update(order=None)
-        GiftCard.objects.filter(issued_in__in=self.positions.all()).update(issued_in=None)
-        Membership.objects.filter(granted_in__order=self, testmode=True).update(granted_in=None)
-        OrderPosition.all.filter(order=self, addon_to__isnull=False).delete()
-        OrderPosition.all.filter(order=self).delete()
-        OrderFee.all.filter(order=self).delete()
-        Transaction.objects.filter(order=self).delete()
-        self.refunds.all().delete()
-        self.payments.all().delete()
-        self.event.cache.delete('complain_testmode_orders')
-        self.delete()
+        voucher_ids = OrderPosition.objects.filter(
+            order__in=orders,
+            voucher__isnull=False
+        ).exclude(order__status=Order.STATUS_CANCELED).values_list("voucher_id", flat=True)
+        voucher_usages = Counter(voucher_ids)
+        for v_id, usage_count in voucher_usages.items():
+            Voucher.objects.filter(pk=v_id).update(redeemed=Greatest(0, F('redeemed') - usage_count))
+
+        GiftCardTransaction.objects.filter(payment__order__in=orders).update(payment=None)
+        GiftCardTransaction.objects.filter(refund__order__in=orders).update(refund=None)
+        GiftCardTransaction.objects.filter(order__in=orders).update(order=None)
+        GiftCard.objects.filter(issued_in__order__in=orders).update(issued_in=None)
+        Membership.objects.filter(granted_in__order__in=orders, testmode=True).update(granted_in=None)
+        OrderPosition.all.filter(order__in=orders, addon_to__isnull=False).delete()
+        OrderPosition.all.filter(order__in=orders).delete()
+        OrderFee.all.filter(order__in=orders).delete()
+        Transaction.objects.filter(order__in=orders).delete()
+        OrderRefund.objects.filter(order__in=orders).delete()
+        OrderPayment.objects.filter(order__in=orders).delete()
+        if isinstance(orders, models.QuerySet):
+            orders.delete()
+        else:
+            Order.objects.filter(pk__in=[o.pk for o in orders]).delete()
+        event.cache.delete('complain_testmode_orders')
+
+    def gracefully_delete(self, user=None, auth=None):
+        if not self.testmode:
+            raise TypeError("Only test mode orders can be deleted.")
+
+        Order.gracefully_delete_bulk(self.event, Order.objects.filter(pk=self.pk), user, auth)
+
+    def email_confirm_secret(self):
+        return self.tagged_secret("email_confirm", 9)
 
     def email_confirm_hash(self):
-        return hashlib.sha256(settings.SECRET_KEY.encode() + self.secret.encode()).hexdigest()[:9]
+        warnings.warn('Use email_confirm_secret() instead of email_confirm_hash().',
+                      DeprecationWarning)
+        return self.email_confirm_secret()
+
+    def check_email_confirm_secret(self, received_secret):
+        return (
+            hmac.compare_digest(
+                self.tagged_secret("email_confirm", 9),
+                received_secret[:9].lower()
+            ) or any(
+                # TODO: remove this clause after a while (compatibility with old secrets currently in flight)
+                hmac.compare_digest(
+                    hashlib.sha256(sk.encode() + self.secret.encode()).hexdigest()[:9],
+                    received_secret
+                )
+                for sk in [settings.SECRET_KEY, *settings.SECRET_KEY_FALLBACKS]
+            )
+        )
+
+    def get_extended_status_display(self):
+        # Changes in this method should to be replicated in pretixcontrol/orders/fragment_order_status.html
+        # and pretixpresale/event/fragment_order_status.html
+        if self.status == Order.STATUS_PENDING:
+            if self.require_approval:
+                return _("approval pending")
+            elif self.valid_if_pending:
+                return pgettext_lazy("order state", "pending (confirmed)")
+        elif self.status == Order.STATUS_PAID and self.count_positions == 0:
+            return _("canceled (paid fee)")
+        return self.get_status_display()
 
     @property
     def fees(self):
@@ -388,8 +526,8 @@ class Order(LockModel, LoggedModel):
             state__in=(OrderRefund.REFUND_STATE_CREATED, OrderRefund.REFUND_STATE_TRANSIT),
             order=OuterRef('pk')
         )
-        payment_sum_sq = Subquery(payment_sum, output_field=models.DecimalField(decimal_places=2, max_digits=10))
-        refund_sum_sq = Subquery(refund_sum, output_field=models.DecimalField(decimal_places=2, max_digits=10))
+        payment_sum_sq = Subquery(payment_sum, output_field=models.DecimalField(decimal_places=2, max_digits=13))
+        refund_sum_sq = Subquery(refund_sum, output_field=models.DecimalField(decimal_places=2, max_digits=13))
         if sums:
             qs = qs.annotate(
                 payment_sum=payment_sum_sq,
@@ -411,9 +549,9 @@ class Order(LockModel, LoggedModel):
         if results:
             qs = qs.annotate(
                 is_overpaid=Case(
-                    When(~Q(status=Order.STATUS_CANCELED) & Q(pending_sum_t__lt=-1e-8),
+                    When(~Q(status__in=(Order.STATUS_CANCELED, Order.STATUS_EXPIRED)) & Q(pending_sum_t__lt=-1e-8),
                          then=Value(1)),
-                    When(Q(status=Order.STATUS_CANCELED) & Q(pending_sum_rc__lt=-1e-8),
+                    When(Q(status__in=(Order.STATUS_CANCELED, Order.STATUS_EXPIRED)) & Q(pending_sum_rc__lt=-1e-8),
                          then=Value(1)),
                     default=Value(0),
                     output_field=models.IntegerField()
@@ -428,7 +566,7 @@ class Order(LockModel, LoggedModel):
                 is_underpaid=Case(
                     When(Q(status=Order.STATUS_PAID) & Q(pending_sum_t__gt=1e-8),
                          then=Value(1)),
-                    When(Q(status=Order.STATUS_CANCELED) & Q(pending_sum_rc__gt=1e-8),
+                    When(Q(status__in=(Order.STATUS_CANCELED, Order.STATUS_EXPIRED)) & Q(pending_sum_rc__gt=1e-8),
                          then=Value(1)),
                     default=Value(0),
                     output_field=models.IntegerField()
@@ -445,14 +583,24 @@ class Order(LockModel, LoggedModel):
         return '{event}-{code}'.format(event=self.event.slug.upper(), code=self.code)
 
     def save(self, **kwargs):
-        if 'update_fields' in kwargs and 'last_modified' not in kwargs['update_fields']:
-            kwargs['update_fields'] = list(kwargs['update_fields']) + ['last_modified']
+        if 'update_fields' in kwargs:
+            kwargs['update_fields'] = {'last_modified'}.union(kwargs['update_fields'])
         if not self.code:
             self.assign_code()
+            if 'update_fields' in kwargs:
+                kwargs['update_fields'] = {'code'}.union(kwargs['update_fields'])
         if not self.datetime:
             self.datetime = now()
+            if 'update_fields' in kwargs:
+                kwargs['update_fields'] = {'datetime'}.union(kwargs['update_fields'])
         if not self.expires:
             self.set_expires()
+            if 'update_fields' in kwargs:
+                kwargs['update_fields'] = {'expires'}.union(kwargs['update_fields'])
+        if not self.organizer_id:
+            self.organizer_id = self.event.organizer_id
+            if 'update_fields' in kwargs:
+                kwargs['update_fields'] = {'organizer'}.union(kwargs['update_fields'])
 
         is_new = not self.pk
         update_fields = kwargs.get('update_fields', [])
@@ -464,7 +612,7 @@ class Order(LockModel, LoggedModel):
             not kwargs.get('force_save_with_deferred_fields', None) and
             (not update_fields or ('require_approval' not in update_fields and 'status' not in update_fields))
         ):
-            _fail("It is unsafe to call save() on an OrderFee with deferred fields since we can't check if you missed "
+            _fail("It is unsafe to call save() on an Order with deferred fields since we can't check if you missed "
                   "creating a transaction. Call save(force_save_with_deferred_fields=True) if you really want to do "
                   "this.")
 
@@ -480,7 +628,7 @@ class Order(LockModel, LoggedModel):
 
     def set_expires(self, now_dt=None, subevents=None):
         now_dt = now_dt or now()
-        tz = pytz.timezone(self.event.settings.timezone)
+        tz = ZoneInfo(self.event.settings.timezone)
         mode = self.event.settings.get('payment_term_mode')
         if mode == 'days':
             exp_by_date = now_dt.astimezone(tz) + timedelta(days=self.event.settings.get('payment_term_days', as_type=int))
@@ -561,17 +709,30 @@ class Order(LockModel, LoggedModel):
     @cached_property
     def user_cancel_fee(self):
         fee = Decimal('0.00')
-        if self.event.settings.cancel_allow_user_paid_keep_fees:
-            fee += self.fees.filter(
-                fee_type__in=(OrderFee.FEE_TYPE_PAYMENT, OrderFee.FEE_TYPE_SHIPPING, OrderFee.FEE_TYPE_SERVICE,
-                              OrderFee.FEE_TYPE_CANCELLATION)
-            ).aggregate(
-                s=Sum('value')
-            )['s'] or 0
-        if self.event.settings.cancel_allow_user_paid_keep_percentage:
-            fee += self.event.settings.cancel_allow_user_paid_keep_percentage / Decimal('100.0') * (self.total - fee)
-        if self.event.settings.cancel_allow_user_paid_keep:
-            fee += self.event.settings.cancel_allow_user_paid_keep
+        if self.status == Order.STATUS_PAID:
+            if self.event.settings.cancel_allow_user_paid_keep_fees:
+                fee += self.fees.filter(
+                    fee_type__in=(OrderFee.FEE_TYPE_PAYMENT, OrderFee.FEE_TYPE_SHIPPING, OrderFee.FEE_TYPE_SERVICE,
+                                  OrderFee.FEE_TYPE_CANCELLATION)
+                ).aggregate(
+                    s=Sum('value')
+                )['s'] or 0
+            if self.event.settings.cancel_allow_user_paid_keep_percentage:
+                fee += self.event.settings.cancel_allow_user_paid_keep_percentage / Decimal('100.0') * (self.total - fee)
+            if self.event.settings.cancel_allow_user_paid_keep:
+                fee += self.event.settings.cancel_allow_user_paid_keep
+        else:
+            if self.event.settings.cancel_allow_user_unpaid_keep_fees:
+                fee += self.fees.filter(
+                    fee_type__in=(OrderFee.FEE_TYPE_PAYMENT, OrderFee.FEE_TYPE_SHIPPING, OrderFee.FEE_TYPE_SERVICE,
+                                  OrderFee.FEE_TYPE_CANCELLATION)
+                ).aggregate(
+                    s=Sum('value')
+                )['s'] or 0
+            if self.event.settings.cancel_allow_user_unpaid_keep_percentage:
+                fee += self.event.settings.cancel_allow_user_unpaid_keep_percentage / Decimal('100.0') * (self.total - fee)
+            if self.event.settings.cancel_allow_user_unpaid_keep:
+                fee += self.event.settings.cancel_allow_user_unpaid_keep
         return round_decimal(min(fee, self.total), self.event.currency)
 
     @property
@@ -595,16 +756,19 @@ class Order(LockModel, LoggedModel):
         positions = list(
             self.positions.all().annotate(
                 has_variations=Exists(ItemVariation.objects.filter(item_id=OuterRef('item_id'))),
-                has_checkin=Exists(Checkin.objects.filter(position_id=OuterRef('pk')))
+                has_checkin=Exists(Checkin.objects.filter(position_id=OuterRef('pk'), list__consider_tickets_used=True))
             ).select_related('item').prefetch_related('issued_gift_cards')
         )
-        cancelable = all([op.item.allow_cancel and not op.has_checkin for op in positions])
+        if self.event.settings.change_allow_user_if_checked_in:
+            cancelable = all([op.item.allow_cancel for op in positions])
+        else:
+            cancelable = all([op.item.allow_cancel and not op.has_checkin for op in positions])
         if not cancelable or not positions:
             return False
         for op in positions:
             if op.issued_gift_cards.all():
                 return False
-        if self.user_change_deadline and now() > self.user_change_deadline:
+        if self.user_change_deadline and time_machine_now() > self.user_change_deadline:
             return False
 
         return (
@@ -624,10 +788,10 @@ class Order(LockModel, LoggedModel):
             return False
         positions = list(
             self.positions.all().annotate(
-                has_checkin=Exists(Checkin.objects.filter(position_id=OuterRef('pk')))
+                has_checkin=Exists(Checkin.objects.filter(position_id=OuterRef('pk'), list__consider_tickets_used=True))
             ).select_related('item').prefetch_related('issued_gift_cards')
         )
-        cancelable = all([op.item.allow_cancel and not op.has_checkin for op in positions])
+        cancelable = all([op.item.allow_cancel and not op.has_checkin and not op.blocked for op in positions])
         if not cancelable or not positions:
             return False
         for op in positions:
@@ -636,13 +800,15 @@ class Order(LockModel, LoggedModel):
                     return False
             if op.granted_memberships.with_usages().filter(usages__gt=0):
                 return False
-        if self.user_cancel_deadline and now() > self.user_cancel_deadline:
+        if self.user_cancel_deadline and time_machine_now() > self.user_cancel_deadline:
             return False
 
-        if self.status == Order.STATUS_PAID or self.payment_refund_sum > Decimal('0.00'):
+        if self.status == Order.STATUS_PAID:
             if self.total == Decimal('0.00'):
                 return self.event.settings.cancel_allow_user
             return self.event.settings.cancel_allow_user_paid
+        elif self.payment_refund_sum > Decimal('0.00'):
+            return False
         elif self.status == Order.STATUS_PENDING:
             return self.event.settings.cancel_allow_user
         return False
@@ -747,6 +913,19 @@ class Order(LockModel, LoggedModel):
                 iteration = 0
 
     @property
+    def modify_deadline(self):
+        modify_deadline = self.event.settings.get('last_order_modification_date', as_type=RelativeDateWrapper)
+        if self.event.has_subevents and modify_deadline:
+            dates = [
+                modify_deadline.datetime(se)
+                for se in self.event.subevents.filter(id__in=self.positions.values_list('subevent', flat=True))
+            ]
+            return min(dates) if dates else None
+        elif modify_deadline:
+            return modify_deadline.datetime(self.event)
+        return None
+
+    @property
     def can_modify_answers(self) -> bool:
         """
         ``True`` if the user can change the question answers / attendee names that are
@@ -758,22 +937,16 @@ class Order(LockModel, LoggedModel):
         if self.status not in (Order.STATUS_PENDING, Order.STATUS_PAID, Order.STATUS_EXPIRED):
             return False
 
-        modify_deadline = self.event.settings.get('last_order_modification_date', as_type=RelativeDateWrapper)
-        if self.event.has_subevents and modify_deadline:
-            dates = [
-                modify_deadline.datetime(se)
-                for se in self.event.subevents.filter(id__in=self.positions.values_list('subevent', flat=True))
-            ]
-            modify_deadline = min(dates) if dates else None
-        elif modify_deadline:
-            modify_deadline = modify_deadline.datetime(self.event)
+        if self.event.settings.allow_modifications not in ("order", "attendee"):
+            return False
 
-        if modify_deadline is not None and now() > modify_deadline:
+        modify_deadline = self.modify_deadline
+        if modify_deadline is not None and time_machine_now() > modify_deadline:
             return False
 
         positions = list(
             self.positions.all().annotate(
-                has_checkin=Exists(Checkin.objects.filter(position_id=OuterRef('pk')))
+                has_checkin=Exists(Checkin.objects.filter(position_id=OuterRef('pk'), list__consider_tickets_used=True))
             ).select_related('item').prefetch_related('item__questions')
         )
         if not self.event.settings.allow_modifications_after_checkin:
@@ -781,11 +954,11 @@ class Order(LockModel, LoggedModel):
                 if cp.has_checkin:
                     return False
 
-        if self.event.settings.get('invoice_address_asked', as_type=bool):
+        if self.event.settings.get('invoice_address_asked', as_type=bool) or self.event.settings.get('invoice_name_required', as_type=bool):
             return True
         ask_names = self.event.settings.get('attendee_names_asked', as_type=bool)
         for cp in positions:
-            if (cp.item.admission and ask_names) or cp.item.questions.all():
+            if (cp.item.ask_attendee_data and ask_names) or cp.item.questions.all():
                 return True
 
         return False  # nothing there to modify
@@ -793,7 +966,7 @@ class Order(LockModel, LoggedModel):
     @property
     def is_expired_by_time(self):
         return (
-            self.status == Order.STATUS_PENDING and self.expires < now()
+            self.status == Order.STATUS_PENDING and not self.require_approval and self.expires < now()
             and not self.event.settings.get('payment_term_expire_automatically')
         )
 
@@ -820,11 +993,11 @@ class Order(LockModel, LoggedModel):
         return self.event.settings.ticket_download and (
             self.event.settings.ticket_download_date is None
             or self.ticket_download_date is None
-            or now() > self.ticket_download_date
+            or time_machine_now() > self.ticket_download_date
         ) and (
             self.status == Order.STATUS_PAID
             or (
-                (self.event.settings.ticket_download_pending or self.total == Decimal("0.00")) and
+                (self.valid_if_pending or self.event.settings.ticket_download_pending) and
                 self.status == Order.STATUS_PENDING and
                 not self.require_approval
             )
@@ -832,7 +1005,7 @@ class Order(LockModel, LoggedModel):
 
     @property
     def payment_term_last(self):
-        tz = pytz.timezone(self.event.settings.timezone)
+        tz = ZoneInfo(self.event.settings.timezone)
         term_last = self.event.settings.get('payment_term_last', as_type=RelativeDateWrapper)
         if term_last:
             if self.event.has_subevents:
@@ -843,7 +1016,7 @@ class Order(LockModel, LoggedModel):
                 if terms:
                     term_last = min(terms)
                 else:
-                    term_last = None
+                    return None
             else:
                 term_last = term_last.datetime(self.event).date()
             term_last = make_aware(datetime.combine(
@@ -852,7 +1025,34 @@ class Order(LockModel, LoggedModel):
             ), tz)
         return term_last
 
-    def _can_be_paid(self, count_waitinglist=True, ignore_date=False, force=False) -> Union[bool, str]:
+    @property
+    def payment_term_expire_date(self):
+        delay = self.event.settings.get('payment_term_expire_delay_days', as_type=int)
+        if not delay:  # performance saver + backwards compatibility
+            return self.expires
+
+        term_last = self.payment_term_last
+        if term_last and self.expires > term_last:  # backwards compatibility
+            return self.expires
+
+        expires = self.expires.date() + timedelta(days=delay)
+        if self.event.settings.get('payment_term_weekdays'):
+            if expires.weekday() == 5:
+                expires += timedelta(days=2)
+            elif expires.weekday() == 6:
+                expires += timedelta(days=1)
+
+        tz = ZoneInfo(self.event.settings.timezone)
+        expires = make_aware(datetime.combine(
+            expires,
+            time(hour=23, minute=59, second=59)
+        ), tz)
+        if term_last:
+            return min(expires, term_last)
+        else:
+            return expires
+
+    def _can_be_paid(self, count_waitinglist=True, ignore_date=False, force=False, lock=False) -> Union[bool, str]:
         error_messages = {
             'late_lastdate': _("The payment can not be accepted as the last date of payments configured in the "
                                "payment settings is over."),
@@ -865,7 +1065,7 @@ class Order(LockModel, LoggedModel):
                 return error_messages['require_approval']
             term_last = self.payment_term_last
             if term_last and not ignore_date:
-                if now() > term_last:
+                if time_machine_now() > term_last:
                     return error_messages['late_lastdate']
 
         if self.status == self.STATUS_PENDING:
@@ -873,10 +1073,11 @@ class Order(LockModel, LoggedModel):
         if not self.event.settings.get('payment_term_accept_late') and not ignore_date and not force:
             return error_messages['late']
 
-        return self._is_still_available(count_waitinglist=count_waitinglist, force=force)
+        return self._is_still_available(count_waitinglist=count_waitinglist, force=force, lock=lock)
 
-    def _is_still_available(self, now_dt: datetime=None, count_waitinglist=True, force=False,
+    def _is_still_available(self, now_dt: datetime=None, count_waitinglist=True, lock=False, force=False,
                             check_voucher_usage=False, check_memberships=False) -> Union[bool, str]:
+        from pretix.base.services.locking import lock_objects
         from pretix.base.services.memberships import (
             validate_memberships_in_order,
         )
@@ -887,7 +1088,7 @@ class Order(LockModel, LoggedModel):
             'voucher_budget': _('The voucher "{voucher}" no longer has sufficient budget.'),
             'voucher_usages': _('The voucher "{voucher}" has been used in the meantime.'),
         }
-        now_dt = now_dt or now()
+        now_dt = now_dt or time_machine_now()
         positions = list(self.positions.all().select_related('item', 'variation', 'seat', 'voucher'))
         quota_cache = {}
         v_budget = {}
@@ -895,13 +1096,24 @@ class Order(LockModel, LoggedModel):
         try:
             if check_memberships:
                 try:
-                    validate_memberships_in_order(self.customer, positions, self.event, lock=False, testmode=self.testmode)
+                    validate_memberships_in_order(self.customer, positions, self.event, lock=lock, testmode=self.testmode)
                 except ValidationError as e:
                     raise Quota.QuotaExceededException(e.message)
 
+            for cp in positions:
+                cp._cached_quotas = list(cp.quotas) if not force else []
+
+            if lock:
+                lock_objects(
+                    [q for q in reduce(operator.or_, (set(cp._cached_quotas) for cp in positions), set()) if q.size is not None] +
+                    [op.voucher for op in positions if op.voucher and not force] +
+                    [op.seat for op in positions if op.seat],
+                    shared_lock_objects=[self.event]
+                )
+
             for i, op in enumerate(positions):
                 if op.seat:
-                    if not op.seat.is_available(ignore_orderpos=op):
+                    if not op.seat.is_available(ignore_orderpos=op, sales_channel=self.sales_channel.identifier):
                         raise Quota.QuotaExceededException(error_messages['seat_unavailable'].format(seat=op.seat))
                 if force:
                     continue
@@ -923,7 +1135,7 @@ class Order(LockModel, LoggedModel):
                             voucher=op.voucher.code
                         ))
 
-                quotas = list(op.quotas)
+                quotas = op._cached_quotas
                 if len(quotas) == 0:
                     raise Quota.QuotaExceededException(error_messages['unavailable'].format(
                         item=str(op.item) + (' - ' + str(op.variation) if op.variation else '')
@@ -945,13 +1157,16 @@ class Order(LockModel, LoggedModel):
                             ))
         except Quota.QuotaExceededException as e:
             return str(e)
+
+        if 'sleep-after-quota-check' in debugflags_var.get():
+            sleep(2)
         return True
 
     def send_mail(self, subject: Union[str, LazyI18nString], template: Union[str, LazyI18nString],
                   context: Dict[str, Any]=None, log_entry_type: str='pretix.event.order.email.sent',
                   user: User=None, headers: dict=None, sender: str=None, invoices: list=None,
                   auth=None, attach_tickets=False, position: 'OrderPosition'=None, auto_email=True,
-                  attach_ical=False, attach_other_files: list=None):
+                  attach_ical=False, attach_other_files: list=None, attach_cached_files: list=None):
         """
         Sends an email to the user that placed this order. Basically, this method does two things:
 
@@ -973,54 +1188,36 @@ class Order(LockModel, LoggedModel):
                          only be attached for this position and child positions, the link will only point to the
                          position and the attendee email will be used if available.
         """
-        from pretix.base.services.mail import (
-            SendMailException, TolerantDict, mail, render_mail,
-        )
+        from pretix.base.services.mail import mail
 
         if not self.email and not (position and position.attendee_email):
             return
-
-        for k, v in self.event.meta_data.items():
-            context['meta_' + k] = v
 
         with language(self.locale, self.event.settings.region):
             recipient = self.email
             if position and position.attendee_email:
                 recipient = position.attendee_email
 
-            try:
-                email_content = render_mail(template, context)
-                subject = str(subject).format_map(TolerantDict(context))
-                mail(
-                    recipient, subject, template, context,
-                    self.event, self.locale, self, headers=headers, sender=sender,
-                    invoices=invoices, attach_tickets=attach_tickets,
-                    position=position, auto_email=auto_email, attach_ical=attach_ical,
-                    attach_other_files=attach_other_files,
-                )
-            except SendMailException:
-                raise
-            else:
+            outgoing_mail = mail(
+                recipient, subject, template, context,
+                self.event, self.locale, self, headers=headers, sender=sender,
+                invoices=invoices, attach_tickets=attach_tickets,
+                position=position, auto_email=auto_email, attach_ical=attach_ical,
+                attach_other_files=attach_other_files, attach_cached_files=attach_cached_files,
+            )
+            if outgoing_mail:
                 self.log_action(
                     log_entry_type,
                     user=user,
                     auth=auth,
-                    data={
-                        'subject': subject,
-                        'message': email_content,
-                        'position': position.positionid if position else None,
-                        'recipient': recipient,
-                        'invoices': [i.pk for i in invoices] if invoices else [],
-                        'attach_tickets': attach_tickets,
-                        'attach_ical': attach_ical,
-                    }
+                    data=outgoing_mail.log_data(),
                 )
 
     def resend_link(self, user=None, auth=None):
         with language(self.locale, self.event.settings.region):
             email_template = self.event.settings.mail_text_resend_link
             email_context = get_email_context(event=self.event, order=self)
-            email_subject = _('Your order: %(code)s') % {'code': self.code}
+            email_subject = self.event.settings.mail_subject_resend_link
             self.send_mail(
                 email_subject, email_template, email_context,
                 'pretix.event.order.email.resend', user=user, auth=auth,
@@ -1028,11 +1225,18 @@ class Order(LockModel, LoggedModel):
             )
 
     @property
+    def positions_with_tickets_ignoring_plugins(self):
+        return (op for op in self.positions.select_related('item') if op.generate_ticket)
+
+    @property
     def positions_with_tickets(self):
-        for op in self.positions.select_related('item'):
-            if not op.generate_ticket:
-                continue
-            yield op
+        signal_response = allow_ticket_download.send(self.event, order=self)
+        if all([r is True for rr, r in signal_response]):
+            return self.positions_with_tickets_ignoring_plugins
+        elif any([r is False for rr, r in signal_response]):
+            return []
+        else:
+            return set.intersection(set(self.positions_with_tickets_ignoring_plugins), *[set(r) for rr, r in signal_response if isinstance(r, Iterable)])
 
     def create_transactions(self, is_new=False, positions=None, fees=None, dt_now=None, migrated=False,
                             _backfill_before_cancellation=False, save=True):
@@ -1052,17 +1256,20 @@ class Order(LockModel, LoggedModel):
                 if p.canceled and not _backfill_before_cancellation:
                     continue
                 target_transaction_count[Transaction.key(p)] += 1
+                p._transaction_key_reset()
 
             fees = self.fees.all() if fees is None else fees
             for f in fees:
                 if f.canceled and not _backfill_before_cancellation:
                     continue
                 target_transaction_count[Transaction.key(f)] += 1
+                f._transaction_key_reset()
 
         keys = set(target_transaction_count.keys()) | set(current_transaction_count.keys())
         create = []
         for k in keys:
-            positionid, itemid, variationid, subeventid, price, taxrate, taxruleid, taxvalue, feetype, internaltype = k
+            (positionid, itemid, variationid, subeventid, price, price_includes_rounding_correction, taxrate,
+             taxruleid, taxvalue, taxvalue_includes_rounding_correction, feetype, internaltype, taxcode) = k
             d = target_transaction_count[k] - current_transaction_count[k]
             if d:
                 create.append(Transaction(
@@ -1075,17 +1282,25 @@ class Order(LockModel, LoggedModel):
                     variation_id=variationid,
                     subevent_id=subeventid,
                     price=price,
+                    price_includes_rounding_correction=price_includes_rounding_correction,
                     tax_rate=taxrate,
                     tax_rule_id=taxruleid,
                     tax_value=taxvalue,
+                    tax_value_includes_rounding_correction=taxvalue_includes_rounding_correction,
+                    tax_code=taxcode,
                     fee_type=feetype,
                     internal_type=internaltype,
                 ))
         create.sort(key=lambda t: (0 if t.count < 0 else 1, t.positionid or 0))
         if save:
             Transaction.objects.bulk_create(create)
+        self._transaction_key_reset()
         _transactions_mark_order_clean(self.pk)
         return create
+
+    def tagged_secret(self, tag, secret_length=64):
+        return salted_hmac(value=tag, key_salt=b"", algorithm="sha256",
+                           secret=self.internal_secret or self.secret).hexdigest()[:secret_length]
 
 
 def answerfile_name(instance, filename: str) -> str:
@@ -1172,13 +1387,28 @@ class QuestionAnswer(models.Model):
 
     @property
     def is_image(self):
-        return any(self.file.name.lower().endswith(e) for e in ('.jpg', '.png', '.gif', '.tiff', '.bmp', '.jpeg'))
+        return any(self.file.name.lower().endswith(e) for e in settings.FILE_UPLOAD_EXTENSIONS_QUESTION_IMAGE)
 
     @property
     def file_name(self):
         return self.file.name.split('.', 1)[-1]
 
     def __str__(self):
+        return self.to_string(use_cached=True)
+
+    def to_string_i18n(self):
+        return self.to_string(use_cached=False)
+
+    def to_string(self, use_cached=True):
+        """
+        Render this answer as a string.
+
+        :param use_cached: If ``True`` (default), choice and multiple choice questions will show their cached
+                           value, i.e. the value of the selected options at the time of saving and in the language
+                           the answer was saved in. If ``False``, the values will instead be loaded from the
+                           database, yielding current and translated values of the options. However, additional database
+                           queries might be required.
+        """
         if self.question.type == Question.TYPE_BOOLEAN and self.answer == "True":
             return str(_("Yes"))
         elif self.question.type == Question.TYPE_BOOLEAN and self.answer == "False":
@@ -1189,7 +1419,7 @@ class QuestionAnswer(models.Model):
             try:
                 d = dateutil.parser.parse(self.answer)
                 if self.orderposition:
-                    tz = pytz.timezone(self.orderposition.order.event.settings.timezone)
+                    tz = ZoneInfo(self.orderposition.order.event.settings.timezone)
                     d = d.astimezone(tz)
                 return date_format(d, "SHORT_DATETIME_FORMAT")
             except ValueError:
@@ -1213,6 +1443,8 @@ class QuestionAnswer(models.Model):
                 return PhoneNumber.from_string(self.answer).as_international
             except NumberParseException:
                 return self.answer
+        elif self.question.type in (Question.TYPE_CHOICE, Question.TYPE_CHOICE_MULTIPLE) and self.answer and not use_cached:
+            return ", ".join(str(o.answer) for o in self.options.all())
         else:
             return self.answer
 
@@ -1229,7 +1461,22 @@ class QuestionAnswer(models.Model):
         super().delete(**kwargs)
 
 
-class AbstractPosition(models.Model):
+class RoundingCorrectionMixin:
+
+    @property
+    def gross_price_before_rounding(self):
+        return self.price - self.price_includes_rounding_correction
+
+    @property
+    def tax_value_before_rounding(self):
+        return self.tax_value - self.tax_value_includes_rounding_correction
+
+    @property
+    def net_price_before_rounding(self):
+        return self.gross_price_before_rounding - self.tax_value_before_rounding
+
+
+class AbstractPosition(RoundingCorrectionMixin, models.Model):
     """
     A position can either be one line of an order or an item placed in a cart.
 
@@ -1276,8 +1523,11 @@ class AbstractPosition(models.Model):
         on_delete=models.PROTECT
     )
     price = models.DecimalField(
-        decimal_places=2, max_digits=10,
+        decimal_places=2, max_digits=13,
         verbose_name=_("Price")
+    )
+    price_includes_rounding_correction = models.DecimalField(
+        max_digits=13, decimal_places=2, default=Decimal("0.00")
     )
     attendee_name_cached = models.CharField(
         max_length=255,
@@ -1401,31 +1651,35 @@ class AbstractPosition(models.Model):
                 else self.variation.quotas.filter(subevent=self.subevent))
 
     def save(self, *args, **kwargs):
-        update_fields = kwargs.get('update_fields', [])
+        update_fields = kwargs.get('update_fields', set())
         if 'attendee_name_parts' in update_fields:
-            update_fields.append('attendee_name_cached')
-        self.attendee_name_cached = self.attendee_name
+            kwargs['update_fields'] = {'attendee_name_cached'}.union(kwargs['update_fields'])
+
+        name = self.attendee_name
+        if name != self.attendee_name_cached:
+            self.attendee_name_cached = name
+            if 'update_fields' in kwargs:
+                kwargs['update_fields'] = {'attendee_name_cached'}.union(kwargs['update_fields'])
+
         if self.attendee_name_parts is None:
             self.attendee_name_parts = {}
+            if 'update_fields' in kwargs:
+                kwargs['update_fields'] = {'attendee_name_parts'}.union(kwargs['update_fields'])
         super().save(*args, **kwargs)
 
     @property
     def attendee_name(self):
-        if not self.attendee_name_parts:
-            return None
-        if '_legacy' in self.attendee_name_parts:
-            return self.attendee_name_parts['_legacy']
-        if '_scheme' in self.attendee_name_parts:
-            scheme = PERSON_NAME_SCHEMES[self.attendee_name_parts['_scheme']]
-        else:
-            scheme = PERSON_NAME_SCHEMES[self.event.settings.name_scheme]
-        return scheme['concatenation'](self.attendee_name_parts).strip()
+        return build_name(self.attendee_name_parts, fallback_scheme=lambda: self.event.settings.name_scheme)
+
+    @property
+    def attendee_name_all_components(self):
+        return build_name(self.attendee_name_parts, "concatenation_all_components", fallback_scheme=lambda: self.event.settings.name_scheme)
 
     @property
     def state_name(self):
         sd = pycountry.subdivisions.get(code='{}-{}'.format(self.country, self.state))
         if sd:
-            return sd.name
+            return _(sd.name)
         return self.state
 
     @property
@@ -1484,6 +1738,9 @@ class OrderPayment(models.Model):
     :type info: str
     :param fee: The ``OrderFee`` object used to track the fee for this order.
     :type fee: pretix.base.models.OrderFee
+    :param process_initiated: Only for internal use inside pretix.presale to check which payments have started
+                              the execution process.
+    :type process_initiated: bool
     """
     PAYMENT_STATE_CREATED = 'created'
     PAYMENT_STATE_PENDING = 'pending'
@@ -1505,7 +1762,7 @@ class OrderPayment(models.Model):
         max_length=190, choices=PAYMENT_STATES
     )
     amount = models.DecimalField(
-        decimal_places=2, max_digits=10,
+        decimal_places=2, max_digits=13,
         verbose_name=_("Amount")
     )
     order = models.ForeignKey(
@@ -1534,6 +1791,9 @@ class OrderPayment(models.Model):
         null=True, blank=True, related_name='payments', on_delete=models.SET_NULL
     )
     migrated = models.BooleanField(default=False)
+    process_initiated = models.BooleanField(
+        null=True  # null = created before this field was introduced
+    )
 
     objects = ScopedManager(organizer='order__event__organizer')
 
@@ -1563,9 +1823,10 @@ class OrderPayment(models.Model):
         return self.order.event.get_payment_providers(cached=True).get(self.provider)
 
     @transaction.atomic()
-    def _mark_paid_inner(self, force, count_waitinglist, user, auth, ignore_date=False, overpaid=False):
+    def _mark_paid_inner(self, force, count_waitinglist, user, auth, ignore_date=False, overpaid=False, lock=False):
         from pretix.base.signals import order_paid
-        can_be_paid = self.order._can_be_paid(count_waitinglist=count_waitinglist, ignore_date=ignore_date, force=force)
+        can_be_paid = self.order._can_be_paid(count_waitinglist=count_waitinglist, ignore_date=ignore_date, force=force,
+                                              lock=lock)
         if can_be_paid is not True:
             self.order.log_action('pretix.event.order.quotaexceeded', {
                 'message': can_be_paid
@@ -1588,21 +1849,30 @@ class OrderPayment(models.Model):
         if status_change:
             self.order.create_transactions()
 
-    def fail(self, info=None, user=None, auth=None):
+    def fail(self, info=None, user=None, auth=None, log_data=None, send_mail=True):
         """
-        Marks the order as failed and sets info to ``info``, but only if the order is in ``created`` or ``pending``
+        Marks the order as failed and sets info to ``info``, but only if the order is in ``created``, ``pending`` or ``canceled``
         state. This is equivalent to setting ``state`` to ``OrderPayment.PAYMENT_STATE_FAILED`` and logging a failure,
-        but it adds strong database logging since we do not want to report a failure for an order that has just
+        but it adds strong database locking since we do not want to report a failure for an order that has just
         been marked as paid.
+        :param send_mail: Whether an email should be sent to the user about this event (default: ``True``).
         """
         with transaction.atomic():
-            locked_instance = OrderPayment.objects.select_for_update().get(pk=self.pk)
-            if locked_instance.state not in (OrderPayment.PAYMENT_STATE_CREATED, OrderPayment.PAYMENT_STATE_PENDING):
+            locked_instance = OrderPayment.objects.select_for_update(of=OF_SELF).get(pk=self.pk)
+            if locked_instance.state in (
+                OrderPayment.PAYMENT_STATE_CONFIRMED,
+                OrderPayment.PAYMENT_STATE_FAILED,
+                OrderPayment.PAYMENT_STATE_REFUNDED
+            ):
                 # Race condition detected, this payment is already confirmed
                 logger.info('Failed payment {} but ignored due to likely race condition.'.format(
                     self.full_id,
                 ))
-                return
+                return False
+
+            if locked_instance.state == OrderPayment.PAYMENT_STATE_CANCELED:
+                # Never send mails when the payment was already canceled intentionally
+                send_mail = False
 
             if isinstance(info, str):
                 locked_instance.info = info
@@ -1616,10 +1886,27 @@ class OrderPayment(models.Model):
             'local_id': self.local_id,
             'provider': self.provider,
             'info': info,
+            'data': log_data,
         }, user=user, auth=auth)
 
+        if self.order.status in (Order.STATUS_PAID, Order.STATUS_CANCELED, Order.STATUS_EXPIRED):
+            # No reason to send mail, as the payment is no longer really expected
+            send_mail = False
+
+        if send_mail:
+            with language(self.order.locale, self.order.event.settings.region):
+                email_subject = self.order.event.settings.mail_subject_order_payment_failed
+                email_template = self.order.event.settings.mail_text_order_payment_failed
+                email_context = get_email_context(event=self.order.event, order=self.order)
+                self.order.send_mail(
+                    email_subject, email_template, email_context,
+                    'pretix.event.order.email.payment_failed', user=user, auth=auth,
+                )
+
+        return True
+
     def confirm(self, count_waitinglist=True, send_mail=True, force=False, user=None, auth=None, mail_text='',
-                ignore_date=False, lock=True, payment_date=None):
+                ignore_date=False, lock=True, payment_date=None, generate_invoice=True):
         """
         Marks the payment as complete. If possible, this also marks the order as paid if no further
         payment is required
@@ -1640,7 +1927,7 @@ class OrderPayment(models.Model):
         :raises Quota.QuotaExceededException: if the quota is exceeded and ``force`` is ``False``
         """
         with transaction.atomic():
-            locked_instance = OrderPayment.objects.select_for_update().get(pk=self.pk)
+            locked_instance = OrderPayment.objects.select_for_update(of=OF_SELF).get(pk=self.pk)
             if locked_instance.state == self.PAYMENT_STATE_CONFIRMED:
                 # Race condition detected, this payment is already confirmed
                 logger.info('Confirmed payment {} but ignored due to likely race condition.'.format(
@@ -1682,81 +1969,89 @@ class OrderPayment(models.Model):
             ))
             return
 
-        self._mark_order_paid(count_waitinglist, send_mail, force, user, auth, mail_text, ignore_date, lock, payment_sum - refund_sum)
+        with transaction.atomic():
+            self._mark_order_paid(count_waitinglist, send_mail, force, user, auth, mail_text, ignore_date, lock, payment_sum - refund_sum,
+                                  generate_invoice)
 
     def _mark_order_paid(self, count_waitinglist=True, send_mail=True, force=False, user=None, auth=None, mail_text='',
-                         ignore_date=False, lock=True, payment_refund_sum=0):
+                         ignore_date=False, lock=True, payment_refund_sum=0, allow_generate_invoice=True):
         from pretix.base.services.invoices import (
-            generate_invoice, invoice_qualified,
+            generate_cancellation, generate_invoice, invoice_qualified,
+            invoice_transmission_separately, transmit_invoice,
         )
+        from pretix.base.services.locking import LOCK_TRUST_WINDOW
 
-        if (self.order.status == Order.STATUS_PENDING and self.order.expires > now() + timedelta(seconds=LOCK_TIMEOUT * 2)) or not lock:
+        if lock and self.order.status == Order.STATUS_PENDING and self.order.expires > now() + timedelta(seconds=LOCK_TRUST_WINDOW):
             # Performance optimization. In this case, there's really no reason to lock everything and an atomic
             # database transaction is more than enough.
-            lockfn = NoLockManager
-        else:
-            lockfn = self.order.event.lock
+            lock = False
 
-        with lockfn():
-            self._mark_paid_inner(force, count_waitinglist, user, auth, overpaid=payment_refund_sum > self.order.total,
-                                  ignore_date=ignore_date)
+        self._mark_paid_inner(force, count_waitinglist, user, auth, overpaid=payment_refund_sum > self.order.total,
+                              ignore_date=ignore_date, lock=lock)
 
         invoice = None
-        if invoice_qualified(self.order):
+        if invoice_qualified(self.order) and allow_generate_invoice:
             invoices = self.order.invoices.filter(is_cancellation=False).count()
             cancellations = self.order.invoices.filter(is_cancellation=True).count()
             gen_invoice = (
                 (invoices == 0 and self.order.event.settings.get('invoice_generate') in ('True', 'paid')) or
-                0 < invoices <= cancellations
+                0 < invoices <= cancellations or
+                self.order.invoice_dirty
             )
             if gen_invoice:
-                invoice = generate_invoice(
-                    self.order,
-                    trigger_pdf=not send_mail or not self.order.event.settings.invoice_email_attachment
-                )
+                try:
+                    if invoices:
+                        last_i = self.order.invoices.filter(is_cancellation=False).last()
+                        if not last_i.canceled:
+                            generate_cancellation(last_i)
+                    invoice = generate_invoice(
+                        self.order,
+                        trigger_pdf=not send_mail or not self.order.event.settings.invoice_email_attachment
+                    )
+                except Exception as e:
+                    logger.exception("Could not generate invoice.")
+                    self.order.log_action("pretix.event.order.invoice.failed", data={
+                        "exception": str(e)
+                    })
 
-        if send_mail and self.order.sales_channel in self.order.event.settings.mail_sales_channel_placed_paid:
-            self._send_paid_mail(invoice, user, mail_text)
+        transmit_invoice_task = invoice_transmission_separately(invoice)
+        transmit_invoice_mail = not transmit_invoice_task and self.order.event.settings.invoice_email_attachment and self.order.email
+
+        if send_mail and self.order.sales_channel.identifier in self.order.event.settings.mail_sales_channel_placed_paid:
+            self._send_paid_mail(invoice if transmit_invoice_mail else None, user, mail_text)
             if self.order.event.settings.mail_send_order_paid_attendee:
                 for p in self.order.positions.all():
                     if p.addon_to_id is None and p.attendee_email and p.attendee_email != self.order.email:
                         self._send_paid_mail_attendee(p, user)
 
-    def _send_paid_mail_attendee(self, position, user):
-        from pretix.base.services.mail import SendMailException
+        if invoice and not transmit_invoice_mail:
+            transmit_invoice.apply_async(args=(self.order.event_id, invoice.pk, False))
 
+    def _send_paid_mail_attendee(self, position, user):
         with language(self.order.locale, self.order.event.settings.region):
             email_template = self.order.event.settings.mail_text_order_paid_attendee
+            email_subject = self.order.event.settings.mail_subject_order_paid_attendee
             email_context = get_email_context(event=self.order.event, order=self.order, position=position)
-            email_subject = _('Event registration confirmed: %(code)s') % {'code': self.order.code}
-            try:
-                position.send_mail(
-                    email_subject, email_template, email_context,
-                    'pretix.event.order.email.order_paid', user,
-                    invoices=[],
-                    attach_tickets=True,
-                    attach_ical=self.order.event.settings.mail_attach_ical
-                )
-            except SendMailException:
-                logger.exception('Order paid email could not be sent')
+            position.send_mail(
+                email_subject, email_template, email_context,
+                'pretix.event.order.email.order_paid', user,
+                invoices=[],
+                attach_tickets=True,
+                attach_ical=self.order.event.settings.mail_attach_ical
+            )
 
     def _send_paid_mail(self, invoice, user, mail_text):
-        from pretix.base.services.mail import SendMailException
-
         with language(self.order.locale, self.order.event.settings.region):
             email_template = self.order.event.settings.mail_text_order_paid
+            email_subject = self.order.event.settings.mail_subject_order_paid
             email_context = get_email_context(event=self.order.event, order=self.order, payment_info=mail_text)
-            email_subject = _('Payment received for your order: %(code)s') % {'code': self.order.code}
-            try:
-                self.order.send_mail(
-                    email_subject, email_template, email_context,
-                    'pretix.event.order.email.order_paid', user,
-                    invoices=[invoice] if invoice and self.order.event.settings.invoice_email_attachment else [],
-                    attach_tickets=True,
-                    attach_ical=self.order.event.settings.mail_attach_ical
-                )
-            except SendMailException:
-                logger.exception('Order paid email could not be sent')
+            self.order.send_mail(
+                email_subject, email_template, email_context,
+                'pretix.event.order.email.order_paid', user,
+                invoices=[invoice] if invoice else [],
+                attach_tickets=True,
+                attach_ical=self.order.event.settings.mail_attach_ical
+            )
 
     @property
     def refunded_amount(self):
@@ -1781,6 +2076,8 @@ class OrderPayment(models.Model):
     def save(self, *args, **kwargs):
         if not self.local_id:
             self.local_id = (self.order.payments.aggregate(m=Max('local_id'))['m'] or 0) + 1
+            if 'update_fields' in kwargs:
+                kwargs['update_fields'] = {'local_id'}.union(kwargs['update_fields'])
         super().save(*args, **kwargs)
 
     def create_external_refund(self, amount=None, execution_date=None, info='{}'):
@@ -1883,7 +2180,7 @@ class OrderRefund(models.Model):
         max_length=190, choices=REFUND_SOURCES
     )
     amount = models.DecimalField(
-        decimal_places=2, max_digits=10,
+        decimal_places=2, max_digits=13,
         verbose_name=_("Amount")
     )
     order = models.ForeignKey(
@@ -1979,6 +2276,14 @@ class OrderRefund(models.Model):
     def save(self, *args, **kwargs):
         if not self.local_id:
             self.local_id = (self.order.refunds.aggregate(m=Max('local_id'))['m'] or 0) + 1
+            if 'update_fields' in kwargs:
+                kwargs['update_fields'] = {'local_id'}.union(kwargs['update_fields'])
+
+        if self.state == OrderRefund.REFUND_STATE_DONE and not self.execution_date:
+            self.execution_date = now()
+            if 'update_fields' in kwargs:
+                kwargs['update_fields'] = {'execution_date'}.union(kwargs['update_fields'])
+
         super().save(*args, **kwargs)
 
 
@@ -1987,7 +2292,7 @@ class ActivePositionManager(ScopedManager(organizer='order__event__organizer')._
         return super().get_queryset().filter(canceled=False)
 
 
-class OrderFee(models.Model):
+class OrderFee(RoundingCorrectionMixin, models.Model):
     """
     An OrderFee object represents a fee that is added to the order total independently of
     the actual positions. This might for example be a payment or a shipping fee.
@@ -2019,21 +2324,26 @@ class OrderFee(models.Model):
     FEE_TYPE_SERVICE = "service"
     FEE_TYPE_CANCELLATION = "cancellation"
     FEE_TYPE_INSURANCE = "insurance"
+    FEE_TYPE_LATE = "late"
     FEE_TYPE_OTHER = "other"
     FEE_TYPE_GIFTCARD = "giftcard"
     FEE_TYPES = (
+        (FEE_TYPE_SERVICE, _("Service fee")),
         (FEE_TYPE_PAYMENT, _("Payment fee")),
         (FEE_TYPE_SHIPPING, _("Shipping fee")),
-        (FEE_TYPE_SERVICE, _("Service fee")),
         (FEE_TYPE_CANCELLATION, _("Cancellation fee")),
         (FEE_TYPE_INSURANCE, _("Insurance fee")),
+        (FEE_TYPE_LATE, _("Late fee")),
         (FEE_TYPE_OTHER, _("Other fees")),
         (FEE_TYPE_GIFTCARD, _("Gift card")),
     )
 
     value = models.DecimalField(
-        decimal_places=2, max_digits=10,
+        decimal_places=2, max_digits=13,
         verbose_name=_("Value")
+    )
+    value_includes_rounding_correction = models.DecimalField(
+        max_digits=13, decimal_places=2, default=Decimal("0.00")
     )
     order = models.ForeignKey(
         Order,
@@ -2055,9 +2365,16 @@ class OrderFee(models.Model):
         on_delete=models.PROTECT,
         null=True, blank=True
     )
+    tax_code = models.CharField(
+        max_length=190,
+        null=True, blank=True,
+    )
     tax_value = models.DecimalField(
-        max_digits=10, decimal_places=2,
+        max_digits=13, decimal_places=2,
         verbose_name=_('Tax value')
+    )
+    tax_value_includes_rounding_correction = models.DecimalField(
+        max_digits=13, decimal_places=2, default=Decimal("0.00")
     )
     canceled = models.BooleanField(default=False)
 
@@ -2071,8 +2388,30 @@ class OrderFee(models.Model):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if not self.get_deferred_fields():
-            self.__initial_transaction_key = Transaction.key(self)
-            self.__initial_canceled = self.canceled
+            self._transaction_key_reset()
+
+    def refresh_from_db(self, using=None, fields=None):
+        """
+        Reload field values from the database. Similar to django's implementation
+        with adjustment for our method that forces us to create ``Transaction`` instances.
+        """
+        if not self.get_deferred_fields():
+            self._transaction_key_reset()
+        return super().refresh_from_db(using, fields)
+
+    def get_tax_code_display(self):
+        from pretix.base.models.tax import get_tax_code_labels
+
+        if self.tax_code:
+            choices_dict = get_tax_code_labels()
+            return force_str(
+                choices_dict.get(make_hashable(self.tax_code), self.tax_code), strings_only=True
+            )
+        return ""
+
+    def _transaction_key_reset(self):
+        self.__initial_transaction_key = Transaction.key(self)
+        self.__initial_canceled = self.canceled
 
     def __str__(self):
         if self.description:
@@ -2085,24 +2424,32 @@ class OrderFee(models.Model):
             self.fee_type, self.value
         )
 
-    def _calculate_tax(self, tax_rule=None):
+    def _calculate_tax(self, tax_rule=None, invoice_address=None, event=None):
         if tax_rule:
             self.tax_rule = tax_rule
 
-        try:
-            ia = self.order.invoice_address
-        except InvoiceAddress.DoesNotExist:
+        if invoice_address:
+            ia = invoice_address
+        elif hasattr(self, "order"):
+            try:
+                ia = self.order.invoice_address
+            except InvoiceAddress.DoesNotExist:
+                ia = None
+        else:
             ia = None
 
-        if not self.tax_rule and self.fee_type == "payment" and self.order.event.settings.tax_rate_default:
-            self.tax_rule = self.order.event.settings.tax_rate_default
+        event = event or self.order.event
+        if not self.tax_rule and self.fee_type == "payment" and event.settings.tax_rule_payment == "default":
+            self.tax_rule = event.cached_default_tax_rule
 
         if self.tax_rule:
             tax = self.tax_rule.tax(self.value, base_price_is='gross', invoice_address=ia, force_fixed_gross_price=True)
             self.tax_rate = tax.rate
+            self.tax_code = tax.code
             self.tax_value = tax.tax
         else:
             self.tax_value = Decimal('0.00')
+            self.tax_code = None
             self.tax_rate = Decimal('0.00')
 
     def save(self, *args, **kwargs):
@@ -2111,6 +2458,7 @@ class OrderFee(models.Model):
 
         if self.tax_rate is None:
             self._calculate_tax()
+
         self.order.touch()
 
         if not self.get_deferred_fields():
@@ -2126,6 +2474,24 @@ class OrderFee(models.Model):
     def delete(self, **kwargs):
         self.order.touch()
         super().delete(**kwargs)
+
+    # For historical reasons, OrderFee has "value", but OrderPosition has "price". These properties
+    # help using them the same way.
+    @property
+    def price(self):
+        return self.value
+
+    @price.setter
+    def price(self, value):
+        self.value = value
+
+    @property
+    def price_includes_rounding_correction(self):
+        return self.value_includes_rounding_correction
+
+    @price_includes_rounding_correction.setter
+    def price_includes_rounding_correction(self, value):
+        self.value_includes_rounding_correction = value
 
 
 class OrderPosition(AbstractPosition):
@@ -2153,17 +2519,42 @@ class OrderPosition(AbstractPosition):
     :type canceled: bool
     :param pseudonymization_id: The QR code content for lead scanning
     :type pseudonymization_id: str
+    :param blocked: A list of reasons why this order position is blocked. Blocked positions can't be used for check-in and
+                    other purposes. Each entry should be a short string that can be translated into a human-readable
+                    description by a plugin. If the position is not blocked, the value must be ``None``, not an empty
+                    list.
+    :type blocked: list
+    :param ignore_from_quota_while_blocked: Ignore this order position from quota, as long as ``blocked`` is set. Only
+                                            to be used carefully by specific plugins.
+    :type ignore_from_quota_while_blocked: boolean
+    :param valid_from: The ticket will not be considered valid before this date. If the value is ``None``, no check on
+                       ticket level is made.
+    :type valid_from: datetime
+    :param valid_until: The ticket will not be considered valid after this date. If the value is ``None``, no check on
+                       ticket level is made.
+    :type valid_until: datetime
     """
     positionid = models.PositiveIntegerField(default=1)
+
+    organizer = models.ForeignKey(
+        # Redundant foreign key, but is required for a uniqueness constraint
+        "Organizer",
+        related_name="order_positions",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+    )
     order = models.ForeignKey(
         Order,
         verbose_name=_("Order"),
         related_name='all_positions',
         on_delete=models.PROTECT
     )
+
     voucher_budget_use = models.DecimalField(
-        max_digits=10, decimal_places=2, null=True, blank=True,
+        max_digits=13, decimal_places=2, null=True, blank=True,
     )
+
     tax_rate = models.DecimalField(
         max_digits=7, decimal_places=2,
         verbose_name=_('Tax rate')
@@ -2173,10 +2564,18 @@ class OrderPosition(AbstractPosition):
         on_delete=models.PROTECT,
         null=True, blank=True
     )
+    tax_code = models.CharField(
+        max_length=190,
+        null=True, blank=True,
+    )
     tax_value = models.DecimalField(
-        max_digits=10, decimal_places=2,
+        max_digits=13, decimal_places=2,
         verbose_name=_('Tax value')
     )
+    tax_value_includes_rounding_correction = models.DecimalField(
+        max_digits=13, decimal_places=2, default=Decimal("0.00"),
+    )
+
     secret = models.CharField(max_length=255, null=False, blank=False, db_index=True)
     web_secret = models.CharField(max_length=32, default=generate_secret, db_index=True)
     pseudonymization_id = models.CharField(
@@ -2184,7 +2583,21 @@ class OrderPosition(AbstractPosition):
         unique=True,
         db_index=True
     )
+
     canceled = models.BooleanField(default=False)
+
+    blocked = models.JSONField(null=True, blank=True)
+    ignore_from_quota_while_blocked = models.BooleanField(default=False)
+    valid_from = models.DateTimeField(
+        verbose_name=_("Valid from"),
+        null=True,
+        blank=True,
+    )
+    valid_until = models.DateTimeField(
+        verbose_name=_("Valid until"),
+        null=True,
+        blank=True,
+    )
 
     all = ScopedManager(organizer='order__event__organizer')
     objects = ActivePositionManager()
@@ -2192,17 +2605,59 @@ class OrderPosition(AbstractPosition):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if not self.get_deferred_fields():
-            self.__initial_transaction_key = Transaction.key(self)
-            self.__initial_canceled = self.canceled
+            self._transaction_key_reset()
+
+    def refresh_from_db(self, using=None, fields=None):
+        """
+        Reload field values from the database. Similar to django's implementation
+        with adjustment for our method that forces us to create ``Transaction`` instances.
+        """
+        if not self.get_deferred_fields():
+            self._transaction_key_reset()
+        return super().refresh_from_db(using, fields)
+
+    def _transaction_key_reset(self):
+        self.__initial_transaction_key = Transaction.key(self)
+        self.__initial_canceled = self.canceled
 
     class Meta:
         verbose_name = _("Order position")
         verbose_name_plural = _("Order positions")
         ordering = ("positionid", "id")
+        constraints = [
+            models.UniqueConstraint("organizer", "secret", name="orderposition_organizer_secret_uniq")
+        ]
+
+    def get_tax_code_display(self):
+        from pretix.base.models.tax import get_tax_code_labels
+
+        if self.tax_code:
+            choices_dict = get_tax_code_labels()
+            return force_str(
+                choices_dict.get(make_hashable(self.tax_code), self.tax_code), strings_only=True
+            )
+        return ""
 
     @cached_property
     def sort_key(self):
-        return self.addon_to.positionid if self.addon_to else self.positionid, self.addon_to_id or 0
+        return self.addon_to.positionid if self.addon_to else self.positionid, self.addon_to_id or 0, self.positionid
+
+    @cached_property
+    def require_checkin_attention(self):
+        if self.order.checkin_attention or self.item.checkin_attention or (self.variation_id and self.variation.checkin_attention):
+            return True
+        return False
+
+    @cached_property
+    def checkin_texts(self):
+        texts = []
+        if self.order.checkin_text:
+            texts.append(self.order.checkin_text)
+        if self.variation_id and self.variation.checkin_text:
+            texts.append(self.variation.checkin_text)
+        if self.item.checkin_text:
+            texts.append(self.item.checkin_text)
+        return texts
 
     @property
     def checkins(self):
@@ -2216,10 +2671,66 @@ class OrderPosition(AbstractPosition):
     def generate_ticket(self):
         if self.item.generate_tickets is not None:
             return self.item.generate_tickets
+        if self.blocked:
+            return False
         return (
             (self.order.event.settings.ticket_download_addons or not self.addon_to_id) and
             (self.event.settings.ticket_download_nonadm or self.item.admission)
         )
+
+    @property
+    def blocked_reasons(self):
+        from ..signals import orderposition_blocked_display
+
+        if not self.blocked:
+            return []
+
+        reasons = {}
+        for b in self.blocked:
+            for recv, response in orderposition_blocked_display.send(self.event, orderposition=self, block_name=b):
+                if response:
+                    reasons[b] = response
+                    break
+            else:
+                reasons[b] = b
+        return reasons
+
+    @property
+    def can_modify_answers(self) -> bool:
+        """
+        ``True`` if the user can change the question answers / attendee names that are
+        related to the position. This checks order status and modification deadlines. It also
+        returns ``False`` if there are no questions that can be answered.
+        """
+        from .checkin import Checkin
+
+        if self.order.status not in (Order.STATUS_PENDING, Order.STATUS_PAID, Order.STATUS_EXPIRED):
+            return False
+
+        if self.event.settings.allow_modifications != "attendee":
+            return False
+
+        modify_deadline = self.order.modify_deadline
+        if modify_deadline is not None and now() > modify_deadline:
+            return False
+
+        positions = list(
+            self.order.positions.all().annotate(
+                has_checkin=Exists(Checkin.objects.filter(position_id=OuterRef('pk'), list__consider_tickets_used=True))
+            ).select_related('item').prefetch_related('item__questions')
+        )
+        if not self.event.settings.allow_modifications_after_checkin:
+            for cp in positions:
+                if cp.has_checkin:
+                    return False
+
+        ask_names = self.event.settings.get('attendee_names_asked', as_type=bool)
+        for cp in positions:
+            if cp.pk == self.pk or cp.addon_to_id == self.pk:
+                if (cp.item.ask_attendee_data and ask_names) or cp.item.questions.all():
+                    return True
+
+        return False  # nothing there to modify
 
     @classmethod
     def transform_cart_positions(cls, cp: List, order) -> list:
@@ -2228,16 +2739,41 @@ class OrderPosition(AbstractPosition):
         ops = []
         cp_mapping = {}
         # The sorting key ensures that all addons come directly after the position they refer to
-        for i, cartpos in enumerate(sorted(cp, key=lambda c: (c.addon_to_id or c.pk, c.addon_to_id or 0))):
+        for i, cartpos in enumerate(sorted(cp, key=lambda c: c.sort_key)):
             op = OrderPosition(order=order)
             for f in AbstractPosition._meta.fields:
                 if f.name == 'addon_to':
-                    setattr(op, f.name, cp_mapping.get(cartpos.addon_to_id))
+                    if cartpos.addon_to_id:
+                        setattr(op, f.name, cp_mapping[cartpos.addon_to_id])
                 else:
                     setattr(op, f.name, getattr(cartpos, f.name))
-            op._calculate_tax()
+
+            op.tax_value = cartpos.tax_value
+            op.tax_value_includes_rounding_correction = cartpos.tax_value_includes_rounding_correction
+            op.tax_rate = cartpos.tax_rate
+            op.tax_code = cartpos.tax_code
+            op.tax_rule = cartpos.item.tax_rule
+            # todo: is removing this safe? op._calculate_tax()
+
             if cartpos.voucher:
                 op.voucher_budget_use = cartpos.listed_price - cartpos.price_after_voucher
+
+            if cartpos.item.validity_mode:
+                valid_from, valid_until = cartpos.item.compute_validity(
+                    requested_start=(
+                        max(cartpos.requested_valid_from, time_machine_now())
+                        if cartpos.requested_valid_from and cartpos.item.validity_dynamic_start_choice
+                        else time_machine_now()
+                    ),
+                    enforce_start_limit=True,
+                    override_tz=order.event.timezone,
+                )
+                op.valid_from = valid_from
+                op.valid_until = valid_until
+
+            if op.is_bundled and not op.addon_to_id:
+                raise ValueError("Bundled cart position without parent does not make sense.")
+
             op.positionid = i + 1
             op.save()
             ops.append(op)
@@ -2272,20 +2808,22 @@ class OrderPosition(AbstractPosition):
             self.item.id, self.variation.id if self.variation else 0, self.order_id
         )
 
-    def _calculate_tax(self, tax_rule=None):
+    def _calculate_tax(self, tax_rule=None, invoice_address=None):
         self.tax_rule = tax_rule or self.item.tax_rule
         try:
-            ia = self.order.invoice_address
+            ia = invoice_address or self.order.invoice_address
         except InvoiceAddress.DoesNotExist:
             ia = None
         if self.tax_rule:
             tax = self.tax_rule.tax(self.price, invoice_address=ia, base_price_is='gross', force_fixed_gross_price=True)
             self.tax_rate = tax.rate
+            self.tax_code = tax.code
             self.tax_value = tax.tax
             if tax.gross != self.price:
                 raise ValueError('Invalid tax calculation')
         else:
             self.tax_value = Decimal('0.00')
+            self.tax_code = None
             self.tax_rate = Decimal('0.00')
 
     def save(self, *args, **kwargs):
@@ -2302,15 +2840,30 @@ class OrderPosition(AbstractPosition):
                 assign_ticket_secret(
                     event=self.order.event, position=self, force_invalidate=True, save=False
                 )
+                if 'update_fields' in kwargs:
+                    kwargs['update_fields'] = {'secret'}.union(kwargs['update_fields'])
+
+        if not self.organizer_id:
+            self.organizer_id = self.order.event.organizer_id
+            if 'update_fields' in kwargs:
+                kwargs['update_fields'] = {'organizer'}.union(kwargs['update_fields'])
+        if not self.blocked and self.blocked is not None:
+            self.blocked = None
+            if 'update_fields' in kwargs:
+                kwargs['update_fields'] = {'blocked'}.union(kwargs['update_fields'])
+        elif self.blocked and (not isinstance(self.blocked, list) or any(not isinstance(b, str) for b in self.blocked)):
+            raise TypeError("blocked needs to be a list of strings")
 
         if not self.pseudonymization_id:
             self.assign_pseudonymization_id()
+            if 'update_fields' in kwargs:
+                kwargs['update_fields'] = {'pseudonymization_id'}.union(kwargs['update_fields'])
 
         if not self.get_deferred_fields():
             if Transaction.key(self) != self.__initial_transaction_key or self.canceled != self.__initial_canceled or not self.pk:
                 _transactions_mark_order_dirty(self.order_id, using=kwargs.get('using', None))
         elif not kwargs.get('force_save_with_deferred_fields', None):
-            _fail("It is unsafe to call save() on an OrderFee with deferred fields since we can't check if you missed "
+            _fail("It is unsafe to call save() on an OrderPosition with deferred fields since we can't check if you missed "
                   "creating a transaction. Call save(force_save_with_deferred_fields=True) if you really want to do "
                   "this.")
 
@@ -2356,45 +2909,28 @@ class OrderPosition(AbstractPosition):
         :param attach_tickets: Attach tickets of this order, if they are existing and ready to download
         :param attach_ical: Attach relevant ICS files
         """
-        from pretix.base.services.mail import (
-            SendMailException, TolerantDict, mail, render_mail,
-        )
+        from pretix.base.services.mail import mail
 
         if not self.attendee_email:
             return
 
-        for k, v in self.event.meta_data.items():
-            context['meta_' + k] = v
-
         with language(self.order.locale, self.order.event.settings.region):
             recipient = self.attendee_email
-            try:
-                email_content = render_mail(template, context)
-                subject = str(subject).format_map(TolerantDict(context))
-                mail(
-                    recipient, subject, template, context,
-                    self.event, self.order.locale, order=self.order, headers=headers, sender=sender,
-                    position=self,
-                    invoices=invoices,
-                    attach_tickets=attach_tickets,
-                    attach_ical=attach_ical,
-                    attach_other_files=attach_other_files,
-                )
-            except SendMailException:
-                raise
-            else:
+            outgoing_mail = mail(
+                recipient, subject, template, context,
+                self.event, self.order.locale, order=self.order, headers=headers, sender=sender,
+                position=self,
+                invoices=invoices,
+                attach_tickets=attach_tickets,
+                attach_ical=attach_ical,
+                attach_other_files=attach_other_files,
+            )
+            if outgoing_mail:
                 self.order.log_action(
                     log_entry_type,
                     user=user,
                     auth=auth,
-                    data={
-                        'subject': subject,
-                        'message': email_content,
-                        'recipient': recipient,
-                        'invoices': [i.pk for i in invoices] if invoices else [],
-                        'attach_tickets': attach_tickets,
-                        'attach_ical': attach_ical,
-                    }
+                    data=outgoing_mail.log_data(),
                 )
 
     def resend_link(self, user=None, auth=None):
@@ -2402,12 +2938,41 @@ class OrderPosition(AbstractPosition):
         with language(self.order.locale, self.order.event.settings.region):
             email_template = self.event.settings.mail_text_resend_link
             email_context = get_email_context(event=self.order.event, order=self.order, position=self)
-            email_subject = _('Your event registration: %(code)s') % {'code': self.order.code}
+            email_subject = self.event.settings.mail_subject_resend_link_attendee
             self.send_mail(
                 email_subject, email_template, email_context,
                 'pretix.event.order.email.resend', user=user, auth=auth,
                 attach_tickets=True
             )
+
+    @property
+    @scopes_disabled()
+    def attendee_change_allowed(self) -> bool:
+        """
+        Returns whether or not this order can be changed by the attendee.
+        """
+        from .items import ItemAddOn
+
+        if not self.event.settings.change_allow_attendee or not self.order.user_change_allowed:
+            return False
+
+        positions = list(
+            self.order.positions.filter(Q(pk=self.pk) | Q(addon_to_id=self.pk)).annotate(
+                has_variations=Exists(ItemVariation.objects.filter(item_id=OuterRef('item_id'))),
+            ).select_related('item').prefetch_related('issued_gift_cards')
+        )
+        return (
+            (self.order.event.settings.change_allow_user_variation and any([op.has_variations for op in positions])) or
+            (self.order.event.settings.change_allow_user_addons and ItemAddOn.objects.filter(base_item_id__in=[op.item_id for op in positions]).exists())
+        )
+
+    @property
+    def code(self):
+        """
+        A ticket code which is unique among all events of a single organizer,
+        built by the order code and the position number.
+        """
+        return '{order_code}-{position}'.format(order_code=self.order.code, position=self.positionid)
 
 
 class Transaction(models.Model):
@@ -2476,7 +3041,6 @@ class Transaction(models.Model):
     )
     datetime = models.DateTimeField(
         verbose_name=_("Date"),
-        db_index=True,
     )
     migrated = models.BooleanField(
         default=False
@@ -2504,8 +3068,11 @@ class Transaction(models.Model):
         verbose_name=pgettext_lazy("subevent", "Date"),
     )
     price = models.DecimalField(
-        decimal_places=2, max_digits=10,
+        decimal_places=2, max_digits=13,
         verbose_name=_("Price")
+    )
+    price_includes_rounding_correction = models.DecimalField(
+        max_digits=13, decimal_places=2, default=Decimal("0.00")
     )
     tax_rate = models.DecimalField(
         max_digits=7, decimal_places=2,
@@ -2516,9 +3083,16 @@ class Transaction(models.Model):
         on_delete=models.PROTECT,
         null=True, blank=True
     )
+    tax_code = models.CharField(
+        max_length=190,
+        null=True, blank=True,
+    )
     tax_value = models.DecimalField(
-        max_digits=10, decimal_places=2,
+        max_digits=13, decimal_places=2,
         verbose_name=_('Tax value')
+    )
+    tax_value_includes_rounding_correction = models.DecimalField(
+        max_digits=13, decimal_places=2, default=Decimal("0.00")
     )
     fee_type = models.CharField(
         max_length=100, choices=OrderFee.FEE_TYPES, null=True, blank=True
@@ -2527,23 +3101,41 @@ class Transaction(models.Model):
 
     class Meta:
         ordering = 'datetime', 'pk'
+        indexes = [
+            models.Index(fields=['datetime', 'id'], name="pretixbase__datetim_b20405_idx")
+        ]
 
     def save(self, *args, **kwargs):
         if not self.fee_type and not self.item:
             raise ValidationError('Should set either item or fee type')
         return super().save(*args, **kwargs)
 
+    def get_tax_code_display(self):
+        from pretix.base.models.tax import get_tax_code_labels
+
+        if self.tax_code:
+            choices_dict = get_tax_code_labels()
+            return force_str(
+                choices_dict.get(make_hashable(self.tax_code), self.tax_code), strings_only=True
+            )
+        return ""
+
     @staticmethod
     def key(obj):
         if isinstance(obj, Transaction):
-            return (obj.positionid, obj.item_id, obj.variation_id, obj.subevent_id, obj.price, obj.tax_rate,
-                    obj.tax_rule_id, obj.tax_value, obj.fee_type, obj.internal_type)
+            return (obj.positionid, obj.item_id, obj.variation_id, obj.subevent_id, obj.price,
+                    obj.price_includes_rounding_correction, obj.tax_rate, obj.tax_rule_id,
+                    obj.tax_value, obj.tax_value_includes_rounding_correction, obj.fee_type,
+                    obj.internal_type, obj.tax_code)
         elif isinstance(obj, OrderPosition):
-            return (obj.positionid, obj.item_id, obj.variation_id, obj.subevent_id, obj.price, obj.tax_rate,
-                    obj.tax_rule_id, obj.tax_value, None, None)
+            return (obj.positionid, obj.item_id, obj.variation_id, obj.subevent_id, obj.price,
+                    obj.price_includes_rounding_correction, obj.tax_rate, obj.tax_rule_id,
+                    obj.tax_value, obj.tax_value_includes_rounding_correction, None,
+                    None, obj.tax_code)
         elif isinstance(obj, OrderFee):
-            return (None, None, None, None, obj.value, obj.tax_rate,
-                    obj.tax_rule_id, obj.tax_value, obj.fee_type, obj.internal_type)
+            return (None, None, None, None, obj.value, obj.value_includes_rounding_correction,
+                    obj.tax_rate, obj.tax_rule_id, obj.tax_value, obj.tax_value_includes_rounding_correction,
+                    obj.fee_type, obj.internal_type, obj.tax_code)
         raise ValueError('invalid state')  # noqa
 
     @property
@@ -2553,6 +3145,14 @@ class Transaction(models.Model):
     @property
     def full_tax_value(self):
         return self.tax_value * self.count
+
+    @property
+    def full_price_includes_rounding_correction(self):
+        return self.price_includes_rounding_correction * self.count
+
+    @property
+    def full_tax_value_includes_rounding_correction(self):
+        return self.tax_value_includes_rounding_correction * self.count
 
 
 class CartPosition(AbstractPosition):
@@ -2586,25 +3186,38 @@ class CartPosition(AbstractPosition):
         verbose_name=_("Expiration date"),
         db_index=True
     )
-
+    max_extend = models.DateTimeField(
+        verbose_name=_("Limit for extending expiration date"),
+        null=True
+    )
     tax_rate = models.DecimalField(
         max_digits=7, decimal_places=2, default=Decimal('0.00'),
         verbose_name=_('Tax rate')
     )
+    tax_code = models.CharField(
+        max_length=190,
+        null=True, blank=True,
+    )
+    tax_value_includes_rounding_correction = models.DecimalField(
+        max_digits=13, decimal_places=2, default=Decimal("0.00")
+    )
     listed_price = models.DecimalField(
-        decimal_places=2, max_digits=10, null=True,
+        decimal_places=2, max_digits=13, null=True,
     )
     price_after_voucher = models.DecimalField(
-        decimal_places=2, max_digits=10, null=True,
+        decimal_places=2, max_digits=13, null=True,
     )
     custom_price_input = models.DecimalField(
-        decimal_places=2, max_digits=10, null=True,
+        decimal_places=2, max_digits=13, null=True,
     )
     custom_price_input_is_net = models.BooleanField(
         default=False,
     )
     line_price_gross = models.DecimalField(
-        decimal_places=2, max_digits=10, null=True,
+        decimal_places=2, max_digits=13, null=True,
+    )
+    requested_valid_from = models.DateTimeField(
+        null=True,
     )
 
     objects = ScopedManager(organizer='event__organizer')
@@ -2618,11 +3231,39 @@ class CartPosition(AbstractPosition):
             self.item.id, self.variation.id if self.variation else 0, self.cart_id
         )
 
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        # invalidate cached values of cached properties that likely have changed
+        try:
+            del self.sort_key
+        except AttributeError:
+            pass
+
     @property
     def tax_value(self):
-        net = round_decimal(self.price - (self.price * (1 - 100 / (100 + self.tax_rate))),
+        price = self.gross_price_before_rounding
+        net = round_decimal(price - (price * (1 - 100 / (100 + self.tax_rate))),
                             self.event.currency)
-        return self.price - net
+        return self.gross_price_before_rounding - net + self.tax_value_includes_rounding_correction
+
+    @tax_value.setter
+    def tax_value(self, value):
+        # ignore, tax value is always computed on the fly
+        pass
+
+    @cached_property
+    def sort_key(self):
+        subevent_key = (self.subevent.date_from, str(self.subevent.name), self.subevent_id) if self.subevent_id else (0, "", 0)
+        category_key = (self.item.category.position, self.item.category.id) if self.item.category_id is not None else (0, 0)
+        item_key = self.item.position, self.item_id
+        variation_key = (self.variation.position, self.variation.id) if self.variation_id is not None else (0, 0)
+        line_key = (self.price, (self.voucher_id or 0), (self.seat.sorting_rank if self.seat_id else 0), self.pk)
+        sort_key = subevent_key + category_key + item_key + variation_key + line_key
+
+        if self.addon_to_id:
+            return self.addon_to.sort_key + (1 if self.is_bundled else 2,) + sort_key
+        else:
+            return sort_key
 
     def update_listed_price_and_voucher(self, voucher_only=False, max_discount=None):
         from pretix.base.services.pricing import (
@@ -2645,8 +3286,12 @@ class CartPosition(AbstractPosition):
         if self.is_bundled:
             bundle = self.addon_to.item.bundles.filter(bundled_item=self.item, bundled_variation=self.variation).first()
             if bundle:
-                listed_price = bundle.designated_price
-                price_after_voucher = bundle.designated_price
+                if self.addon_to.voucher_id and self.addon_to.voucher.all_bundles_included:
+                    listed_price = Decimal('0.00')
+                    price_after_voucher = Decimal('0.00')
+                else:
+                    listed_price = bundle.designated_price
+                    price_after_voucher = bundle.designated_price
 
         if listed_price != self.listed_price or price_after_voucher != self.price_after_voucher:
             self.listed_price = listed_price
@@ -2657,7 +3302,7 @@ class CartPosition(AbstractPosition):
         # Migrate from pre-discounts position
         if self.item.free_price and self.custom_price_input is None:
             custom_price = self.price
-            if custom_price > 100000000:
+            if custom_price > 99_999_999_999:
                 raise ValueError('price_too_high')
             self.custom_price_input = custom_price
             self.custom_price_input_is_net = not False
@@ -2673,11 +3318,43 @@ class CartPosition(AbstractPosition):
             tax_rule=self.item.tax_rule,
             invoice_address=invoice_address,
             bundled_sum=sum([b.price_after_voucher for b in bundled_positions]),
+            is_bundled=self.is_bundled,
         )
         if line_price.gross != self.line_price_gross or line_price.rate != self.tax_rate:
             self.line_price_gross = line_price.gross
             self.tax_rate = line_price.rate
+            self.tax_code = line_price.code
             self.save(update_fields=['line_price_gross', 'tax_rate'])
+
+    @property
+    def discount_percentage(self):
+        if not self.line_price_gross:
+            return 0
+        return (self.line_price_gross - self.price) / self.line_price_gross * 100
+
+    @property
+    def addons_without_bundled(self):
+        addons = [op for op in self.addons.all() if not op.is_bundled]
+        return sorted(addons, key=lambda cp: cp.sort_key)
+
+    @cached_property
+    def predicted_validity(self):
+        return self.item.compute_validity(
+            requested_start=(
+                max(self.requested_valid_from, time_machine_now())
+                if self.requested_valid_from and self.item.validity_dynamic_start_choice
+                else time_machine_now()
+            ),
+            override_tz=self.event.timezone,
+        )
+
+    @property
+    def valid_from(self):
+        return self.predicted_validity[0]
+
+    @property
+    def valid_until(self):
+        return self.predicted_validity[1]
 
 
 class InvoiceAddress(models.Model):
@@ -2693,9 +3370,9 @@ class InvoiceAddress(models.Model):
     company = models.CharField(max_length=255, blank=True, verbose_name=_('Company name'))
     name_cached = models.CharField(max_length=255, verbose_name=_('Full name'), blank=True)
     name_parts = models.JSONField(default=dict)
-    street = models.TextField(verbose_name=_('Address'), blank=False)
-    zipcode = models.CharField(max_length=30, verbose_name=_('ZIP code'), blank=False)
-    city = models.CharField(max_length=255, verbose_name=_('City'), blank=False)
+    street = models.TextField(verbose_name=_('Address'), blank=True)
+    zipcode = models.CharField(max_length=30, verbose_name=_('ZIP code'), blank=True)
+    city = models.CharField(max_length=255, verbose_name=_('City'), blank=True)
     country_old = models.CharField(max_length=255, verbose_name=_('Country'), blank=False)
     country = FastCountryField(verbose_name=_('Country'), blank=False, blank_label=_('Select country'),
                                countries=CachedCountries)
@@ -2713,6 +3390,9 @@ class InvoiceAddress(models.Model):
         blank=True
     )
 
+    transmission_type = models.CharField(max_length=255, default="email")
+    transmission_info = models.JSONField(null=True, blank=True)
+
     objects = ScopedManager(organizer='order__event__organizer')
     profiles = ScopedManager(organizer='customer__organizer')
 
@@ -2721,11 +3401,36 @@ class InvoiceAddress(models.Model):
             self.order.touch()
 
         if self.name_parts:
-            self.name_cached = self.name
+            name = self.name
+            if self.name_cached != name:
+                self.name_cached = self.name
+                if 'update_fields' in kwargs:
+                    kwargs['update_fields'] = {'name_cached'}.union(kwargs['update_fields'])
         else:
+            if self.name_cached != "" or self.name_parts != {}:
+                self.name_cached = ""
+                self.name_parts = {}
+                if 'update_fields' in kwargs:
+                    kwargs['update_fields'] = {'name_cached', 'name_parts'}.union(kwargs['update_fields'])
+        super().save(**kwargs)
+
+    def clear(self, except_name=False):
+        self.is_business = False
+        if not except_name:
             self.name_cached = ""
             self.name_parts = {}
-        super().save(**kwargs)
+        self.company = ""
+        self.street = ""
+        self.zipcode = ""
+        self.city = ""
+        self.country_old = ""
+        self.country = ""
+        self.state = ""
+        self.vat_id = ""
+        self.vat_id_validated = False
+        self.custom_field = None
+        self.internal_reference = ""
+        self.beneficiary = ""
 
     def describe(self):
         parts = [
@@ -2739,6 +3444,7 @@ class InvoiceAddress(models.Model):
             self.internal_reference,
             (_('Beneficiary') + ': ' + self.beneficiary) if self.beneficiary else '',
         ]
+        parts += [f'{k}: {v}' for k, v in self.describe_transmission()]
         return '\n'.join([str(p).strip() for p in parts if p and str(p).strip()])
 
     @property
@@ -2752,7 +3458,7 @@ class InvoiceAddress(models.Model):
     def state_name(self):
         sd = pycountry.subdivisions.get(code='{}-{}'.format(self.country, self.state))
         if sd:
-            return sd.name
+            return _(sd.name)
         return self.state
 
     @property
@@ -2766,15 +3472,11 @@ class InvoiceAddress(models.Model):
 
     @property
     def name(self):
-        if not self.name_parts:
-            return ""
-        if '_legacy' in self.name_parts:
-            return self.name_parts['_legacy']
-        if '_scheme' in self.name_parts:
-            scheme = PERSON_NAME_SCHEMES[self.name_parts['_scheme']]
-        else:
-            raise TypeError("Invalid name given.")
-        return scheme['concatenation'](self.name_parts).strip()
+        return build_name(self.name_parts, fallback_scheme=lambda: self.order.event.settings.name_scheme) or ""
+
+    @property
+    def name_all_components(self):
+        return build_name(self.name_parts, "concatenation_all_components", fallback_scheme=lambda: self.order.event.settings.name_scheme) or ""
 
     def for_js(self):
         d = {}
@@ -2797,8 +3499,19 @@ class InvoiceAddress(models.Model):
             'custom_field': self.custom_field,
             'internal_reference': self.internal_reference,
             'beneficiary': self.beneficiary,
+            'transmission_type': self.transmission_type,
+            **(self.transmission_info or {}),
         })
         return d
+
+    def describe_transmission(self):
+        from pretix.base.invoicing.transmission import transmission_types
+        data = []
+        t, __ = transmission_types.get(identifier=self.transmission_type)
+        data.append((_("Transmission type"), t.public_name))
+        if self.transmission_info:
+            data += t.describe_info(self.transmission_info, self.country, self.is_business)
+        return data
 
 
 def cachedticket_name(instance, filename: str) -> str:
@@ -2845,7 +3558,7 @@ class CachedCombinedTicket(models.Model):
 class CancellationRequest(models.Model):
     order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='cancellation_requests')
     created = models.DateTimeField(auto_now_add=True)
-    cancellation_fee = models.DecimalField(max_digits=10, decimal_places=2)
+    cancellation_fee = models.DecimalField(max_digits=13, decimal_places=2)
     refund_as_giftcard = models.BooleanField(default=False)
 
 
@@ -2859,6 +3572,90 @@ class RevokedTicketSecret(models.Model):
     )
     secret = models.TextField(db_index=True)
     created = models.DateTimeField(auto_now_add=True)
+
+
+class BlockedTicketSecret(models.Model):
+    event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name='blocked_secrets')
+    position = models.ForeignKey(
+        OrderPosition,
+        on_delete=models.SET_NULL,
+        related_name='blocked_secrets',
+        null=True,
+    )
+    secret = models.TextField(db_index=True)
+    blocked = models.BooleanField()
+    updated = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = (('event', 'secret'),)
+
+
+class PrintLog(models.Model):
+    """
+    A print log object is created when a ticket or badge is printed with our apps.
+    """
+    TYPE_BADGE = 'badge'
+    TYPE_TICKET = 'ticket'
+    TYPE_CERTIFICATE = 'certificate'
+    TYPE_OTHER = 'other'
+    PRINT_TYPES = (
+        (TYPE_BADGE, _('Badge')),
+        (TYPE_TICKET, _('Ticket')),
+        (TYPE_CERTIFICATE, _('Certificate')),
+        (TYPE_OTHER, _('Other')),
+    )
+
+    position = models.ForeignKey(
+        'pretixbase.OrderPosition',
+        related_name='print_logs',
+        on_delete=models.CASCADE,
+    )
+    successful = models.BooleanField(
+        default=True,
+    )
+
+    # Datetime of checkin, might be different from created if past scans are uploaded
+    datetime = models.DateTimeField(default=now)
+
+    # Datetime of creation on server
+    created = models.DateTimeField(auto_now_add=True, null=True, blank=True)
+
+    # Who printed?
+    device = models.ForeignKey('Device', related_name='print_logs', null=True, blank=True, on_delete=models.PROTECT)
+    user = models.ForeignKey('User', related_name='print_logs', null=True, blank=True, on_delete=models.PROTECT)
+    api_token = models.ForeignKey('TeamAPIToken', null=True, blank=True, on_delete=models.PROTECT)
+    oauth_application = models.ForeignKey('pretixapi.OAuthApplication', null=True, blank=True, on_delete=models.PROTECT)
+
+    # Source = Tag field with undefined values, e.g. name of app ("pretixscan")
+    source = models.CharField(max_length=255)
+
+    # Type = Type of object printed ("badge", "ticket")
+    type = models.CharField(max_length=255, choices=PRINT_TYPES)
+
+    info = models.JSONField(default=dict)
+
+    objects = ScopedManager(organizer='position__order__event__organizer')
+
+    class Meta:
+        ordering = (('-datetime'),)
+
+    def __repr__(self):
+        return "<PrintLog: pos {} at {} from {}>".format(
+            self.position, self.datetime, self.source
+        )
+
+    def save(self, **kwargs):
+        super().save(**kwargs)
+        if self.position:
+            self.position.order.touch()
+
+    def delete(self, **kwargs):
+        super().delete(**kwargs)
+        self.position.order.touch()
+
+    @property
+    def is_late_upload(self):
+        return self.created and abs(self.created - self.datetime) > timedelta(minutes=2)
 
 
 @receiver(post_delete, sender=CachedTicket)

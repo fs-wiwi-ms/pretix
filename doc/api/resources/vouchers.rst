@@ -14,11 +14,14 @@ The voucher resource contains the following public fields:
 Field                                 Type                       Description
 ===================================== ========================== =======================================================
 id                                    integer                    Internal ID of the voucher
+created                               datetime                   The creation date of the voucher. For vouchers created before pretix 2025.7.0, this is guessed retroactively and might not be accurate.
 code                                  string                     The voucher code that is required to redeem the voucher
 max_usages                            integer                    The maximum number of times this voucher can be
                                                                  redeemed (default: 1).
 redeemed                              integer                    The number of times this voucher already has been
                                                                  redeemed.
+min_usages                            integer                    The minimum number of times this voucher must be
+                                                                 redeemed on first usage (default: 1).
 valid_until                           datetime                   The voucher expiration date (or ``null``).
 block_quota                           boolean                    If ``true``, quota is blocked for this voucher.
 allow_ignore_quota                    boolean                    If ``true``, this voucher can be redeemed even if a
@@ -45,12 +48,16 @@ tag                                   string                     A string that i
 comment                               string                     An internal comment on the voucher
 subevent                              integer                    ID of the date inside an event series this voucher belongs to (or ``null``).
 show_hidden_items                     boolean                    Only if set to ``true``, this voucher allows to buy products with the property ``hide_without_voucher``. Defaults to ``true``.
+all_addons_included                   boolean                    If set to ``true``, all add-on products for the product purchased with this voucher are included in the base price.
+all_bundles_included                  boolean                    If set to ``true``, all bundled products for the product purchased with this voucher are added without their designated price.
+budget                                money (string)             The budget a voucher is allowed to consume before being used up (or ``null``)
+budget_used                           money (string)             The amount of budget the voucher has already used up.
 ===================================== ========================== =======================================================
 
+.. versionchanged:: 2025.7
 
-.. versionchanged:: 3.4
+    The attributes ``created``, ``budget``, and ``budget_used`` have been added.
 
-   The attribute ``seat`` has been added.
 
 Endpoints
 ---------
@@ -82,6 +89,7 @@ Endpoints
         "results": [
           {
             "id": 1,
+            "created": "2020-09-18T14:17:40.971519Z",
             "code": "43K6LKM37FBVR2YG",
             "max_usages": 1,
             "redeemed": 0,
@@ -97,6 +105,11 @@ Endpoints
             "comment": "",
             "seat": null,
             "subevent": null,
+            "show_hidden_items": false,
+            "all_addons_included": false,
+            "all_bundles_included": false,
+            "budget": None,
+            "budget_used": "0.00"
           }
         ]
       }
@@ -149,6 +162,7 @@ Endpoints
 
       {
         "id": 1,
+        "created": "2020-09-18T14:17:40.971519Z",
         "code": "43K6LKM37FBVR2YG",
         "max_usages": 1,
         "redeemed": 0,
@@ -163,7 +177,12 @@ Endpoints
         "tag": "testvoucher",
         "comment": "",
         "seat": null,
-        "subevent": null
+        "subevent": null,
+        "show_hidden_items": false,
+        "all_addons_included": false,
+        "all_bundles_included": false,
+        "budget": None,
+        "budget_used": "0.00"
       }
 
    :param organizer: The ``slug`` field of the organizer to fetch
@@ -200,7 +219,10 @@ Endpoints
         "quota": null,
         "tag": "testvoucher",
         "comment": "",
-        "subevent": null
+        "subevent": null,
+        "show_hidden_items": false,
+        "all_addons_included": false,
+        "all_bundles_included": false
       }
 
    **Example response**:
@@ -213,6 +235,7 @@ Endpoints
 
       {
         "id": 1,
+        "created": "2020-09-18T14:17:40.971519Z",
         "code": "43K6LKM37FBVR2YG",
         "max_usages": 1,
         "redeemed": 0,
@@ -227,7 +250,12 @@ Endpoints
         "tag": "testvoucher",
         "comment": "",
         "seat": null,
-        "subevent": null
+        "subevent": null,
+        "show_hidden_items": false,
+        "all_addons_included": false,
+        "all_bundles_included": false,
+        "budget": None,
+        "budget_used": "0.00"
       }
 
    :param organizer: The ``slug`` field of the organizer to create a voucher for
@@ -266,7 +294,10 @@ Endpoints
           "quota": null,
           "tag": "testvoucher",
           "comment": "",
-          "subevent": null
+          "subevent": null,
+          "show_hidden_items": false,
+          "all_addons_included": false,
+          "all_bundles_included": false
         },
         {
           "code": "ASDKLJCYXCASDASD",
@@ -281,7 +312,10 @@ Endpoints
           "quota": null,
           "tag": "testvoucher",
           "comment": "",
-          "subevent": null
+          "subevent": null,
+          "show_hidden_items": false,
+          "all_addons_included": false,
+          "all_bundles_included": false
         },
 
    **Example response**:
@@ -295,6 +329,7 @@ Endpoints
       [
         {
           "id": 1,
+          "created": "2020-09-18T14:17:40.971519Z",
           "code": "43K6LKM37FBVR2YG",
           …
         }, …
@@ -341,6 +376,7 @@ Endpoints
 
       {
         "id": 1,
+        "created": "2020-09-18T14:17:40.971519Z",
         "code": "43K6LKM37FBVR2YG",
         "max_usages": 1,
         "redeemed": 0,
@@ -355,7 +391,12 @@ Endpoints
         "tag": "testvoucher",
         "comment": "",
         "seat": null,
-        "subevent": null
+        "subevent": null,
+        "show_hidden_items": false,
+        "all_addons_included": false,
+        "all_bundles_included": false,
+        "budget": None,
+        "budget_used": "0.00"
       }
 
    :param organizer: The ``slug`` field of the organizer to modify

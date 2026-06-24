@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -32,13 +32,12 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under the License.
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 from django.test import utils
 from django.utils.timezone import now
 from django_scopes import scopes_disabled
-from pytz import UTC
 from rest_framework.test import APIClient
 
 from pretix.base.models import Device, Event, Organizer, Team, User
@@ -53,7 +52,7 @@ def client():
 @pytest.fixture
 @scopes_disabled()
 def organizer():
-    return Organizer.objects.create(name='Dummy', slug='dummy')
+    return Organizer.objects.create(name='Dummy', slug='dummy', plugins='pretix.plugins.banktransfer')
 
 
 @pytest.fixture
@@ -67,8 +66,8 @@ def meta_prop(organizer):
 def event(organizer, meta_prop):
     e = Event.objects.create(
         organizer=organizer, name='Dummy', slug='dummy',
-        date_from=datetime(2017, 12, 27, 10, 0, 0, tzinfo=UTC),
-        plugins='pretix.plugins.banktransfer,pretix.plugins.ticketoutputpdf',
+        date_from=datetime(2017, 12, 27, 10, 0, 0, tzinfo=timezone.utc),
+        plugins='pretix.plugins.banktransfer,pretix.plugins.ticketoutputpdf,tests.testdummy',
         is_public=True
     )
     e.meta_values.create(property=meta_prop, value="Conference")
@@ -82,7 +81,7 @@ def event(organizer, meta_prop):
 def event2(organizer, meta_prop):
     e = Event.objects.create(
         organizer=organizer, name='Dummy2', slug='dummy2',
-        date_from=datetime(2017, 12, 27, 10, 0, 0, tzinfo=UTC),
+        date_from=datetime(2017, 12, 27, 10, 0, 0, tzinfo=timezone.utc),
         plugins='pretix.plugins.banktransfer,pretix.plugins.ticketoutputpdf'
     )
     e.meta_values.create(property=meta_prop, value="Conference")
@@ -94,7 +93,7 @@ def event2(organizer, meta_prop):
 def event3(organizer, meta_prop):
     e = Event.objects.create(
         organizer=organizer, name='Dummy3', slug='dummy3',
-        date_from=datetime(2017, 12, 27, 10, 0, 0, tzinfo=UTC),
+        date_from=datetime(2017, 12, 27, 10, 0, 0, tzinfo=timezone.utc),
         plugins='pretix.plugins.banktransfer,pretix.plugins.ticketoutputpdf'
     )
     e.meta_values.create(property=meta_prop, value="Conference")
@@ -107,16 +106,8 @@ def team(organizer):
     return Team.objects.create(
         organizer=organizer,
         name="Test-Team",
-        can_change_teams=True,
-        can_manage_gift_cards=True,
-        can_change_items=True,
-        can_create_events=True,
-        can_change_event_settings=True,
-        can_change_vouchers=True,
-        can_view_vouchers=True,
-        can_change_orders=True,
-        can_manage_customers=True,
-        can_change_organizer_settings=True
+        all_event_permissions=True,
+        all_organizer_permissions=True,
     )
 
 
@@ -140,8 +131,9 @@ def user():
 @pytest.fixture
 @scopes_disabled()
 def user_client(client, team, user):
-    team.can_view_orders = True
-    team.can_view_vouchers = True
+    if not team.all_event_permissions:
+        team.limit_event_permissions["event.orders:read"] = True
+        team.limit_event_permissions["event.vouchers:read"] = True
     team.all_events = True
     team.save()
     team.members.add(user)
@@ -152,8 +144,9 @@ def user_client(client, team, user):
 @pytest.fixture
 @scopes_disabled()
 def token_client(client, team):
-    team.can_view_orders = True
-    team.can_view_vouchers = True
+    if not team.all_event_permissions:
+        team.limit_event_permissions["event.orders:read"] = True
+        team.limit_event_permissions["event.vouchers:read"] = True
     team.all_events = True
     team.save()
     t = team.tokens.create(name='Foo')
@@ -172,7 +165,7 @@ def device_client(client, device):
 def subevent(event, meta_prop):
     event.has_subevents = True
     event.save()
-    se = event.subevents.create(name="Foobar", date_from=datetime(2017, 12, 27, 10, 0, 0, tzinfo=UTC))
+    se = event.subevents.create(name="Foobar", date_from=datetime(2017, 12, 27, 10, 0, 0, tzinfo=timezone.utc))
 
     se.meta_values.create(property=meta_prop, value="Workshop")
     return se
@@ -183,7 +176,7 @@ def subevent(event, meta_prop):
 def subevent2(event2, meta_prop):
     event2.has_subevents = True
     event2.save()
-    se = event2.subevents.create(name="Foobar", date_from=datetime(2017, 12, 27, 10, 0, 0, tzinfo=UTC))
+    se = event2.subevents.create(name="Foobar", date_from=datetime(2017, 12, 27, 10, 0, 0, tzinfo=timezone.utc))
 
     se.meta_values.create(property=meta_prop, value="Workshop")
     return se
@@ -192,13 +185,13 @@ def subevent2(event2, meta_prop):
 @pytest.fixture
 @scopes_disabled()
 def taxrule(event):
-    return event.tax_rules.create(name="VAT", rate=19)
+    return event.tax_rules.create(name="VAT", rate=19, code="S/standard", default=True)
 
 
 @pytest.fixture
 @scopes_disabled()
 def taxrule0(event):
-    return event.tax_rules.create(name="VAT", rate=0)
+    return event.tax_rules.create(name="VAT", rate=0, code="E")
 
 
 @pytest.fixture
@@ -217,6 +210,19 @@ def item(event):
 @scopes_disabled()
 def membership_type(organizer):
     return organizer.membership_types.create(name='foo')
+
+
+@pytest.fixture
+def clist(event, item):
+    c = event.checkin_lists.create(name="Default", all_products=False)
+    c.limit_products.add(item)
+    return c
+
+
+@pytest.fixture
+def clist_all(event, item):
+    c = event.checkin_lists.create(name="Default", all_products=True)
+    return c
 
 
 utils.setup_databases = scopes_disabled()(utils.setup_databases)

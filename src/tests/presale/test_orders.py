@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -56,7 +56,7 @@ class BaseOrdersTest(TestCase):
     @scopes_disabled()
     def setUp(self):
         super().setUp()
-        self.orga = Organizer.objects.create(name='CCC', slug='ccc')
+        self.orga = Organizer.objects.create(name='CCC', slug='ccc', plugins='pretix.plugins.banktransfer')
         self.event = Event.objects.create(
             organizer=self.orga, name='30C3', slug='30c3',
             date_from=datetime.datetime(2013, 12, 26, tzinfo=datetime.timezone.utc),
@@ -77,7 +77,7 @@ class BaseOrdersTest(TestCase):
         self.quota_tickets = Quota.objects.create(event=self.event, name='Tickets', size=5)
         self.ticket = Item.objects.create(event=self.event, name='Early-bird ticket',
                                           category=self.category, default_price=23,
-                                          admission=True)
+                                          admission=True, personalized=True)
         self.quota_tickets.items.add(self.ticket)
         self.event.settings.set('attendee_names_asked', True)
         self.question = Question.objects.create(question='Foo', type=Question.TYPE_STRING, event=self.event,
@@ -91,6 +91,7 @@ class BaseOrdersTest(TestCase):
             datetime=now() - datetime.timedelta(days=3),
             expires=now() + datetime.timedelta(days=11),
             total=Decimal("23"),
+            sales_channel=self.orga.sales_channels.get(identifier="web"),
             locale='en'
         )
         self.ticket_pos = OrderPosition.objects.create(
@@ -114,7 +115,8 @@ class BaseOrdersTest(TestCase):
             email='user@localhost',
             datetime=now() - datetime.timedelta(days=3),
             expires=now() + datetime.timedelta(days=11),
-            total=Decimal("23")
+            total=Decimal("23"),
+            sales_channel=self.orga.sales_channels.get(identifier="web"),
         )
 
 
@@ -191,6 +193,24 @@ class OrdersTest(BaseOrdersTest):
                                          self.deleted_pos.positionid, self.deleted_pos.web_secret)
         )
         assert response.status_code == 404
+        response = self.client.get(
+            '/%s/%s/ticket/%s/1/123/modify' % (self.orga.slug, self.event.slug, self.not_my_order.code)
+        )
+        assert response.status_code == 404
+        response = self.client.get(
+            '/%s/%s/ticket/%s/%s/%s/modify' % (self.orga.slug, self.event.slug, self.order.code,
+                                               self.deleted_pos.positionid, self.deleted_pos.web_secret)
+        )
+        assert response.status_code == 404
+        response = self.client.get(
+            '/%s/%s/ticket/%s/1/123/change' % (self.orga.slug, self.event.slug, self.not_my_order.code)
+        )
+        assert response.status_code == 404
+        response = self.client.get(
+            '/%s/%s/ticket/%s/%s/%s/change' % (self.orga.slug, self.event.slug, self.order.code,
+                                               self.deleted_pos.positionid, self.deleted_pos.web_secret)
+        )
+        assert response.status_code == 404
 
     def test_orders_confirm_email(self):
         response = self.client.get(
@@ -201,7 +221,7 @@ class OrdersTest(BaseOrdersTest):
         assert not self.order.email_known_to_work
 
         response = self.client.get(
-            '/%s/%s/order/%s/%s/open/%s/' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret, self.order.email_confirm_hash())
+            '/%s/%s/order/%s/%s/open/%s/' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret, self.order.email_confirm_secret())
         )
         assert response.status_code == 302
         self.order.refresh_from_db()
@@ -253,6 +273,7 @@ class OrdersTest(BaseOrdersTest):
         response = self.client.post(
             '/%s/%s/order/%s/%s/modify' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret), {
                 '%s-attendee_name_parts_0' % self.ticket_pos.id: '',
+                'transmission_type': 'email',
             }, follow=True)
         self.assertRedirects(response,
                              '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code,
@@ -284,6 +305,7 @@ class OrdersTest(BaseOrdersTest):
         response = self.client.post(
             '/%s/%s/order/%s/%s/modify' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret), {
                 '%s-attendee_name_parts_0' % self.ticket_pos.id: 'Peter',
+                'transmission_type': 'email',
             }, follow=True)
         self.assertRedirects(response, '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code,
                                                                 self.order.secret),
@@ -306,6 +328,7 @@ class OrdersTest(BaseOrdersTest):
         response = self.client.post(
             '/%s/%s/order/%s/%s/modify' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret), {
                 '%s-question_%s' % (self.ticket_pos.id, self.question.id): '',
+                'transmission_type': 'email',
             }, follow=True)
         self.assertRedirects(response,
                              '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code,
@@ -330,6 +353,7 @@ class OrdersTest(BaseOrdersTest):
         response = self.client.post(
             '/%s/%s/order/%s/%s/modify' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret), {
                 '%s-question_%s' % (self.ticket_pos.id, self.question.id): '',
+                'transmission_type': 'email',
             }, follow=True)
         doc = BeautifulSoup(response.content.decode(), "lxml")
         self.assertGreaterEqual(len(doc.select('.has-error')), 1)
@@ -337,6 +361,7 @@ class OrdersTest(BaseOrdersTest):
         response = self.client.post(
             '/%s/%s/order/%s/%s/modify' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret), {
                 '%s-question_%s' % (self.ticket_pos.id, self.question.id): 'ABC',
+                'transmission_type': 'email',
             }, follow=True)
         self.assertRedirects(response,
                              '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code,
@@ -345,7 +370,7 @@ class OrdersTest(BaseOrdersTest):
         with scopes_disabled():
             assert self.ticket_pos.answers.get(question=self.question).answer == 'ABC'
 
-    def test_modify_invoice_regenerate(self):
+    def test_modify_invoice_address_validated(self):
         self.event.settings.set('invoice_reissue_after_modify', True)
         self.event.settings.set('invoice_address_asked', True)
         with scopes_disabled():
@@ -354,6 +379,7 @@ class OrdersTest(BaseOrdersTest):
         response = self.client.post(
             '/%s/%s/order/%s/%s/modify' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret), {
                 '%s-question_%s' % (self.ticket_pos.id, self.question.id): 'ABC',
+                'transmission_type': 'email',
             }, follow=True)
         self.assertRedirects(response,
                              '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code,
@@ -366,7 +392,42 @@ class OrdersTest(BaseOrdersTest):
         response = self.client.post(
             '/%s/%s/order/%s/%s/modify' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret), {
                 '%s-question_%s' % (self.ticket_pos.id, self.question.id): 'ABC',
-                'zipcode': '1234',
+                'zipcode': 'XXINVALIDXX',
+                'street': 'Main Street',
+                'city': 'Heidelberg',
+                'country': 'DE',
+                'transmission_type': 'email',
+            }, follow=True)
+        doc = BeautifulSoup(response.content.decode(), "lxml")
+        self.assertGreaterEqual(len(doc.select('.has-error')), 1)
+
+    def test_modify_invoice_regenerate(self):
+        self.event.settings.set('invoice_reissue_after_modify', True)
+        self.event.settings.set('invoice_address_asked', True)
+        with scopes_disabled():
+            generate_invoice(self.order)
+
+        response = self.client.post(
+            '/%s/%s/order/%s/%s/modify' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret), {
+                '%s-question_%s' % (self.ticket_pos.id, self.question.id): 'ABC',
+                'transmission_type': 'email',
+            }, follow=True)
+        self.assertRedirects(response,
+                             '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code,
+                                                      self.order.secret),
+                             target_status_code=200)
+        # Only questions changed
+        with scopes_disabled():
+            assert self.order.invoices.count() == 1
+
+        response = self.client.post(
+            '/%s/%s/order/%s/%s/modify' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret), {
+                '%s-question_%s' % (self.ticket_pos.id, self.question.id): 'ABC',
+                'zipcode': '12345',
+                'street': 'Main Street',
+                'city': 'Heidelberg',
+                'country': 'DE',
+                'transmission_type': 'email',
             }, follow=True)
         self.assertRedirects(response,
                              '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code,
@@ -381,6 +442,10 @@ class OrdersTest(BaseOrdersTest):
             '/%s/%s/order/%s/%s/modify' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret), {
                 '%s-question_%s' % (self.ticket_pos.id, self.question.id): 'ABC',
                 'zipcode': '54321',
+                'street': 'Main Street',
+                'city': 'Heidelberg',
+                'country': 'DE',
+                'transmission_type': 'email',
             }, follow=True)
         self.assertRedirects(response,
                              '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code,
@@ -388,6 +453,53 @@ class OrdersTest(BaseOrdersTest):
                              target_status_code=200)
         with scopes_disabled():
             assert self.order.invoices.count() == 3
+
+    def test_orders_attendee_modify_invalid(self):
+        self.order.status = Order.STATUS_CANCELED
+        self.order.save()
+        self.event.settings.set('allow_modifications', 'attendee')
+        r = self.client.get(
+            '/%s/%s/ticket/%s/%s/%s/modify' % (self.orga.slug, self.event.slug, self.order.code,
+                                               self.ticket_pos.positionid, self.ticket_pos.web_secret)
+        )
+        assert r.status_code == 302
+
+    def test_orders_attendee_modify_forbidden(self):
+        self.event.settings.set('allow_modifications', 'order')
+        r = self.client.get(
+            '/%s/%s/ticket/%s/%s/%s/modify' % (self.orga.slug, self.event.slug, self.order.code,
+                                               self.ticket_pos.positionid, self.ticket_pos.web_secret)
+        )
+        assert r.status_code == 302
+
+    def test_orders_attendee_modify_attendee_optional(self):
+        self.event.settings.set('allow_modifications', 'attendee')
+        self.event.settings.set('attendee_names_asked', True)
+        self.event.settings.set('attendee_names_required', False)
+
+        response = self.client.get(
+            '/%s/%s/ticket/%s/%s/%s/modify' % (self.orga.slug, self.event.slug, self.order.code,
+                                               self.ticket_pos.positionid, self.ticket_pos.web_secret)
+        )
+        doc = BeautifulSoup(response.content.decode(), "lxml")
+        self.assertEqual(len(doc.select('input[name="%s-attendee_name_parts_0"]' % self.ticket_pos.id)), 1)
+
+        # Not all fields filled out, expect success
+        response = self.client.post(
+            '/%s/%s/ticket/%s/%s/%s/modify' % (self.orga.slug, self.event.slug, self.order.code,
+                                               self.ticket_pos.positionid, self.ticket_pos.web_secret),
+            {
+                'transmission_type': 'email',
+            }
+        )
+        print(response.content.decode())
+        self.assertRedirects(response,
+                             '/%s/%s/ticket/%s/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code,
+                                                          self.ticket_pos.positionid, self.ticket_pos.web_secret),
+                             target_status_code=200)
+        with scopes_disabled():
+            self.ticket_pos = OrderPosition.objects.get(id=self.ticket_pos.id)
+        assert self.ticket_pos.attendee_name in (None, '')
 
     def test_orders_cancel_invalid(self):
         self.order.status = Order.STATUS_PAID
@@ -460,30 +572,19 @@ class OrdersTest(BaseOrdersTest):
             r = self.order.cancellation_requests.get()
             assert r.cancellation_fee == Decimal('3.00')
 
-    def test_orders_cancel_unpaid_no_request(self):
+    def test_orders_cancel_partially_paid_no_selfservice(self):
         self.order.status = Order.STATUS_PENDING
         self.order.save()
         with scopes_disabled():
-            self.order.payments.create(provider='testdummy_partialrefund', amount=self.order.total, state=OrderPayment.PAYMENT_STATE_CONFIRMED)
+            self.order.payments.create(provider='testdummy_partialrefund', amount=self.order.total - Decimal("1.00"),
+                                       state=OrderPayment.PAYMENT_STATE_CONFIRMED)
         self.event.settings.cancel_allow_user_paid = True
         self.event.settings.cancel_allow_user_paid_keep = Decimal('3.00')
         self.event.settings.cancel_allow_user_paid_require_approval = True
         response = self.client.get(
             '/%s/%s/order/%s/%s/cancel' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret)
         )
-        assert response.status_code == 200
-        response = self.client.post(
-            '/%s/%s/order/%s/%s/cancel/do' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret), {
-            }, follow=True)
-        self.assertRedirects(response,
-                             '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code,
-                                                      self.order.secret),
-                             target_status_code=200)
-        self.order.refresh_from_db()
-        assert self.order.status == Order.STATUS_CANCELED
-        with scopes_disabled():
-            assert not self.order.refunds.exists()
-            assert not self.order.cancellation_requests.exists()
+        assert response.status_code == 302
 
     def test_orders_cancel_free_no_request(self):
         self.order.status = Order.STATUS_PAID
@@ -586,7 +687,7 @@ class OrdersTest(BaseOrdersTest):
         assert "gift card" in response.content.decode()
         response = self.client.post(
             '/%s/%s/order/%s/%s/cancel/do' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret), {
-                'giftcard': 'false'
+                'payment_giftcard-code': 'false'
             }, follow=True)
         self.assertRedirects(response,
                              '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code,
@@ -600,6 +701,73 @@ class OrdersTest(BaseOrdersTest):
             r = self.order.refunds.get()
             assert r.provider == "giftcard"
             assert r.amount == Decimal('20.00')
+
+    def test_orders_cancel_autorefund_gift_card_customer(self):
+        self.order.status = Order.STATUS_PAID
+        self.order.save()
+        with scopes_disabled():
+            customer = self.orga.customers.create(email='john@example.org', is_verified=True)
+            customer.set_password('foo')
+            customer.save()
+        self.order.customer = customer
+        self.order.save()
+        with scopes_disabled():
+            self.order.payments.create(provider='testdummy_partialrefund', amount=self.order.total,
+                                       state=OrderPayment.PAYMENT_STATE_CONFIRMED)
+        self.event.settings.cancel_allow_user_paid = True
+        self.event.settings.cancel_allow_user_paid_refund_as_giftcard = 'option'
+        gc = customer.usable_gift_cards()
+        assert len(gc) == 0
+        response = self.client.get(
+            '/%s/%s/order/%s/%s/cancel' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret)
+        )
+        assert response.status_code == 200
+        assert 'manually' not in response.content.decode()
+        assert "gift card" in response.content.decode()
+        response = self.client.post(
+            '/%s/%s/order/%s/%s/cancel/do' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret), {
+                'giftcard': 'true'
+            }, follow=True)
+        self.assertRedirects(response,
+                             '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code,
+                                                      self.order.secret),
+                             target_status_code=200)
+        assert "gift card" in response.content.decode()
+        self.order.refresh_from_db()
+        assert self.order.status == Order.STATUS_CANCELED
+        with scopes_disabled():
+            r = self.order.refunds.get()
+            assert r.provider == "giftcard"
+            assert r.amount == Decimal('23.00')
+            gc = customer.usable_gift_cards()
+            assert len(gc) == 1
+
+    def test_orders_cancel_unpaid_fee(self):
+        self.order.status = Order.STATUS_PENDING
+        self.order.save()
+        with scopes_disabled():
+            self.order.payments.create(provider='testdummy_partialrefund', amount=self.order.total, state=OrderPayment.PAYMENT_STATE_CREATED)
+        self.event.settings.cancel_allow_user = True
+        self.event.settings.cancel_allow_user_paid = False
+        self.event.settings.cancel_allow_user_unpaid_keep = Decimal('3.00')
+        self.event.settings.cancel_allow_user_paid_keep = Decimal('7.00')
+        response = self.client.get(
+            '/%s/%s/order/%s/%s/cancel' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret)
+        )
+        assert response.status_code == 200
+        assert 'manually' not in response.content.decode()
+        response = self.client.post(
+            '/%s/%s/order/%s/%s/cancel/do' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret), {
+            }, follow=True)
+        self.assertRedirects(response,
+                             '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code,
+                                                      self.order.secret),
+                             target_status_code=200)
+        self.order.refresh_from_db()
+        assert self.order.status == Order.STATUS_PENDING
+        assert self.order.total == Decimal('3.00')
+        with scopes_disabled():
+            assert self.order.refunds.count() == 0
 
     def test_orders_cancel_paid_fee_autorefund(self):
         self.order.status = Order.STATUS_PAID
@@ -725,6 +893,26 @@ class OrdersTest(BaseOrdersTest):
         self.order.refresh_from_db()
         assert self.order.status == Order.STATUS_PENDING
 
+    def test_orders_cancel_paid_checkin_list(self):
+        self.order.status = Order.STATUS_PAID
+        self.order.save()
+        with scopes_disabled():
+            cl = self.event.checkin_lists.create(name="Foo")
+            self.order.positions.first().checkins.create(list=cl)
+        self.event.settings.cancel_allow_user_paid = True
+        response = self.client.get(
+            '/%s/%s/order/%s/%s/cancel' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret)
+        )
+        assert response.status_code == 302
+
+        cl.consider_tickets_used = False
+        cl.save()
+
+        response = self.client.get(
+            '/%s/%s/order/%s/%s/cancel' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret)
+        )
+        assert response.status_code == 200
+
     def test_orders_cancel_forbidden(self):
         self.event.settings.set('cancel_allow_user', False)
         self.client.post(
@@ -739,6 +927,21 @@ class OrdersTest(BaseOrdersTest):
             '/%s/%s/order/%s/%s/invoice' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret),
             {}, follow=True)
         assert 'alert-danger' in response.content.decode()
+
+    def test_invoice_create_onlypaid(self):
+        self.event.settings.set('invoice_generate', 'user_paid')
+        response = self.client.post(
+            '/%s/%s/order/%s/%s/invoice' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret),
+            {}, follow=True)
+        assert 'alert-danger' in response.content.decode()
+        self.order.status = Order.STATUS_PAID
+        self.order.save()
+        response = self.client.post(
+            '/%s/%s/order/%s/%s/invoice' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret),
+            {}, follow=True)
+        assert 'alert-success' in response.content.decode()
+        with scopes_disabled():
+            assert self.order.invoices.exists()
 
     def test_invoice_create_duplicate(self):
         self.event.settings.set('invoice_generate', 'user')
@@ -873,7 +1076,7 @@ class OrdersTest(BaseOrdersTest):
         self.event.date_from = now() + datetime.timedelta(days=3)
         self.event.save()
         self.event.settings.set('ticket_download_date', RelativeDateWrapper(RelativeDate(
-            base_date_name='date_from', days_before=2, time=None, minutes_before=None
+            base_date_name='date_from', days=2, time=None, minutes=None
         )))
         response = self.client.post(
             '/%s/%s/order/%s/%s/download/%d/testdummy' % (self.orga.slug, self.event.slug, self.order.code,
@@ -917,6 +1120,17 @@ class OrdersTest(BaseOrdersTest):
         )
         assert 'alert-danger' in response.content.decode()
 
+    def test_change_paymentmethod_expired_not_available(self):
+        self.order.status = Order.STATUS_EXPIRED
+        self.order.save()
+        self.quota_tickets.size = 0
+        self.quota_tickets.save()
+        response = self.client.get(
+            '/%s/%s/order/%s/%s/pay/change' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret),
+            follow=True
+        )
+        assert 'alert-danger' in response.content.decode()
+
     def test_pay_wrong_payment_state(self):
         with scopes_disabled():
             p = self.order.payments.create(
@@ -939,6 +1153,33 @@ class OrdersTest(BaseOrdersTest):
         response = self.client.get(
             '/%s/%s/order/%s/%s/pay/%d/complete' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret,
                                                     p.pk),
+            follow=True
+        )
+        assert 'alert-danger' in response.content.decode()
+
+    def test_pay_expired_not_available(self):
+        self.order.status = Order.STATUS_EXPIRED
+        self.order.save()
+        self.quota_tickets.size = 0
+        self.quota_tickets.save()
+        with scopes_disabled():
+            p = self.order.payments.create(
+                provider='banktransfer',
+                state=OrderPayment.PAYMENT_STATE_CREATED,
+                amount=Decimal('10.00'),
+            )
+        response = self.client.get(
+            '/%s/%s/order/%s/%s/pay/%d/' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret, p.pk),
+            follow=True
+        )
+        assert 'alert-danger' in response.content.decode()
+        response = self.client.get(
+            '/%s/%s/order/%s/%s/pay/%d/confirm' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret, p.pk),
+            follow=True
+        )
+        assert 'alert-danger' in response.content.decode()
+        response = self.client.get(
+            '/%s/%s/order/%s/%s/pay/%d/complete' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret, p.pk),
             follow=True
         )
         assert 'alert-danger' in response.content.decode()
@@ -1093,6 +1334,56 @@ class OrdersTest(BaseOrdersTest):
         p.refresh_from_db()
         assert p.state == OrderPayment.PAYMENT_STATE_CREATED
 
+    def test_change_paymentmethod_with_rounding_change(self):
+        tr19 = self.event.tax_rules.create(
+            name='VAT',
+            rate=Decimal('19.00'),
+            default=True
+        )
+        self.ticket.tax_rule = tr19
+        self.ticket.save()
+        self.ticket_pos.price = Decimal("100.00")
+        self.ticket_pos.tax_rule = tr19
+        self.ticket_pos._calculate_tax()
+        self.ticket_pos.save()
+        self.order.total = Decimal("100.00")
+        self.order.tax_rounding_mode = "sum_by_net"
+        self.order.save()
+
+        self.event.settings.tax_rounding = "sum_by_net"
+        self.event.settings.set('payment_banktransfer__enabled', True)
+        self.event.settings.set('payment_testdummy__enabled', True)
+        self.event.settings.set('payment_testdummy__fee_reverse_calc', False)
+        self.event.settings.set('payment_testdummy__fee_abs', '100.00')
+
+        response = self.client.get(
+            '/%s/%s/order/%s/%s/pay/change' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret),
+        )
+        assert 'Test dummy' in response.content.decode()
+        assert '+ €100.00' in response.content.decode()
+        response = self.client.post(
+            '/%s/%s/order/%s/%s/pay/change' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret),
+            {
+                'payment': 'testdummy'
+            }, follow=True
+        )
+        assert 'Total: €199.99' in response.content.decode()
+        self.order.refresh_from_db()
+        with scopes_disabled():
+            assert self.order.payments.last().provider == 'testdummy'
+            fee = self.order.fees.filter(fee_type=OrderFee.FEE_TYPE_PAYMENT).last()
+            assert fee.value == Decimal('100.00')
+            assert fee.tax_value == Decimal('15.97')
+            self.ticket_pos.refresh_from_db()
+            assert self.ticket_pos.price == Decimal("99.99")
+            assert self.ticket_pos.price_includes_rounding_correction == Decimal("-0.01")
+            self.order.refresh_from_db()
+            assert self.order.total == Decimal('199.99')
+            p = self.order.payments.last()
+            assert p.provider == 'testdummy'
+            assert p.state == OrderPayment.PAYMENT_STATE_CREATED
+            assert p.amount == Decimal('199.99')
+
     def test_change_paymentmethod_to_same(self):
         with scopes_disabled():
             p_old = self.order.payments.create(
@@ -1225,7 +1516,7 @@ class OrdersTest(BaseOrdersTest):
                 amount=Decimal('10.00'),
             )
             gc = self.orga.issued_gift_cards.create(currency="EUR")
-            gc.transactions.create(value=10)
+            gc.transactions.create(value=10, acceptor=self.orga)
         response = self.client.get(
             '/%s/%s/order/%s/%s/pay/change' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret),
         )
@@ -1234,7 +1525,7 @@ class OrdersTest(BaseOrdersTest):
             '/%s/%s/order/%s/%s/pay/change' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret),
             {
                 'payment': 'giftcard',
-                'giftcard': gc.secret
+                'payment_giftcard-code': gc.secret
             }
         )
         with scopes_disabled():
@@ -1264,14 +1555,14 @@ class OrdersTest(BaseOrdersTest):
                 amount=Decimal('10.00'),
             )
             gc = self.orga.issued_gift_cards.create(currency="EUR")
-            gc.transactions.create(value=10)
+            gc.transactions.create(value=10, acceptor=self.orga)
             self.ticket.issue_giftcard = True
             self.ticket.save()
         response = self.client.post(
             '/%s/%s/order/%s/%s/pay/change' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret),
             {
                 'payment': 'giftcard',
-                'giftcard': gc.secret
+                'payment_giftcard-code': gc.secret
             }
         )
         assert "You cannot pay with gift cards when buying a gift card." in response.content.decode()
@@ -1279,12 +1570,12 @@ class OrdersTest(BaseOrdersTest):
     def test_change_paymentmethod_giftcard_wrong_currency(self):
         with scopes_disabled():
             gc = self.orga.issued_gift_cards.create(currency="USD")
-            gc.transactions.create(value=10)
+            gc.transactions.create(value=10, acceptor=self.orga)
         response = self.client.post(
             '/%s/%s/order/%s/%s/pay/change' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret),
             {
                 'payment': 'giftcard',
-                'giftcard': gc.secret
+                'payment_giftcard-code': gc.secret
             }
         )
         assert "This gift card does not support this currency." in response.content.decode()
@@ -1294,12 +1585,12 @@ class OrdersTest(BaseOrdersTest):
             self.order.testmode = True
             self.order.save()
             gc = self.orga.issued_gift_cards.create(currency="EUR")
-            gc.transactions.create(value=10)
+            gc.transactions.create(value=10, acceptor=self.orga)
         response = self.client.post(
             '/%s/%s/order/%s/%s/pay/change' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret),
             {
                 'payment': 'giftcard',
-                'giftcard': gc.secret
+                'payment_giftcard-code': gc.secret
             }
         )
         assert "Only test gift cards can be used in test mode." in response.content.decode()
@@ -1307,12 +1598,12 @@ class OrdersTest(BaseOrdersTest):
     def test_change_paymentmethod_giftcard_not_in_test_mode(self):
         with scopes_disabled():
             gc = self.orga.issued_gift_cards.create(currency="EUR", testmode=True)
-            gc.transactions.create(value=10)
+            gc.transactions.create(value=10, acceptor=self.orga)
         response = self.client.post(
             '/%s/%s/order/%s/%s/pay/change' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret),
             {
                 'payment': 'giftcard',
-                'giftcard': gc.secret
+                'payment_giftcard-code': gc.secret
             }
         )
         assert "This gift card can only be used in test mode." in response.content.decode()
@@ -1324,7 +1615,7 @@ class OrdersTest(BaseOrdersTest):
             '/%s/%s/order/%s/%s/pay/change' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret),
             {
                 'payment': 'giftcard',
-                'giftcard': gc.secret
+                'payment_giftcard-code': gc.secret
             }
         )
         assert "All credit on this gift card has been used." in response.content.decode()
@@ -1334,12 +1625,12 @@ class OrdersTest(BaseOrdersTest):
             o = Organizer.objects.create(slug='Foo', name='bar')
             self.orga.issued_gift_cards.create(currency="EUR")
             gc = o.issued_gift_cards.create(currency="EUR")
-            gc.transactions.create(value=10)
+            gc.transactions.create(value=10, acceptor=self.orga)
         response = self.client.post(
             '/%s/%s/order/%s/%s/pay/change' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret),
             {
                 'payment': 'giftcard',
-                'giftcard': gc.secret
+                'payment_giftcard-code': gc.secret
             }
         )
         assert "This gift card is not known." in response.content.decode()
@@ -1352,7 +1643,7 @@ class OrdersTest(BaseOrdersTest):
                 amount=Decimal('10.00'),
             )
             gc = self.orga.issued_gift_cards.create(currency="EUR")
-            gc.transactions.create(value=100)
+            gc.transactions.create(value=100, acceptor=self.orga)
         response = self.client.get(
             '/%s/%s/order/%s/%s/pay/change' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret),
         )
@@ -1361,7 +1652,7 @@ class OrdersTest(BaseOrdersTest):
             '/%s/%s/order/%s/%s/pay/change' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret),
             {
                 'payment': 'giftcard',
-                'giftcard': gc.secret
+                'payment_giftcard-code': gc.secret
             }
         )
         with scopes_disabled():
@@ -1381,6 +1672,35 @@ class OrdersTest(BaseOrdersTest):
         assert p.state == OrderPayment.PAYMENT_STATE_CONFIRMED
         assert self.order.status == Order.STATUS_PAID
         assert gc.value == Decimal('87.00')
+
+    def test_change_paymentmethod_customeraccount_giftcard_offered(self):
+        with scopes_disabled():
+            self.orga.settings.customer_accounts = True
+            customer = self.orga.customers.create(email='john@example.org', is_verified=True)
+            customer.set_password('foo')
+            customer.save()
+            self.order.customer = customer
+            self.order.payments.create(
+                provider='manual',
+                state=OrderPayment.PAYMENT_STATE_CONFIRMED,
+                amount=Decimal('10.00'),
+            )
+            gc = self.orga.issued_gift_cards.create(currency="EUR", customer=customer)
+            gc.transactions.create(value=100, acceptor=self.orga)
+            ugc = customer.usable_gift_cards()
+            assert len(ugc) == 1
+        r = self.client.post('/%s/account/login' % (self.orga.slug), {
+            'email': 'john@example.org',
+            'password': 'foo',
+        })
+        assert r.status_code == 302
+        r = self.client.get('/%s/account/' % (self.orga.slug))
+        assert r.status_code == 200
+        response = self.client.get(
+            '/%s/%s/order/%s/%s/pay/change' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret),
+        )
+        assert 'Gift card' in response.content.decode()
+        assert '1 available' in response.content.decode()
 
     def test_answer_download_token(self):
         with scopes_disabled():
@@ -1418,3 +1738,222 @@ class OrdersTest(BaseOrdersTest):
                                                         self.order.secret, a.pk, match.group(1))
         )
         assert response.status_code == 404
+
+    def test_require_login_for_order_access_disabled_unauth(self):
+        self.orga.settings.customer_accounts = True
+
+        with scopes_disabled():
+            customer = self.orga.customers.create(email='john@example.org', is_verified=True)
+            customer.set_password("foo")
+            customer.save()
+
+        self.order.customer = customer
+        self.order.save()
+
+        self.orga.settings.customer_accounts_require_login_for_order_access = False
+
+        response = self.client.get(
+            '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret)
+        )
+        assert response.status_code == 200
+        doc = BeautifulSoup(response.content.decode(), "lxml")
+        assert len(doc.select(".cart-row")) > 0
+        assert "pending" in doc.select(".order-details")[0].text.lower()
+        assert "Peter" in response.content.decode()
+        assert "Lukas" not in response.content.decode()
+
+        response = self.client.get(
+            '/%s/%s/ticket/%s/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code,
+                                         self.ticket_pos.positionid, self.ticket_pos.web_secret)
+        )
+        assert response.status_code == 200
+        doc = BeautifulSoup(response.content.decode(), "lxml")
+        assert len(doc.select(".cart-row")) > 0
+        assert "pending" in doc.select(".order-details")[0].text.lower()
+        assert "Peter" in response.content.decode()
+        assert "Lukas" not in response.content.decode()
+
+    def test_require_login_for_order_access_enabled_unauth(self):
+        self.orga.settings.customer_accounts = True
+
+        with scopes_disabled():
+            customer = self.orga.customers.create(email='john@example.org', is_verified=True)
+            customer.set_password("foo")
+            customer.save()
+
+        self.order.customer = customer
+        self.order.save()
+
+        self.orga.settings.customer_accounts_require_login_for_order_access = True
+
+        response = self.client.get(
+            '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret)
+        )
+        assert response.status_code == 302
+
+        response = self.client.get(
+            '/%s/%s/ticket/%s/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code,
+                                         self.ticket_pos.positionid, self.ticket_pos.web_secret)
+        )
+        assert response.status_code == 200
+        doc = BeautifulSoup(response.content.decode(), "lxml")
+        assert len(doc.select(".cart-row")) > 0
+        assert "pending" in doc.select(".order-details")[0].text.lower()
+        assert "Peter" in response.content.decode()
+        assert "Lukas" not in response.content.decode()
+
+    def test_require_login_for_order_access_disabled_auth(self):
+        self.orga.settings.customer_accounts = True
+
+        with scopes_disabled():
+            customer = self.orga.customers.create(email='john@example.org', is_verified=True)
+            customer.set_password("foo")
+            customer.save()
+
+        self.order.customer = customer
+        self.order.save()
+
+        self.orga.settings.customer_accounts_require_login_for_order_access = False
+
+        response = self.client.post('/%s/account/login' % (self.orga.slug), {
+            'email': 'john@example.org',
+            'password': 'foo',
+        })
+        assert response.status_code == 302
+
+        response = self.client.get(
+            '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret)
+        )
+        assert response.status_code == 200
+        doc = BeautifulSoup(response.content.decode(), "lxml")
+        assert len(doc.select(".cart-row")) > 0
+        assert "pending" in doc.select(".order-details")[0].text.lower()
+        assert "Peter" in response.content.decode()
+        assert "Lukas" not in response.content.decode()
+
+        response = self.client.get(
+            '/%s/%s/ticket/%s/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code,
+                                         self.ticket_pos.positionid, self.ticket_pos.web_secret)
+        )
+        assert response.status_code == 200
+        doc = BeautifulSoup(response.content.decode(), "lxml")
+        assert len(doc.select(".cart-row")) > 0
+        assert "pending" in doc.select(".order-details")[0].text.lower()
+        assert "Peter" in response.content.decode()
+        assert "Lukas" not in response.content.decode()
+
+    def test_require_login_for_order_access_enabled_auth(self):
+        self.orga.settings.customer_accounts = True
+
+        with scopes_disabled():
+            customer = self.orga.customers.create(email='john@example.org', is_verified=True)
+            customer.set_password("foo")
+            customer.save()
+
+        self.order.customer = customer
+        self.order.save()
+
+        self.orga.settings.customer_accounts_require_login_for_order_access = True
+
+        response = self.client.post('/%s/account/login' % (self.orga.slug), {
+            'email': 'john@example.org',
+            'password': 'foo',
+        })
+        assert response.status_code == 302
+
+        response = self.client.get(
+            '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret)
+        )
+        assert response.status_code == 200
+        doc = BeautifulSoup(response.content.decode(), "lxml")
+        assert len(doc.select(".cart-row")) > 0
+        assert "pending" in doc.select(".order-details")[0].text.lower()
+        assert "Peter" in response.content.decode()
+        assert "Lukas" not in response.content.decode()
+
+        response = self.client.get(
+            '/%s/%s/ticket/%s/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code,
+                                         self.ticket_pos.positionid, self.ticket_pos.web_secret)
+        )
+        assert response.status_code == 200
+        doc = BeautifulSoup(response.content.decode(), "lxml")
+        assert len(doc.select(".cart-row")) > 0
+        assert "pending" in doc.select(".order-details")[0].text.lower()
+        assert "Peter" in response.content.decode()
+        assert "Lukas" not in response.content.decode()
+
+    def test_require_login_for_order_access_accounts_disabled(self):
+        self.orga.settings.customer_accounts = True
+
+        with scopes_disabled():
+            customer = self.orga.customers.create(email='john@example.org', is_verified=True)
+            customer.set_password("foo")
+            customer.save()
+
+        self.order.customer = customer
+        self.order.save()
+
+        self.orga.settings.customer_accounts = False
+        self.orga.settings.customer_accounts_require_login_for_order_access = True
+
+        response = self.client.get(
+            '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret)
+        )
+        assert response.status_code == 200
+        doc = BeautifulSoup(response.content.decode(), "lxml")
+        assert len(doc.select(".cart-row")) > 0
+        assert "pending" in doc.select(".order-details")[0].text.lower()
+        assert "Peter" in response.content.decode()
+        assert "Lukas" not in response.content.decode()
+
+    def test_require_login_for_order_access_enabled_wrong_customer(self):
+        self.orga.settings.customer_accounts = True
+
+        with scopes_disabled():
+            customer = self.orga.customers.create(email='john@example.org', is_verified=True)
+            customer.set_password("foo")
+            customer.save()
+
+        self.order.customer = customer
+        self.order.save()
+
+        with scopes_disabled():
+            customer = self.orga.customers.create(email='jill@example.org', is_verified=True)
+            customer.set_password("bar")
+            customer.save()
+
+        self.orga.settings.customer_accounts_require_login_for_order_access = True
+
+        response = self.client.post('/%s/account/login' % (self.orga.slug), {
+            'email': 'jill@example.org',
+            'password': 'bar',
+        })
+        assert response.status_code == 302
+
+        response = self.client.get(
+            '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret)
+        )
+        assert response.status_code == 404
+
+    def test_require_login_for_order_access_enabled_unverified_account(self):
+        self.orga.settings.customer_accounts = True
+
+        with scopes_disabled():
+            customer = self.orga.customers.create(email='john@example.org', is_verified=False)
+            customer.set_password("foo")
+            customer.save()
+
+        self.order.customer = customer
+        self.order.save()
+
+        self.orga.settings.customer_accounts_require_login_for_order_access = True
+
+        response = self.client.get(
+            '/%s/%s/order/%s/%s/' % (self.orga.slug, self.event.slug, self.order.code, self.order.secret)
+        )
+        assert response.status_code == 200
+        doc = BeautifulSoup(response.content.decode(), "lxml")
+        assert len(doc.select(".cart-row")) > 0
+        assert "pending" in doc.select(".order-details")[0].text.lower()
+        assert "Peter" in response.content.decode()
+        assert "Lukas" not in response.content.decode()

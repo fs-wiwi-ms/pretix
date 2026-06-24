@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -35,7 +35,7 @@
 from django.dispatch import receiver
 from django.utils.formats import date_format
 from django.utils.functional import cached_property
-from django.utils.translation import gettext_lazy as _
+from django.utils.translation import gettext_lazy as _, pgettext_lazy
 
 from ...control.forms.filter import get_all_payment_providers
 from ..exporter import ListExporter
@@ -45,6 +45,8 @@ from ..signals import register_multievent_data_exporters
 class EventDataExporter(ListExporter):
     identifier = 'eventdata'
     verbose_name = _('Event data')
+    category = pgettext_lazy('export_category', 'Event data')
+    description = _('Download a spreadsheet with information on all events in this organizer account.')
 
     @cached_property
     def providers(self):
@@ -56,6 +58,7 @@ class EventDataExporter(ListExporter):
             _("Short form"),
             _("Shop is live"),
             _("Event currency"),
+            _("Timezone"),
             _("Event start time"),
             _("Event end time"),
             _("Admission time"),
@@ -73,16 +76,18 @@ class EventDataExporter(ListExporter):
 
         for e in self.events.all():
             m = e.meta_data
+            tz = e.timezone
             yield [
                 str(e.name),
                 e.slug,
                 _('Yes') if e.live else _('No'),
                 e.currency,
-                date_format(e.date_from, 'SHORT_DATETIME_FORMAT'),
-                date_format(e.date_to, 'SHORT_DATETIME_FORMAT') if e.date_to else '',
-                date_format(e.date_admission, 'SHORT_DATETIME_FORMAT') if e.date_admission else '',
-                date_format(e.presale_start, 'SHORT_DATETIME_FORMAT') if e.presale_start else '',
-                date_format(e.presale_end, 'SHORT_DATETIME_FORMAT') if e.presale_end else '',
+                str(e.timezone),
+                date_format(e.date_from.astimezone(tz), 'SHORT_DATETIME_FORMAT'),
+                date_format(e.date_to.astimezone(tz), 'SHORT_DATETIME_FORMAT') if e.date_to else '',
+                date_format(e.date_admission.astimezone(tz), 'SHORT_DATETIME_FORMAT') if e.date_admission else '',
+                date_format(e.presale_start.astimezone(tz), 'SHORT_DATETIME_FORMAT') if e.presale_start else '',
+                date_format(e.presale_end.astimezone(tz), 'SHORT_DATETIME_FORMAT') if e.presale_end else '',
                 str(e.location),
                 e.geo_lat or '',
                 e.geo_lon or '',
@@ -92,7 +97,7 @@ class EventDataExporter(ListExporter):
             ]
 
     def get_filename(self):
-        return '{}_events'.format(self.events.first().organizer.slug)
+        return '{}_events'.format(self.organizer.slug)
 
 
 @receiver(register_multievent_data_exporters, dispatch_uid="multiexporter_eventdata")

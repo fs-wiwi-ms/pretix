@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -35,34 +35,39 @@
 import copy
 import json
 import logging
+import re
+from datetime import timedelta
 from decimal import Decimal
 from io import BytesIO
+from zoneinfo import ZoneInfo
 
 import dateutil.parser
 import pycountry
-import pytz
 from django import forms
 from django.conf import settings
 from django.contrib import messages
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.core.validators import (
-    MaxValueValidator, MinValueValidator, RegexValidator,
-)
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db.models import QuerySet
 from django.forms import Select, widgets
+from django.forms.widgets import FILE_INPUT_CONTRADICTION
 from django.utils.formats import date_format
 from django.utils.html import escape
 from django.utils.safestring import mark_safe
+from django.utils.text import format_lazy
 from django.utils.timezone import get_current_timezone
 from django.utils.translation import gettext_lazy as _, pgettext_lazy
 from django_countries import countries
 from django_countries.fields import Country, CountryField
+from geoip2.errors import AddressNotFoundError
 from phonenumber_field.formfields import PhoneNumberField
 from phonenumber_field.phonenumber import PhoneNumber
 from phonenumber_field.widgets import PhoneNumberPrefixWidget
-from phonenumbers import NumberParseException, national_significant_number
-from phonenumbers.data import _COUNTRY_CODE_TO_REGION_CODE
+from phonenumbers import (
+    COUNTRY_CODE_TO_REGION_CODE, REGION_CODE_FOR_NON_GEO_ENTITY,
+    NumberParseException, national_significant_number,
+)
 from PIL import ImageOps
 
 from pretix.base.forms.widgets import (
@@ -72,16 +77,20 @@ from pretix.base.forms.widgets import (
 from pretix.base.i18n import (
     get_babel_locale, get_language_without_region, language,
 )
-from pretix.base.models import InvoiceAddress, Question, QuestionOption
-from pretix.base.models.tax import VAT_ID_COUNTRIES, ask_for_vat_id
+from pretix.base.invoicing.transmission import (
+    get_transmission_types, transmission_types,
+)
+from pretix.base.models import InvoiceAddress, Item, Question, QuestionOption
+from pretix.base.models.tax import ask_for_vat_id
 from pretix.base.services.tax import (
-    VATIDFinalError, VATIDTemporaryError, validate_vat_id,
+    VATIDFinalError, VATIDTemporaryError, normalize_vat_id, validate_vat_id,
 )
 from pretix.base.settings import (
-    COUNTRIES_WITH_STATE_IN_ADDRESS, PERSON_NAME_SALUTATIONS,
-    PERSON_NAME_SCHEMES, PERSON_NAME_TITLE_GROUPS,
+    COUNTRIES_WITH_STATE_IN_ADDRESS, COUNTRY_STATE_LABEL,
+    PERSON_NAME_SALUTATIONS, PERSON_NAME_SCHEMES, PERSON_NAME_TITLE_GROUPS,
 )
-from pretix.base.templatetags.rich_text import rich_text
+from pretix.base.templatetags.rich_text import URL_RE, rich_text
+from pretix.base.timemachine import time_machine_now
 from pretix.control.forms import (
     ExtFileField, ExtValidationMixin, SizeValidationMixin, SplitDateTimeField,
 )
@@ -89,7 +98,9 @@ from pretix.helpers.countries import (
     CachedCountries, get_phone_prefixes_sorted_and_localized,
 )
 from pretix.helpers.escapejson import escapejson_attr
+from pretix.helpers.http import get_client_ip
 from pretix.helpers.i18n import get_format_without_seconds
+from pretix.helpers.security import get_geoip
 from pretix.presale.signals import question_form_fields
 
 logger = logging.getLogger(__name__)
@@ -120,7 +131,13 @@ class NamePartsWidget(forms.MultiWidget):
             if fname == 'title' and self.titles:
                 widgets.append(Select(attrs=a, choices=[('', '')] + [(d, d) for d in self.titles[1]]))
             elif fname == 'salutation':
-                widgets.append(Select(attrs=a, choices=[('', '---')] + PERSON_NAME_SALUTATIONS))
+                widgets.append(Select(
+                    attrs=a,
+                    choices=[
+                        ('', '---'),
+                        ('empty', '({})'.format(pgettext_lazy("name_salutation", "not specified"))),
+                    ] + PERSON_NAME_SALUTATIONS
+                ))
             else:
                 widgets.append(self.widget(attrs=a))
         super().__init__(widgets, attrs)
@@ -131,9 +148,16 @@ class NamePartsWidget(forms.MultiWidget):
         data = []
         for i, field in enumerate(self.scheme['fields']):
             fname, label, size = field
-            data.append(value.get(fname, ""))
+            fval = value.get(fname, "")
+            if fname == "salutation" and fname in value and fval == "":
+                fval = "empty"
+            data.append(fval)
         if '_legacy' in value and not data[-1]:
             data[-1] = value.get('_legacy', '')
+        elif not any(d for d in data) and '_scheme' in value:
+            scheme = PERSON_NAME_SCHEMES[value['_scheme']]
+            data[-1] = scheme['concatenation'](value).strip()
+
         return data
 
     def render(self, name: str, value, attrs=None, renderer=None) -> str:
@@ -161,10 +185,15 @@ class NamePartsWidget(forms.MultiWidget):
                     if self.field.required:
                         these_attrs['required'] = 'required'
                     these_attrs.pop('data-no-required-attr', None)
-                these_attrs['autocomplete'] = (self.attrs.get('autocomplete', '') + ' ' + self.autofill_map.get(self.scheme['fields'][i][0], 'off')).strip()
+
+                autofill_section = self.attrs.get('autocomplete', '')
+                autofill_by_name_scheme = self.autofill_map.get(self.scheme['fields'][i][0], 'off')
+                if autofill_by_name_scheme == "off" or autofill_section.strip() == "off":
+                    these_attrs['autocomplete'] = "off"
+                else:
+                    these_attrs['autocomplete'] = (autofill_section + ' ' + autofill_by_name_scheme).strip()
                 these_attrs['data-size'] = self.scheme['fields'][i][2]
-                if len(self.widgets) > 1:
-                    these_attrs['aria-label'] = self.scheme['fields'][i][1]
+                these_attrs['aria-label'] = self.scheme['fields'][i][1]
             else:
                 these_attrs = final_attrs
             output.append(widget.render(name + '_%s' % i, widget_value, these_attrs, renderer=renderer))
@@ -181,7 +210,8 @@ class NamePartsFormField(forms.MultiValueField):
         data = {}
         data['_scheme'] = self.scheme_name
         for i, value in enumerate(data_list):
-            data[self.scheme['fields'][i][0]] = value or ''
+            key = self.scheme['fields'][i][0]
+            data[key] = value or ''
         return data
 
     def __init__(self, *args, **kwargs):
@@ -189,16 +219,8 @@ class NamePartsFormField(forms.MultiValueField):
         defaults = {
             'widget': self.widget,
             'max_length': kwargs.pop('max_length', None),
-            'validators': [
-                RegexValidator(
-                    # The following characters should never appear in a name anywhere of
-                    # the world. However, they commonly appear in inputs generated by spam
-                    # bots.
-                    r'^[^$€/%§{}<>~]*$',
-                    message=_('Please do not use special characters in names.')
-                )
-            ]
         }
+        self.max_length = defaults['max_length']
         self.scheme_name = kwargs.pop('scheme')
         self.titles = kwargs.pop('titles')
         self.scheme = PERSON_NAME_SCHEMES.get(self.scheme_name)
@@ -218,7 +240,6 @@ class NamePartsFormField(forms.MultiValueField):
             if fname == 'title' and self.scheme_titles:
                 d = dict(defaults)
                 d.pop('max_length', None)
-                d.pop('validators', None)
                 field = forms.ChoiceField(
                     **d,
                     choices=[('', '')] + [(d, d) for d in self.scheme_titles[1]]
@@ -227,10 +248,12 @@ class NamePartsFormField(forms.MultiValueField):
             elif fname == 'salutation':
                 d = dict(defaults)
                 d.pop('max_length', None)
-                d.pop('validators', None)
                 field = forms.ChoiceField(
                     **d,
-                    choices=[('', '---')] + PERSON_NAME_SALUTATIONS
+                    choices=[
+                        ('', '---'),
+                        ('empty', '({})'.format(pgettext_lazy("name_salutation", "not specified"))),
+                    ] + PERSON_NAME_SALUTATIONS
                 )
             else:
                 field = forms.CharField(**defaults)
@@ -253,10 +276,48 @@ class NamePartsFormField(forms.MultiValueField):
         if self.require_all_fields and not all(v for v in value):
             raise forms.ValidationError(self.error_messages['incomplete'], code='required')
 
-        if sum(len(v) for v in value.values() if v) > 250:
+        if sum(len(v) for v in value.values() if v) > (self.max_length or 250):
             raise forms.ValidationError(_('Please enter a shorter name.'), code='max_length')
 
+        for fname, label, size in self.scheme['fields']:
+            if fname == 'salutation' or (fname == 'title' and self.scheme_titles):
+                continue
+            v = value.get(fname)
+            if not v:
+                continue
+            special_chars = re.findall('[$€/%§{}<>~]', v)
+            if special_chars:
+                raise forms.ValidationError(
+                    _('The field "%(label)s" may not contain special characters such as "%(chars)s".'),
+                    code='name_special_chars',
+                    params={
+                        "label": label,
+                        "chars": "".join(special_chars),
+                    },
+                )
+            # URL_RE checks for valid domain names, including one special TLD med, which can be part of a title
+            if ".med" in v:
+                v = v.replace(".med", ". med")
+                value[fname] = v
+            url_matched = URL_RE.search(v)
+            if url_matched:
+                raise forms.ValidationError(
+                    _('The field "%(label)s" may not contain an URL (%(url)s).'),
+                    code='url_in_title',
+                    params={
+                        "label": label,
+                        "url": url_matched.group(0),
+                    }
+                )
+
+        if value.get("salutation") == "empty":
+            value["salutation"] = ""
+
         return value
+
+
+def name_parts_is_empty(name_parts_dict):
+    return not any(k != "_scheme" and v for k, v in name_parts_dict.items())
 
 
 class WrappedPhonePrefixSelect(Select):
@@ -266,12 +327,17 @@ class WrappedPhonePrefixSelect(Select):
         choices = [("", "---------")]
 
         if initial:
-            for prefix, values in _COUNTRY_CODE_TO_REGION_CODE.items():
+            for prefix, values in COUNTRY_CODE_TO_REGION_CODE.items():
+                if all(v == REGION_CODE_FOR_NON_GEO_ENTITY for v in values):
+                    continue
                 if initial in values:
                     self.initial = "+%d" % prefix
                     break
         choices += get_phone_prefixes_sorted_and_localized()
-        super().__init__(choices=choices, attrs={'aria-label': pgettext_lazy('phonenumber', 'International area code')})
+        super().__init__(choices=choices, attrs={
+            'aria-label': pgettext_lazy('phonenumber', 'International area code'),
+            'autocomplete': 'tel-country-code',
+        })
 
     def render(self, name, value, *args, **kwargs):
         return super().render(name, value or self.initial, *args, **kwargs)
@@ -294,11 +360,11 @@ class WrappedPhonePrefixSelect(Select):
 class WrappedPhoneNumberPrefixWidget(PhoneNumberPrefixWidget):
 
     def __init__(self, attrs=None, initial=None):
-        attrs = {
-            'aria-label': pgettext_lazy('phonenumber', 'Phone number (without international area code)')
-        }
-        widgets = (WrappedPhonePrefixSelect(initial), forms.TextInput(attrs=attrs))
-        super(PhoneNumberPrefixWidget, self).__init__(widgets, attrs)
+        widgets = (WrappedPhonePrefixSelect(initial), forms.TextInput(attrs={
+            'aria-label': pgettext_lazy('phonenumber', 'Phone number (without international area code)'),
+            'autocomplete': 'tel-national',
+        }))
+        super(PhoneNumberPrefixWidget, self).__init__(widgets)
 
     def render(self, name, value, attrs=None, renderer=None):
         output = super().render(name, value, attrs, renderer)
@@ -345,6 +411,18 @@ class WrappedPhoneNumberPrefixWidget(PhoneNumberPrefixWidget):
         return ""
 
 
+def guess_country_from_request(request, event):
+    if settings.HAS_GEOIP:
+        g = get_geoip()
+        try:
+            res = g.country(get_client_ip(request))
+            if res['country_code'] and len(res['country_code']) == 2:
+                return Country(res['country_code'])
+        except AddressNotFoundError:
+            pass
+    return guess_country(event)
+
+
 def guess_country(event):
     # Try to guess the initial country from either the country of the merchant
     # or the locale. This will hopefully save at least some users some scrolling :)
@@ -376,8 +454,16 @@ def guess_phone_prefix(event):
         return get_phone_prefix(country)
 
 
+def guess_phone_prefix_from_request(request, event):
+    with language(get_babel_locale()):
+        country = str(guess_country_from_request(request, event))
+        return get_phone_prefix(country)
+
+
 def get_phone_prefix(country):
-    for prefix, values in _COUNTRY_CODE_TO_REGION_CODE.items():
+    if country == REGION_CODE_FOR_NON_GEO_ENTITY:
+        return None
+    for prefix, values in COUNTRY_CODE_TO_REGION_CODE.items():
         if country in values:
             return prefix
     return None
@@ -429,7 +515,7 @@ class PortraitImageWidget(UploadedFileWidget):
 
     def value_from_datadict(self, data, files, name):
         d = super().value_from_datadict(data, files, name)
-        if d is not None and d is not False:
+        if d is not None and d is not False and d is not FILE_INPUT_CONTRADICTION:
             d._cropdata = json.loads(data.get(name + '_cropdata', '{}') or '{}')
         return d
 
@@ -473,14 +559,14 @@ class PortraitImageField(SizeValidationMixin, ExtValidationMixin, forms.FileFiel
                 file = BytesIO(data['content'])
 
         try:
-            image = Image.open(file)
+            image = Image.open(file, formats=settings.PILLOW_FORMATS_QUESTIONS_IMAGE)
             # verify() must be called immediately after the constructor.
             image.verify()
 
             # We want to do more than just verify(), so we need to re-open the file
             if hasattr(file, 'seek'):
                 file.seek(0)
-            image = Image.open(file)
+            image = Image.open(file, formats=settings.PILLOW_FORMATS_QUESTIONS_IMAGE)
 
             # load() is a potential DoS vector (see Django bug #18520), so we verify the size first
             if image.width > 10_000 or image.height > 10_000:
@@ -526,7 +612,7 @@ class PortraitImageField(SizeValidationMixin, ExtValidationMixin, forms.FileFiel
                     code='aspect_ratio_not_3_by_4',
                 )
         except Exception as exc:
-            logger.exception('foo')
+            logger.exception('Could not parse image')
             # Pillow doesn't recognize it as an image.
             if isinstance(exc, ValidationError):
                 raise
@@ -539,7 +625,7 @@ class PortraitImageField(SizeValidationMixin, ExtValidationMixin, forms.FileFiel
         return f
 
     def __init__(self, *args, **kwargs):
-        kwargs.setdefault('ext_whitelist', (".png", ".jpg", ".jpeg", ".jfif", ".tif", ".tiff", ".bmp"))
+        kwargs.setdefault('ext_whitelist', settings.FILE_UPLOAD_EXTENSIONS_QUESTION_IMAGE)
         kwargs.setdefault('max_size', settings.FILE_UPLOAD_MAX_SIZE_IMAGE)
         super().__init__(*args, **kwargs)
 
@@ -550,6 +636,7 @@ class BaseQuestionsForm(forms.Form):
     the attendee name for admission tickets, if the corresponding setting is enabled,
     as well as additional questions defined by the organizer.
     """
+    address_validation = False
 
     def __init__(self, *args, **kwargs):
         """
@@ -558,6 +645,7 @@ class BaseQuestionsForm(forms.Form):
         :param cartpos: The cart position the form should be for
         :param event: The event this belongs to
         """
+        request = kwargs.pop('request', None)
         cartpos = self.cartpos = kwargs.pop('cartpos', None)
         orderpos = self.orderpos = kwargs.pop('orderpos', None)
         pos = cartpos or orderpos
@@ -565,12 +653,52 @@ class BaseQuestionsForm(forms.Form):
         questions = pos.item.questions_to_ask
         event = kwargs.pop('event')
         self.all_optional = kwargs.pop('all_optional', False)
+        self.attendee_addresses_required = event.settings.attendee_addresses_required and not self.all_optional
 
         super().__init__(*args, **kwargs)
 
+        if cartpos and item.validity_mode == Item.VALIDITY_MODE_DYNAMIC and item.validity_dynamic_start_choice:
+            if item.validity_dynamic_start_choice_day_limit:
+                max_date = time_machine_now().astimezone(event.timezone) + timedelta(days=item.validity_dynamic_start_choice_day_limit)
+            else:
+                max_date = None
+            min_date = time_machine_now()
+            initial = None
+            if (item.require_membership or (pos.variation and pos.variation.require_membership)) and pos.used_membership:
+                if pos.used_membership.date_start >= time_machine_now():
+                    initial = min_date = pos.used_membership.date_start
+                max_date = min(max_date, pos.used_membership.date_end) if max_date else pos.used_membership.date_end
+            if item.validity_dynamic_duration_months or item.validity_dynamic_duration_days:
+                attrs = {}
+                if max_date:
+                    attrs['data-max'] = max_date.date().isoformat()
+                if min_date:
+                    attrs['data-min'] = min_date.date().isoformat()
+                self.fields['requested_valid_from'] = forms.DateField(
+                    label=_('Start date'),
+                    help_text='' if initial else _('If you keep this empty, the ticket will be valid starting at the time of purchase.'),
+                    required=bool(initial),
+                    initial=pos.requested_valid_from or initial,
+                    widget=DatePickerWidget(attrs),
+                    validators=([MaxDateValidator(max_date.date())] if max_date else []) + [MinDateValidator(min_date.date())]
+                )
+            else:
+                self.fields['requested_valid_from'] = forms.SplitDateTimeField(
+                    label=_('Start date'),
+                    help_text='' if initial else _('If you keep this empty, the ticket will be valid starting at the time of purchase.'),
+                    required=bool(initial),
+                    initial=pos.requested_valid_from or initial,
+                    widget=SplitDateTimePickerWidget(
+                        time_format=get_format_without_seconds('TIME_INPUT_FORMATS'),
+                        min_date=min_date,
+                        max_date=max_date
+                    ),
+                    validators=([MaxDateTimeValidator(max_date)] if max_date else []) + [MinDateTimeValidator(min_date)]
+                )
+
         add_fields = {}
 
-        if item.admission and event.settings.attendee_names_asked:
+        if item.ask_attendee_data and event.settings.attendee_names_asked:
             add_fields['attendee_name_parts'] = NamePartsFormField(
                 max_length=255,
                 required=event.settings.attendee_names_required and not self.all_optional,
@@ -579,7 +707,7 @@ class BaseQuestionsForm(forms.Form):
                 label=_('Attendee name'),
                 initial=(cartpos.attendee_name_parts if cartpos else orderpos.attendee_name_parts),
             )
-        if item.admission and event.settings.attendee_emails_asked:
+        if item.ask_attendee_data and event.settings.attendee_emails_asked:
             add_fields['attendee_email'] = forms.EmailField(
                 required=event.settings.attendee_emails_required and not self.all_optional,
                 label=_('Attendee email'),
@@ -590,7 +718,7 @@ class BaseQuestionsForm(forms.Form):
                     }
                 )
             )
-        if item.admission and event.settings.attendee_company_asked:
+        if item.ask_attendee_data and event.settings.attendee_company_asked:
             add_fields['company'] = forms.CharField(
                 required=event.settings.attendee_company_required and not self.all_optional,
                 label=_('Company'),
@@ -598,9 +726,9 @@ class BaseQuestionsForm(forms.Form):
                 initial=(cartpos.company if cartpos else orderpos.company),
             )
 
-        if item.admission and event.settings.attendee_addresses_asked:
+        if item.ask_attendee_data and event.settings.attendee_addresses_asked:
             add_fields['street'] = forms.CharField(
-                required=event.settings.attendee_addresses_required and not self.all_optional,
+                required=self.attendee_addresses_required,
                 label=_('Address'),
                 widget=forms.Textarea(attrs={
                     'rows': 2,
@@ -610,7 +738,7 @@ class BaseQuestionsForm(forms.Form):
                 initial=(cartpos.street if cartpos else orderpos.street),
             )
             add_fields['zipcode'] = forms.CharField(
-                required=event.settings.attendee_addresses_required and not self.all_optional,
+                required=False,
                 max_length=30,
                 label=_('ZIP code'),
                 initial=(cartpos.zipcode if cartpos else orderpos.zipcode),
@@ -619,7 +747,7 @@ class BaseQuestionsForm(forms.Form):
                 }),
             )
             add_fields['city'] = forms.CharField(
-                required=event.settings.attendee_addresses_required and not self.all_optional,
+                required=False,
                 label=_('City'),
                 max_length=255,
                 initial=(cartpos.city if cartpos else orderpos.city),
@@ -627,18 +755,19 @@ class BaseQuestionsForm(forms.Form):
                     'autocomplete': 'address-level2',
                 }),
             )
-            country = (cartpos.country if cartpos else orderpos.country) or guess_country(event)
+            country = (cartpos.country if cartpos else orderpos.country) or guess_country_from_request(request, event)
             add_fields['country'] = CountryField(
                 countries=CachedCountries
             ).formfield(
-                required=event.settings.attendee_addresses_required and not self.all_optional,
+                required=self.attendee_addresses_required,
                 label=_('Country'),
                 initial=country,
                 widget=forms.Select(attrs={
                     'autocomplete': 'country',
+                    'data-trigger-address-info': 'on',
                 }),
             )
-            c = [('', pgettext_lazy('address', 'Select state'))]
+            c = [('', '---')]
             fprefix = str(self.prefix) + '-' if self.prefix is not None and self.prefix != '-' else ''
             cc = None
             state = None
@@ -680,12 +809,12 @@ class BaseQuestionsForm(forms.Form):
                 initial = answers[0]
             else:
                 initial = None
-            tz = pytz.timezone(event.settings.timezone)
+            tz = ZoneInfo(event.settings.timezone)
             help_text = rich_text(q.help_text)
             label = escape(q.question)  # django-bootstrap3 calls mark_safe
             required = q.required and not self.all_optional
             if q.type == Question.TYPE_BOOLEAN:
-                if q.required:
+                if required:
                     # For some reason, django-bootstrap3 does not set the required attribute
                     # itself.
                     widget = forms.CheckboxInput(attrs={'required': 'required'})
@@ -713,12 +842,14 @@ class BaseQuestionsForm(forms.Form):
             elif q.type == Question.TYPE_STRING:
                 field = forms.CharField(
                     label=label, required=required,
+                    max_length=q.valid_string_length_max,
                     help_text=help_text,
                     initial=initial.answer if initial else None,
                 )
             elif q.type == Question.TYPE_TEXT:
                 field = forms.CharField(
                     label=label, required=required,
+                    max_length=q.valid_string_length_max,
                     help_text=help_text,
                     widget=forms.Textarea,
                     initial=initial.answer if initial else None,
@@ -732,7 +863,7 @@ class BaseQuestionsForm(forms.Form):
                     help_text=help_text,
                     widget=forms.Select,
                     empty_label=' ',
-                    initial=initial.answer if initial else (guess_country(event) if required else None),
+                    initial=initial.answer if initial else (guess_country_from_request(request, event) if required else None),
                 )
             elif q.type == Question.TYPE_CHOICE:
                 field = forms.ModelChoiceField(
@@ -767,11 +898,7 @@ class BaseQuestionsForm(forms.Form):
                         help_text=help_text,
                         initial=initial.file if initial else None,
                         widget=UploadedFileWidget(position=pos, event=event, answer=initial),
-                        ext_whitelist=(
-                            ".png", ".jpg", ".gif", ".jpeg", ".pdf", ".txt", ".docx", ".gif", ".svg",
-                            ".pptx", ".ppt", ".doc", ".xlsx", ".xls", ".jfif", ".heic", ".heif", ".pages",
-                            ".bmp", ".tif", ".tiff"
-                        ),
+                        ext_whitelist=settings.FILE_UPLOAD_EXTENSIONS_OTHER,
                         max_size=settings.FILE_UPLOAD_MAX_SIZE_OTHER,
                     )
             elif q.type == Question.TYPE_DATE:
@@ -780,10 +907,34 @@ class BaseQuestionsForm(forms.Form):
                     attrs['data-min'] = q.valid_date_min.isoformat()
                 if q.valid_date_max:
                     attrs['data-max'] = q.valid_date_max.isoformat()
+                if not help_text:
+                    if q.valid_date_min and q.valid_date_max:
+                        help_text = format_lazy(
+                            _('Please enter a date between {min} and {max}.'),
+                            min=date_format(q.valid_date_min, "SHORT_DATE_FORMAT"),
+                            max=date_format(q.valid_date_max, "SHORT_DATE_FORMAT"),
+                        )
+                    elif q.valid_date_min:
+                        help_text = format_lazy(
+                            _('Please enter a date no earlier than {min}.'),
+                            min=date_format(q.valid_date_min, "SHORT_DATE_FORMAT"),
+                        )
+                    elif q.valid_date_max:
+                        help_text = format_lazy(
+                            _('Please enter a date no later than {max}.'),
+                            max=date_format(q.valid_date_max, "SHORT_DATE_FORMAT"),
+                        )
+                if initial and initial.answer:
+                    try:
+                        _initial = dateutil.parser.parse(initial.answer).date()
+                    except dateutil.parser.ParserError:
+                        _initial = None
+                else:
+                    _initial = None
                 field = forms.DateField(
                     label=label, required=required,
                     help_text=help_text,
-                    initial=dateutil.parser.parse(initial.answer).date() if initial and initial.answer else None,
+                    initial=_initial,
                     widget=DatePickerWidget(attrs),
                 )
                 if q.valid_date_min:
@@ -791,17 +942,50 @@ class BaseQuestionsForm(forms.Form):
                 if q.valid_date_max:
                     field.validators.append(MaxDateValidator(q.valid_date_max))
             elif q.type == Question.TYPE_TIME:
+                if initial and initial.answer:
+                    try:
+                        _initial = dateutil.parser.parse(initial.answer).time()
+                    except dateutil.parser.ParserError:
+                        _initial = None
+                else:
+                    _initial = None
                 field = forms.TimeField(
                     label=label, required=required,
                     help_text=help_text,
-                    initial=dateutil.parser.parse(initial.answer).time() if initial and initial.answer else None,
+                    initial=_initial,
                     widget=TimePickerWidget(time_format=get_format_without_seconds('TIME_INPUT_FORMATS')),
                 )
             elif q.type == Question.TYPE_DATETIME:
+                if not help_text:
+                    if q.valid_datetime_min and q.valid_datetime_max:
+                        help_text = format_lazy(
+                            _('Please enter a date and time between {min} and {max}.'),
+                            min=date_format(q.valid_datetime_min, "SHORT_DATETIME_FORMAT"),
+                            max=date_format(q.valid_datetime_max, "SHORT_DATETIME_FORMAT"),
+                        )
+                    elif q.valid_datetime_min:
+                        help_text = format_lazy(
+                            _('Please enter a date and time no earlier than {min}.'),
+                            min=date_format(q.valid_datetime_min, "SHORT_DATETIME_FORMAT"),
+                        )
+                    elif q.valid_datetime_max:
+                        help_text = format_lazy(
+                            _('Please enter a date and time no later than {max}.'),
+                            max=date_format(q.valid_datetime_max, "SHORT_DATETIME_FORMAT"),
+                        )
+
+                if initial and initial.answer:
+                    try:
+                        _initial = dateutil.parser.parse(initial.answer).astimezone(tz)
+                    except dateutil.parser.ParserError:
+                        _initial = None
+                else:
+                    _initial = None
+
                 field = SplitDateTimeField(
                     label=label, required=required,
                     help_text=help_text,
-                    initial=dateutil.parser.parse(initial.answer).astimezone(tz) if initial and initial.answer else None,
+                    initial=_initial,
                     widget=SplitDateTimePickerWidget(
                         time_format=get_format_without_seconds('TIME_INPUT_FORMATS'),
                         min_date=q.valid_datetime_min,
@@ -820,7 +1004,7 @@ class BaseQuestionsForm(forms.Form):
                         initial = None
 
                 if not initial:
-                    phone_prefix = guess_phone_prefix(event)
+                    phone_prefix = guess_phone_prefix_from_request(request, event)
                     if phone_prefix:
                         initial = "+{}.".format(phone_prefix)
 
@@ -862,13 +1046,30 @@ class BaseQuestionsForm(forms.Form):
                 value.initial = data.get('question_form_data', {}).get(key)
 
         for k, v in self.fields.items():
+            if isinstance(v.widget, forms.MultiWidget):
+                for w in v.widget.widgets:
+                    autocomplete = w.attrs.get('autocomplete', '')
+                    if autocomplete.strip() == "off":
+                        w.attrs['autocomplete'] = 'off'
+                    else:
+                        w.attrs['autocomplete'] = 'section-{} '.format(self.prefix) + autocomplete
             if v.widget.attrs.get('autocomplete') or k == 'attendee_name_parts':
-                v.widget.attrs['autocomplete'] = 'section-{} '.format(self.prefix) + v.widget.attrs.get('autocomplete', '')
+                autocomplete = v.widget.attrs.get('autocomplete', '')
+                if autocomplete.strip() == "off":
+                    v.widget.attrs['autocomplete'] = 'off'
+                else:
+                    v.widget.attrs['autocomplete'] = 'section-{} '.format(self.prefix) + autocomplete
 
     def clean(self):
+        from pretix.base.addressvalidation import \
+            validate_address  # local import to prevent impact on startup time
+
         d = super().clean()
 
-        if d.get('city') and d.get('country') and str(d['country']) in COUNTRIES_WITH_STATE_IN_ADDRESS:
+        if self.address_validation:
+            self.cleaned_data = d = validate_address(d, all_optional=not self.attendee_addresses_required)
+
+        if d.get('street') and d.get('country') and str(d['country']) in COUNTRIES_WITH_STATE_IN_ADDRESS:
             if not d.get('state'):
                 self.add_error('state', _('This field is required.'))
 
@@ -914,6 +1115,7 @@ class BaseQuestionsForm(forms.Form):
 
 class BaseInvoiceAddressForm(forms.ModelForm):
     vat_warning = False
+    address_validation = False
 
     class Meta:
         model = InvoiceAddress
@@ -924,7 +1126,7 @@ class BaseInvoiceAddressForm(forms.ModelForm):
             'street': forms.Textarea(attrs={
                 'rows': 2,
                 'placeholder': _('Street and Number'),
-                'autocomplete': 'street-address'
+                'autocomplete': 'street-address',
             }),
             'beneficiary': forms.Textarea(attrs={'rows': 3}),
             'country': forms.Select(attrs={
@@ -937,15 +1139,26 @@ class BaseInvoiceAddressForm(forms.ModelForm):
                 'autocomplete': 'address-level2',
             }),
             'company': forms.TextInput(attrs={
-                'data-display-dependency': '#id_is_business_1',
                 'autocomplete': 'organization',
             }),
-            'vat_id': forms.TextInput(attrs={'data-display-dependency': '#id_is_business_1', 'data-countries-with-vat-id': ','.join(VAT_ID_COUNTRIES)}),
+            'vat_id': forms.TextInput(),
             'internal_reference': forms.TextInput,
         }
         labels = {
             'is_business': ''
         }
+
+    @property
+    def ask_vat_id(self):
+        return self.event.settings.invoice_address_vatid
+
+    @property
+    def address_required(self):
+        return self.event.settings.invoice_address_required
+
+    @property
+    def company_required(self):
+        return self.event.settings.invoice_address_company_required
 
     def __init__(self, *args, **kwargs):
         self.event = event = kwargs.pop('event')
@@ -954,28 +1167,50 @@ class BaseInvoiceAddressForm(forms.ModelForm):
         self.all_optional = kwargs.pop('all_optional', False)
 
         kwargs.setdefault('initial', {})
-        if not kwargs.get('instance') or not kwargs['instance'].country:
-            kwargs['initial']['country'] = guess_country(self.event)
+        if (not kwargs.get('instance') or not kwargs['instance'].country) and not kwargs["initial"].get("country"):
+            kwargs['initial']['country'] = guess_country_from_request(self.request, self.event)
+
+        if kwargs.get('instance') and kwargs['instance'].transmission_type:
+            ttype, meta = transmission_types.get(identifier=kwargs['instance'].transmission_type)
+            if ttype:
+                kwargs['initial'].update(ttype.transmission_info_to_form_data(kwargs['instance'].transmission_info or {}))
+                kwargs['initial']['transmission_type'] = ttype.identifier
 
         super().__init__(*args, **kwargs)
-        if not event.settings.invoice_address_vatid:
+
+        # Individuals do not have a company name or VAT ID
+        self.fields["company"].widget.attrs["data-display-dependency"] = f'input[name="{self.add_prefix("is_business")}"][value="business"]'
+        self.fields["vat_id"].widget.attrs["data-display-dependency"] = f'input[name="{self.add_prefix("is_business")}"][value="business"]'
+
+        # The internal reference is a very business-specific field and might confuse non-business users
+        self.fields["internal_reference"].widget.attrs["data-display-dependency"] = f'input[name="{self.add_prefix("is_business")}"][value="business"]'
+
+        if not self.ask_vat_id:
             del self.fields['vat_id']
         elif self.validate_vat_id:
             self.fields['vat_id'].help_text = '<br/>'.join([
                 str(_('Optional, but depending on the country you reside in we might need to charge you '
                       'additional taxes if you do not enter it.')),
-                str(_('If you are registered in Switzerland, you can enter your UID instead.')),
             ])
         else:
             self.fields['vat_id'].help_text = '<br/>'.join([
                 str(_('Optional, but it might be required for you to claim tax benefits on your invoice '
                       'depending on your and the seller’s country of residence.')),
-                str(_('If you are registered in Switzerland, you can enter your UID instead.')),
             ])
+
+        transmission_type_choices = [
+            (t.identifier, t.public_name) for t in get_transmission_types()
+        ]
+        if not self.address_required or self.all_optional:
+            transmission_type_choices.insert(0, ("-", _("No invoice requested")))
+        self.fields['transmission_type'] = forms.ChoiceField(
+            label=_('Invoice transmission method'),
+            choices=transmission_type_choices
+        )
 
         self.fields['country'].choices = CachedCountries()
 
-        c = [('', pgettext_lazy('address', 'Select state'))]
+        c = [('', '---')]
         fprefix = self.prefix + '-' if self.prefix else ''
         cc = None
         if fprefix + 'country' in self.data:
@@ -984,16 +1219,19 @@ class BaseInvoiceAddressForm(forms.ModelForm):
             cc = str(self.initial['country'])
         elif self.instance and self.instance.country:
             cc = str(self.instance.country)
+        state_label = pgettext_lazy('address', 'State')
         if cc and cc in COUNTRIES_WITH_STATE_IN_ADDRESS:
             types, form = COUNTRIES_WITH_STATE_IN_ADDRESS[cc]
             statelist = [s for s in pycountry.subdivisions.get(country_code=cc) if s.type in types]
             c += sorted([(s.code[3:], s.name) for s in statelist], key=lambda s: s[1])
+            if cc in COUNTRY_STATE_LABEL:
+                state_label = COUNTRY_STATE_LABEL[cc]
         elif fprefix + 'state' in self.data:
             self.data = self.data.copy()
             del self.data[fprefix + 'state']
 
         self.fields['state'] = forms.ChoiceField(
-            label=pgettext_lazy('address', 'State'),
+            label=state_label,
             required=False,
             choices=c,
             widget=forms.Select(attrs={
@@ -1002,18 +1240,22 @@ class BaseInvoiceAddressForm(forms.ModelForm):
         )
         self.fields['state'].widget.is_required = True
 
+        self.fields['street'].required = False
+        self.fields['zipcode'].required = False
+        self.fields['city'].required = False
+
         # Without JavaScript the VAT ID field is not hidden, so we empty the field if a country outside the EU is selected.
         if cc and not ask_for_vat_id(cc) and fprefix + 'vat_id' in self.data:
             self.data = self.data.copy()
             del self.data[fprefix + 'vat_id']
 
-        if not event.settings.invoice_address_required or self.all_optional:
+        if not self.address_required or self.all_optional:
             for k, f in self.fields.items():
                 f.required = False
                 f.widget.is_required = False
                 if 'required' in f.widget.attrs:
                     del f.widget.attrs['required']
-        elif event.settings.invoice_address_company_required and not self.all_optional:
+        elif self.company_required and not self.all_optional:
             self.initial['is_business'] = True
 
             self.fields['is_business'].widget = BusinessBooleanRadio(require_business=True)
@@ -1030,71 +1272,179 @@ class BaseInvoiceAddressForm(forms.ModelForm):
             label=_('Name'),
             initial=self.instance.name_parts,
         )
-        if event.settings.invoice_address_required and not event.settings.invoice_address_company_required and not self.all_optional:
+        if self.address_required and not self.company_required and not self.all_optional:
             if not event.settings.invoice_name_required:
-                self.fields['name_parts'].widget.attrs['data-required-if'] = '#id_is_business_0'
+                self.fields['name_parts'].widget.attrs['data-required-if'] = f'input[name="{self.add_prefix("is_business")}"][value="individual"]'
             self.fields['name_parts'].widget.attrs['data-no-required-attr'] = '1'
-            self.fields['company'].widget.attrs['data-required-if'] = '#id_is_business_1'
+            self.fields['company'].widget.attrs['data-required-if'] = f'input[name="{self.add_prefix("is_business")}"][value="business"]'
 
         if not event.settings.invoice_address_beneficiary:
             del self.fields['beneficiary']
 
         if event.settings.invoice_address_custom_field:
             self.fields['custom_field'].label = event.settings.invoice_address_custom_field
+            self.fields['custom_field'].help_text = event.settings.invoice_address_custom_field_helptext
         else:
             del self.fields['custom_field']
 
+        # Add transmission type specific fields
+        for transmission_type in get_transmission_types():
+            for k, f in transmission_type.invoice_address_form_fields.items():
+                if (
+                    transmission_type.identifier == "email" and
+                    k in ("transmission_email_other", "transmission_email_address") and
+                    (
+                        event.settings.invoice_generate == "False" or
+                        not event.settings.invoice_email_attachment
+                    )
+                ):
+                    # This looks like a very unclean hack (and probably really is one), but hear me out:
+                    # With pretix 2025.7, we introduced invoice transmission types and added the "send to another email"
+                    # feature for the email provider. This feature was previously part of the bank transfer payment
+                    # provider and opt-in. With this change, this feature becomes available for all pretix shops, which
+                    # we think is a good thing in the long run as it is an useful feature for every business customer.
+                    # However, there's two scenarios where it might be bad that we add it without opt-in:
+                    # - When the organizer has turned off invoice generation in pretix and is collecting invoice information
+                    #   only for other reasons or to later create invoices with a separate software. In this case it
+                    #   would be very bad for the user to be able to ask for the invoice to be sent somewhere else, and
+                    #   that information then be ignored because the organizer has not updated their process.
+                    # - When the organizer has intentionally turned off invoices being attached to emails, because that
+                    #   would somehow be a contradiction.
+                    # Now, the obvious solution would be to make the TransmissionType.invoice_address_form_fields property
+                    # a function that depends on the event as an input. However, I believe this is the wrong approach
+                    # over the long term. As a generalized concept, we DO want invoice address collection to be
+                    # *independent* of event settings, in order to (later) e.g. implement invoice address editing within
+                    # customer accounts. Hence, this hack directly in the form to provide (some) backwards compatibility
+                    # only for the default transmission type "email".
+                    continue
+
+                self.fields[k] = f
+                f._required = f.required
+                f.required = False
+                f.widget.is_required = False
+                if 'required' in f.widget.attrs:
+                    del f.widget.attrs['required']
+
         for k, v in self.fields.items():
             if v.widget.attrs.get('autocomplete') or k == 'name_parts':
-                v.widget.attrs['autocomplete'] = 'section-invoice billing ' + v.widget.attrs.get('autocomplete', '')
+                autocomplete = v.widget.attrs.get('autocomplete', '')
+                if autocomplete.strip() == "off":
+                    v.widget.attrs['autocomplete'] = 'off'
+                else:
+                    v.widget.attrs['autocomplete'] = 'section-invoice billing ' + autocomplete
+
+        self.fields['country'].widget.attrs['data-trigger-address-info'] = 'on'
+        self.fields['is_business'].widget.attrs['data-trigger-address-info'] = 'on'
+        self.fields['transmission_type'].widget.attrs['data-trigger-address-info'] = 'on'
 
     def clean(self):
+        from pretix.base.addressvalidation import \
+            validate_address  # local import to prevent impact on startup time
+
         data = self.cleaned_data
+
         if not data.get('is_business'):
             data['company'] = ''
             data['vat_id'] = ''
         if data.get('is_business') and not ask_for_vat_id(data.get('country')):
             data['vat_id'] = ''
-        if self.event.settings.invoice_address_required:
+        if self.address_validation and self.address_required and not self.all_optional:
             if data.get('is_business') and not data.get('company'):
-                raise ValidationError(_('You need to provide a company name.'))
-            if not data.get('is_business') and not data.get('name_parts'):
+                raise ValidationError({"company": _('You need to provide a company name.')})
+            if not data.get('is_business') and name_parts_is_empty(data.get('name_parts', {})):
                 raise ValidationError(_('You need to provide your name.'))
+            if not data.get('street') and not data.get('zipcode') and not data.get('city'):
+                raise ValidationError({"street": _('This field is required.')})
 
         if 'vat_id' in self.changed_data or not data.get('vat_id'):
             self.instance.vat_id_validated = False
 
-        if data.get('city') and data.get('country') and str(data['country']) in COUNTRIES_WITH_STATE_IN_ADDRESS:
-            if not data.get('state'):
-                self.add_error('state', _('This field is required.'))
+        if self.address_validation:
+            self.cleaned_data = data = validate_address(data, self.all_optional)
 
         self.instance.name_parts = data.get('name_parts')
 
-        if all(
-                not v for k, v in data.items() if k not in ('is_business', 'country', 'name_parts')
-        ) and len(data.get('name_parts', {})) == 1:
+        form_is_empty = all(
+            not v for k, v in data.items()
+            if k not in ('is_business', 'country', 'name_parts', 'transmission_type') and not k.startswith("transmission_")
+        ) and name_parts_is_empty(data.get('name_parts', {}))
+
+        if form_is_empty:
             # Do not save the country if it is the only field set -- we don't know the user even checked it!
             self.cleaned_data['country'] = ''
+            if data.get('transmission_type') == "-":
+                data['transmission_type'] = 'email'  # our actual default for now, we can revisit this later
+
+        else:
+            if data.get('transmission_type') == "-":
+                raise ValidationError(
+                    {"transmission_type": _("If you enter an invoice address, you also need to select an invoice "
+                                            "transmission method.")}
+                )
+
+        vat_id_applicable = (
+            'vat_id' in self.fields and
+            data.get('is_business') and
+            ask_for_vat_id(data.get('country'))
+        )
+        vat_id_required = vat_id_applicable and str(data.get('country')) in self.event.settings.invoice_address_vatid_required_countries
+        if vat_id_required and not data.get('vat_id'):
+            raise ValidationError({
+                "vat_id": _("This field is required.")
+            })
 
         if self.validate_vat_id and self.instance.vat_id_validated and 'vat_id' not in self.changed_data:
-            pass
-        elif self.validate_vat_id and data.get('is_business') and ask_for_vat_id(data.get('country')) and data.get('vat_id'):
+            pass  # Skip re-validation if it is validated
+        elif self.validate_vat_id and vat_id_applicable:
             try:
                 normalized_id = validate_vat_id(data.get('vat_id'), str(data.get('country')))
                 self.instance.vat_id_validated = True
-                self.instance.vat_id = normalized_id
+                self.instance.vat_id = data['vat_id'] = normalized_id
             except VATIDFinalError as e:
                 if self.all_optional:
                     self.instance.vat_id_validated = False
                     messages.warning(self.request, e.message)
                 else:
-                    raise ValidationError(e.message)
+                    raise ValidationError({"vat_id": e.message})
             except VATIDTemporaryError as e:
+                # We couldn't check it online, but we can still normalize it
+                normalized_id = normalize_vat_id(data.get('vat_id'), str(data.get('country')))
+                self.instance.vat_id = data['vat_id'] = normalized_id
                 self.instance.vat_id_validated = False
                 if self.request and self.vat_warning:
                     messages.warning(self.request, e.message)
         else:
             self.instance.vat_id_validated = False
+
+        for transmission_type in get_transmission_types():
+            if transmission_type.identifier == data.get("transmission_type"):
+                if not transmission_type.is_available(self.event, data.get("country"), data.get("is_business")):
+                    raise ValidationError({
+                        "transmission_type": _("The selected transmission type is not available in your country or for "
+                                               "your type of address.")
+                    })
+
+                required_fields = transmission_type.invoice_address_form_fields_required(data.get("country"), data.get("is_business"))
+                for r in required_fields:
+                    if r not in self.fields:
+                        logger.info(f"Transmission type {transmission_type.identifier} required field {r} which is not available.")
+                        raise ValidationError(
+                            _("The selected type of invoice transmission requires a field that is currently not "
+                              "available, please reach out to the organizer.")
+                        )
+                    if not data.get(r):
+                        raise ValidationError({r: _("This field is required for the selected type of invoice transmission.")})
+
+                transmission_type.validate_invoice_address_data(data)
+                self.instance.transmission_type = transmission_type.identifier
+                self.instance.transmission_info = transmission_type.form_data_to_transmission_info(data)
+            elif transmission_type.is_exclusive(self.event, data.get("country"), data.get("is_business")):
+                if transmission_type.is_available(self.event, data.get("country"), data.get("is_business")):
+                    raise ValidationError({
+                        "transmission_type": "The transmission type '%s' must be used for this country or address type." % (
+                            transmission_type.public_name,
+                        )
+                    })
 
 
 class BaseInvoiceNameForm(BaseInvoiceAddressForm):

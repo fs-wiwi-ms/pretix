@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -21,9 +21,49 @@
 #
 import logging
 
+from django.core.signals import request_finished
+from django.dispatch import receiver
+
+try:
+    from asgiref.local import Local
+except ImportError:
+    from threading import local as Local
+
 from django.conf import settings
 
 
 class AdminExistsFilter(logging.Filter):
     def filter(self, record):
         return not settings.DEBUG and len(settings.ADMINS) > 0
+
+
+local = Local()
+
+
+class RequestIdFilter(logging.Filter):
+    def filter(self, record):
+        record.request_id = getattr(local, 'request_id', None)
+        return True
+
+
+class RequestIdMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        if settings.REQUEST_ID_HEADER and settings.REQUEST_ID_HEADER in request.headers:
+            local.request_id = request.request_id = request.headers[settings.REQUEST_ID_HEADER]
+
+            if settings.SENTRY_ENABLED:
+                import sentry_sdk
+                sentry_sdk.set_tag("request_id", request.request_id)
+        else:
+            local.request_id = request.request_id = None
+
+        return self.get_response(request)
+
+
+@receiver(request_finished)
+def on_request_finished(sender, **kwargs):
+    # not part of middleware, since things could be logged after the middleware stack is finished
+    local.request_id = None

@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -32,6 +32,7 @@ from django.utils.translation import gettext_lazy as _
 from django.views.generic import TemplateView
 
 from pretix.base import email
+from pretix.base.forms import SECRET_REDACTED
 from pretix.base.models import Event
 from pretix.base.services.mail import mail
 from pretix.control.forms.filter import OrganizerFilterForm
@@ -43,7 +44,7 @@ logger = logging.getLogger(__name__)
 def get_spf_record(hostname):
     try:
         r = dns.resolver.Resolver()
-        for resp in r.query(hostname, 'TXT'):
+        for resp in r.resolve(hostname, 'TXT'):
             data = b''.join(resp.strings).decode()
             if data.lower().strip().startswith('v=spf1 '):  # RFC7208, section 4.5
                 return data
@@ -69,6 +70,11 @@ def _check_spf_record(not_found_lookup_parts, spf_record, depth):
     for p in parts:
         if p.startswith('include:') or p.startswith('+include:'):
             _, hostname = p.split(':')
+            rec_record = get_spf_record(hostname)
+            if rec_record:
+                _check_spf_record(not_found_lookup_parts, rec_record, depth + 1)
+        elif p.startswith('redirect='):
+            _, hostname = p.split('=')
             rec_record = get_spf_record(hostname)
             if rec_record:
                 _check_spf_record(not_found_lookup_parts, rec_record, depth + 1)
@@ -169,6 +175,13 @@ class MailSettingsSetupView(TemplateView):
             )
 
             if allow_save:
+                self.object.settings.smtp_use_custom = False
+                del self.object.settings.smtp_host
+                del self.object.settings.smtp_port
+                del self.object.settings.smtp_username
+                del self.object.settings.smtp_password
+                del self.object.settings.smtp_use_tls
+                del self.object.settings.smtp_use_ssl
                 for k, v in self.simple_form.cleaned_data.items():
                     self.object.settings.set(k, v)
                 self.log_action(self.simple_form.cleaned_data)
@@ -184,8 +197,8 @@ class MailSettingsSetupView(TemplateView):
                 spf_record = get_spf_record(hostname)
                 if not spf_record:
                     spf_warning = _(
-                        'We could not find an SPF record set for the domain you are trying to use. You can still '
-                        'proceed, but it will increase the chance of emails going to spam or being rejected. We '
+                        'We could not find an SPF record set for the domain you are trying to use. This means that '
+                        'there is a very high change most of the emails will be rejected or marked as spam. We '
                         'strongly recommend setting an SPF record on the domain. You can do so through the DNS '
                         'settings at the provider you registered your domain with.'
                     )
@@ -197,7 +210,8 @@ class MailSettingsSetupView(TemplateView):
                         'this system in the SPF record.'
                     )
 
-            if settings.MAIL_CUSTOM_SENDER_VERIFICATION_REQUIRED:
+            verification = settings.MAIL_CUSTOM_SENDER_VERIFICATION_REQUIRED and not spf_warning
+            if verification:
                 if 'verification' in self.request.POST:
                     messages.error(request, _('The verification code was incorrect, please try again.'))
                 else:
@@ -222,7 +236,7 @@ class MailSettingsSetupView(TemplateView):
                 context={
                     'basetpl': self.basetpl,
                     'object': self.object,
-                    'verification': settings.MAIL_CUSTOM_SENDER_VERIFICATION_REQUIRED,
+                    'verification': verification,
                     'spf_warning': spf_warning,
                     'spf_record': spf_record,
                     'spf_key': settings.MAIL_CUSTOM_SENDER_SPF_STRING,
@@ -237,7 +251,8 @@ class MailSettingsSetupView(TemplateView):
 
             if request.POST.get('state') == 'save':
                 for k, v in self.smtp_form.cleaned_data.items():
-                    self.object.settings.set(k, v)
+                    if v != SECRET_REDACTED:
+                        self.object.settings.set(k, v)
                 self.object.settings.smtp_use_custom = True
                 self.log_action({**self.smtp_form.cleaned_data, 'smtp_use_custom': True})
                 messages.success(request, _('Your changes have been saved.'))

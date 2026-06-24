@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -44,7 +44,7 @@ from django.http import HttpRequest
 from django.template.loader import get_template
 from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
-from PyPDF2 import PdfFileMerger
+from pypdf import PdfWriter
 
 from pretix.base.i18n import language
 from pretix.base.models import Order, OrderPosition
@@ -64,18 +64,20 @@ class PdfTicketOutput(BaseTicketOutput):
     download_button_text = _('PDF')
     multi_download_button_text = _('Download tickets (PDF)')
     long_download_button_text = _('Download ticket (PDF)')
+    override_layout_signal = override_layout
 
-    def __init__(self, event, override_layout=None, override_background=None):
+    def __init__(self, event, override_layout=None, override_background=None, override_channel=None):
         self.override_layout = override_layout
         self.override_background = override_background
+        self.override_channel = override_channel
         super().__init__(event)
 
     @cached_property
     def layout_map(self):
         if not hasattr(self.event, '_ticketoutputpdf_cache_layoutmap'):
             self.event._ticketoutputpdf_cache_layoutmap = {
-                (bi.item_id, bi.sales_channel): bi.layout
-                for bi in TicketLayoutItem.objects.select_related('layout').filter(item__event=self.event)
+                (bi.item_id, bi.sales_channel.identifier): bi.layout
+                for bi in TicketLayoutItem.objects.select_related('layout', 'sales_channel').filter(item__event=self.event)
             }
         return self.event._ticketoutputpdf_cache_layoutmap
 
@@ -91,7 +93,7 @@ class PdfTicketOutput(BaseTicketOutput):
         return self.event._ticketoutputpdf_cache_default_layout
 
     def _register_fonts(self):
-        Renderer._register_fonts()
+        Renderer._register_fonts(self.event)
 
     def _draw_page(self, layout: TicketLayout, op: OrderPosition, order: Order):
         buffer = BytesIO()
@@ -112,12 +114,12 @@ class PdfTicketOutput(BaseTicketOutput):
         return renderer.render_background(buffer, _('Ticket'))
 
     def generate_order(self, order: Order):
-        merger = PdfFileMerger()
+        merger = PdfWriter()
         with language(order.locale, self.event.settings.region):
-            for op in order.positions_with_tickets:
-                layout = override_layout.send_chained(
+            for op in self.get_tickets_to_print(order):
+                layout = self.override_layout_signal.send_chained(
                     order.event, 'layout', orderposition=op, layout=self.layout_map.get(
-                        (op.item_id, order.sales_channel),
+                        (op.item_id, self.override_channel or order.sales_channel.identifier),
                         self.layout_map.get(
                             (op.item_id, 'web'),
                             self.default_layout
@@ -136,9 +138,9 @@ class PdfTicketOutput(BaseTicketOutput):
     def generate(self, op):
         order = op.order
 
-        layout = override_layout.send_chained(
+        layout = self.override_layout_signal.send_chained(
             order.event, 'layout', orderposition=op, layout=self.layout_map.get(
-                (op.item_id, order.sales_channel),
+                (op.item_id, self.override_channel or order.sales_channel.identifier),
                 self.layout_map.get(
                     (op.item_id, 'web'),
                     self.default_layout

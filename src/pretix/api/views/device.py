@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -19,8 +19,13 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
+import base64
+import copy
 import logging
 
+from cryptography.hazmat.backends.openssl.backend import Backend
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from django.db.models import Exists, OuterRef, Q
 from django.db.models.functions import Coalesce
 from django.utils.timezone import now
@@ -29,9 +34,13 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from pretix import __version__
 from pretix.api.auth.device import DeviceTokenAuthentication
+from pretix.api.views.version import numeric_version
 from pretix.base.models import CheckinList, Device, SubEvent
 from pretix.base.models.devices import Gate, generate_api_token
+from pretix.base.models.media import MediumKeySet
+from pretix.base.services.media import get_keysets_for_organizer
 
 logger = logging.getLogger(__name__)
 
@@ -40,17 +49,75 @@ class InitializationRequestSerializer(serializers.Serializer):
     token = serializers.CharField(max_length=190)
     hardware_brand = serializers.CharField(max_length=190)
     hardware_model = serializers.CharField(max_length=190)
+    os_name = serializers.CharField(max_length=190, required=False, allow_null=True)
+    os_version = serializers.CharField(max_length=190, required=False, allow_null=True)
     software_brand = serializers.CharField(max_length=190)
     software_version = serializers.CharField(max_length=190)
     info = serializers.JSONField(required=False, allow_null=True)
+    rsa_pubkey = serializers.CharField(required=False, allow_null=True)
+
+    def validate(self, attrs):
+        if attrs.get('rsa_pubkey'):
+            try:
+                load_pem_public_key(
+                    attrs['rsa_pubkey'].encode(), Backend()
+                )
+            except:
+                raise ValidationError({'rsa_pubkey': ['Not a valid public key.']})
+        return attrs
 
 
 class UpdateRequestSerializer(serializers.Serializer):
     hardware_brand = serializers.CharField(max_length=190)
     hardware_model = serializers.CharField(max_length=190)
+    os_name = serializers.CharField(max_length=190, required=False, allow_null=True)
+    os_version = serializers.CharField(max_length=190, required=False, allow_null=True)
     software_brand = serializers.CharField(max_length=190)
     software_version = serializers.CharField(max_length=190)
     info = serializers.JSONField(required=False, allow_null=True)
+    rsa_pubkey = serializers.CharField(required=False, allow_null=True)
+
+    def validate(self, attrs):
+        if attrs.get('rsa_pubkey'):
+            try:
+                load_pem_public_key(
+                    attrs['rsa_pubkey'].encode(), Backend()
+                )
+            except:
+                raise ValidationError({'rsa_pubkey': ['Not a valid public key.']})
+        return attrs
+
+
+class RSAEncryptedField(serializers.Field):
+    def to_representation(self, value):
+        if isinstance(value, memoryview):
+            value = value.tobytes()
+        public_key = load_pem_public_key(
+            self.context['device'].rsa_pubkey.encode(), Backend()
+        )
+        cipher_text = public_key.encrypt(
+            # RSA/ECB/PKCS1Padding
+            value,
+            padding.PKCS1v15()
+        )
+        return base64.b64encode(cipher_text).decode()
+
+
+class MediumKeySetSerializer(serializers.ModelSerializer):
+    uid_key = RSAEncryptedField(read_only=True)
+    diversification_key = RSAEncryptedField(read_only=True)
+    organizer = serializers.SlugRelatedField(slug_field='slug', read_only=True)
+
+    class Meta:
+        model = MediumKeySet
+        fields = [
+            'public_id',
+            'organizer',
+            'active',
+            'media_type',
+            'uid_key',
+            'diversification_key',
+        ]
 
 
 class GateSerializer(serializers.ModelSerializer):
@@ -80,6 +147,8 @@ class InitializeView(APIView):
     permission_classes = ()
 
     def post(self, request, format=None):
+        from pretix.base.signals import device_info_updated
+
         serializer = InitializationRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
@@ -91,16 +160,28 @@ class InitializeView(APIView):
         if device.initialized:
             raise ValidationError({'token': ['This initialization token has already been used.']})
 
+        if device.revoked:
+            raise ValidationError({'token': ['This initialization token has been revoked.']})
+
+        old_instance = copy.copy(device)
+
         device.initialized = now()
         device.hardware_brand = serializer.validated_data.get('hardware_brand')
         device.hardware_model = serializer.validated_data.get('hardware_model')
+        device.os_name = serializer.validated_data.get('os_name')
+        device.os_version = serializer.validated_data.get('os_version')
         device.software_brand = serializer.validated_data.get('software_brand')
         device.software_version = serializer.validated_data.get('software_version')
         device.info = serializer.validated_data.get('info')
+        device.rsa_pubkey = serializer.validated_data.get('rsa_pubkey')
         device.api_token = generate_api_token()
         device.save()
 
         device.log_action('pretix.device.initialized', data=serializer.validated_data, auth=device)
+
+        device_info_updated.send(
+            sender=Device, old_device=old_instance, new_device=device
+        )
 
         serializer = DeviceSerializer(device)
         return Response(serializer.data)
@@ -110,16 +191,30 @@ class UpdateView(APIView):
     authentication_classes = (DeviceTokenAuthentication,)
 
     def post(self, request, format=None):
+        from pretix.base.signals import device_info_updated
+
         serializer = UpdateRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         device = request.auth
+        old_instance = copy.copy(device)
         device.hardware_brand = serializer.validated_data.get('hardware_brand')
         device.hardware_model = serializer.validated_data.get('hardware_model')
+        device.os_name = serializer.validated_data.get('os_name')
+        device.os_version = serializer.validated_data.get('os_version')
         device.software_brand = serializer.validated_data.get('software_brand')
         device.software_version = serializer.validated_data.get('software_version')
+        if serializer.validated_data.get('rsa_pubkey') and serializer.validated_data.get('rsa_pubkey') != device.rsa_pubkey:
+            if device.rsa_pubkey:
+                raise ValidationError({'rsa_pubkey': ['You cannot change the rsa_pubkey of the device once it is set.']})
+            else:
+                device.rsa_pubkey = serializer.validated_data.get('rsa_pubkey')
         device.info = serializer.validated_data.get('info')
         device.save()
         device.log_action('pretix.device.updated', data=serializer.validated_data, auth=device)
+
+        device_info_updated.send(
+            sender=Device, old_device=old_instance, new_device=device
+        )
 
         serializer = DeviceSerializer(device)
         return Response(serializer.data)
@@ -149,6 +244,28 @@ class RevokeKeyView(APIView):
 
         serializer = DeviceSerializer(device)
         return Response(serializer.data)
+
+
+class InfoView(APIView):
+    authentication_classes = (DeviceTokenAuthentication,)
+
+    def get(self, request, format=None):
+        device = request.auth
+        serializer = DeviceSerializer(device)
+        return Response({
+            'device': serializer.data,
+            'server': {
+                'version': {
+                    'pretix': __version__,
+                    'pretix_numeric': numeric_version(__version__),
+                }
+            },
+            'medium_key_sets': MediumKeySetSerializer(
+                get_keysets_for_organizer(device.organizer),
+                many=True,
+                context={'device': request.auth}
+            ).data if device.rsa_pubkey else []
+        })
 
 
 class EventSelectionView(APIView):

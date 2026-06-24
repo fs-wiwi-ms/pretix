@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -51,13 +51,14 @@ from django.utils.translation import gettext as __, gettext_lazy as _
 from i18nfield.strings import LazyI18nString
 from paypalrestsdk.exceptions import BadRequest, UnauthorizedAccess
 from paypalrestsdk.openid_connect import Tokeninfo
+from requests import RequestException
 
 from pretix.base.decimal import round_decimal
+from pretix.base.forms import SecretKeySettingsField
 from pretix.base.models import Event, Order, OrderPayment, OrderRefund, Quota
 from pretix.base.payment import BasePaymentProvider, PaymentException
-from pretix.base.services.mail import SendMailException
 from pretix.base.settings import SettingsSandbox
-from pretix.multidomain.urlreverse import build_absolute_uri
+from pretix.multidomain.urlreverse import eventreverse_absolute
 from pretix.plugins.paypal.api import Api
 from pretix.plugins.paypal.models import ReferencedPayPalObject
 
@@ -118,7 +119,7 @@ class Paypal(BasePaymentProvider):
                      )
                  )),
                 ('secret',
-                 forms.CharField(
+                 SecretKeySettingsField(
                      label=_('Secret'),
                      max_length=80,
                      min_length=80,
@@ -228,7 +229,10 @@ class Paypal(BasePaymentProvider):
             kwargs['cart_namespace'] = request.resolver_match.kwargs['cart_namespace']
 
         try:
-            if request.event.settings.payment_paypal_connect_user_id:
+            if self.settings.connect_client_id and not self.settings.secret:
+                if not request.event.settings.payment_paypal_connect_user_id:
+                    raise PaymentException('Payment method misconfigured')
+
                 try:
                     tokeninfo = Tokeninfo.create_with_refresh_token(request.event.settings.payment_paypal_connect_refresh_token)
                 except BadRequest as ex:
@@ -264,8 +268,8 @@ class Paypal(BasePaymentProvider):
                     "payment_method": "paypal",
                 },
                 "redirect_urls": {
-                    "return_url": build_absolute_uri(request.event, 'plugins:paypal:return', kwargs=kwargs),
-                    "cancel_url": build_absolute_uri(request.event, 'plugins:paypal:abort', kwargs=kwargs),
+                    "return_url": eventreverse_absolute(request.event, 'plugins:paypal:return', kwargs=kwargs),
+                    "cancel_url": eventreverse_absolute(request.event, 'plugins:paypal:abort', kwargs=kwargs),
                 },
                 "transactions": [
                     {
@@ -347,7 +351,7 @@ class Paypal(BasePaymentProvider):
                     if request.session.get('iframe_session', False):
                         signer = signing.Signer(salt='safe-redirect')
                         return (
-                            build_absolute_uri(request.event, 'plugins:paypal:redirect') + '?url=' +
+                            eventreverse_absolute(request.event, 'plugins:paypal:redirect') + '?url=' +
                             urllib.parse.quote(signer.sign(link.href))
                         )
                     else:
@@ -423,6 +427,9 @@ class Paypal(BasePaymentProvider):
             except paypalrestsdk.exceptions.ConnectionError as e:
                 messages.error(request, _('We had trouble communicating with PayPal'))
                 logger.exception('Error on creating payment: ' + str(e))
+            except RequestException as e:
+                messages.error(request, _('We had trouble communicating with PayPal'))
+                logger.exception('Error on creating payment: ' + str(e))
 
         for trans in payment.transactions:
             for rr in trans.related_resources:
@@ -460,9 +467,6 @@ class Paypal(BasePaymentProvider):
             payment_obj.confirm()
         except Quota.QuotaExceededException as e:
             raise PaymentException(str(e))
-
-        except SendMailException:
-            messages.warning(request, _('There was an error sending the confirmation mail.'))
         return None
 
     def payment_pending_render(self, request, payment) -> str:
@@ -609,8 +613,8 @@ class Paypal(BasePaymentProvider):
                     "payment_method": "paypal",
                 },
                 "redirect_urls": {
-                    "return_url": build_absolute_uri(request.event, 'plugins:paypal:return'),
-                    "cancel_url": build_absolute_uri(request.event, 'plugins:paypal:abort'),
+                    "return_url": eventreverse_absolute(request.event, 'plugins:paypal:return'),
+                    "cancel_url": eventreverse_absolute(request.event, 'plugins:paypal:abort'),
                 },
                 "transactions": [
                     {

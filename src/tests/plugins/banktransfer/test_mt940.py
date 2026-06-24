@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -215,13 +215,13 @@ EXPECTED = [
          'payer': 'MUELLER',
          'iban': '234567',
          'bic': '10020030',
-         'reference': 'NONREF//55555\nMiete November'},
+         'reference': 'NONREF\n55555\nMiete November'},
         {'amount': '3000.00',
          'date': '2002-11-02',
          'payer': 'MUELLER',
          'iban': '0847564700',
          'bic': '50060400',
-         'reference': 'NONREF//55555\nGehalt OktoberFirma Mustermann GmbH'},
+         'reference': 'NONREF\n55555\nGehalt OktoberFirma Mustermann GmbH'},
     ],
     [
         {'amount': '-400.62',
@@ -245,11 +245,11 @@ EXPECTED = [
          'payer': 'PETER PETERSEN',
          'iban': '5555555555',
          'bic': '50050050',
-         'reference': 'NONREF//00000000\nRECHNUNG 20120165PETER PETERSEN\n0001'}
+         'reference': 'NONREF\n000000000001\nRECHNUNG 20120165PETER PETERSEN'}
     ],
     [
         {'amount': '5000.00', 'date': '2002-03-17',
-         'reference': '68790452\nVerwendungszweck 1\nVerwendungszweck 2\nEmpfÃ¤nger\nBuchungstext\n12345\n1000\n4711'},
+         'reference': '68790452\nVerwendungszweck 1\nVerwendungszweck 2\nEmpf√§nger\nBuchungstext\n12345\n1000\n4711'},
         {'amount': '20000.00', 'date': '2002-03-22', 'reference': ''},
         {'amount': '20000.00', 'date': '2002-03-22', 'reference': ''},
         {'amount': '20000.00', 'date': '2002-03-22', 'reference': ''},

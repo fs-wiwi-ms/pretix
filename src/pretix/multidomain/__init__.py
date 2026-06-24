@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -33,12 +33,20 @@
 # License for the specific language governing permissions and limitations under the License.
 
 from django.urls import URLPattern
-from django.urls.resolvers import RegexPattern
+from django.urls.resolvers import RegexPattern, RoutePattern
 
 
 def event_url(route, view, name=None, require_live=True):
     if callable(view):
         pattern = RegexPattern(route, name=name, is_endpoint=True)
+        pattern._require_live = require_live
+        return URLPattern(pattern, view, {}, name)
+    raise TypeError('view must be a callable.')
+
+
+def event_path(route, view, name=None, require_live=True):
+    if callable(view):
+        pattern = RoutePattern(route, name=name, is_endpoint=True)
         pattern._require_live = require_live
         return URLPattern(pattern, view, {}, name)
     raise TypeError('view must be a callable.')

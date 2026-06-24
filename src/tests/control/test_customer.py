@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -31,6 +31,7 @@ from tests.base import extract_form_fields
 from pretix.base.models import (
     Item, Order, OrderPosition, Organizer, Team, User,
 )
+from pretix.base.models.customers import CustomerSSOProvider
 
 
 @pytest.fixture
@@ -67,6 +68,7 @@ def order(event, customer):
         email='admin@localhost',
         datetime=now() - timedelta(days=3),
         expires=now() + timedelta(days=11),
+        sales_channel=event.organizer.sales_channels.get(identifier="web"),
         total=Decimal("23"),
     )
     OrderPosition.objects.create(
@@ -83,11 +85,21 @@ def order(event, customer):
 def admin_user(organizer):
     u = User.objects.create_user('dummy@dummy.dummy', 'dummy')
     admin_team = Team.objects.create(
-        organizer=organizer, can_manage_customers=True, can_change_organizer_settings=True,
+        organizer=organizer, all_organizer_permissions=True,
         name='Admin team'
     )
     admin_team.members.add(u)
     return u
+
+
+@pytest.fixture
+def provider(organizer):
+    return CustomerSSOProvider.objects.create(
+        organizer=organizer,
+        method="oidc",
+        name="OIDC OP",
+        configuration={}
+    )
 
 
 @pytest.mark.django_db
@@ -123,6 +135,25 @@ def test_customer_update(organizer, admin_user, customer, client):
     customer.refresh_from_db()
     assert customer.name == 'John Doe'
     assert customer.is_verified
+
+
+@pytest.mark.django_db
+def test_customer_update_email_not_allowed_for_sso_customers(organizer, admin_user, customer, client, provider):
+    customer.provider = provider
+    customer.save()
+    client.login(email='dummy@dummy.dummy', password='dummy')
+    resp = client.get('/control/organizer/dummy/customer/{}/edit'.format(customer.identifier))
+    doc = BeautifulSoup(resp.content, "lxml")
+    d = extract_form_fields(doc)
+    d['name_parts_0'] = 'John Doe'
+    d['email'] = 'customer@example.net'
+    d['external_identifier'] = 'aaaaaaa'
+    resp = client.post('/control/organizer/dummy/customer/{}/edit'.format(customer.identifier), d)
+    assert resp.status_code == 302
+    customer.refresh_from_db()
+    assert customer.name == 'John Doe'
+    assert customer.email == "john@example.org"
+    assert not customer.external_identifier
 
 
 @pytest.mark.django_db

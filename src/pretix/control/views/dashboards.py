@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -34,10 +34,11 @@
 
 from datetime import timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
-import pytz
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
+from django.contrib.humanize.templatetags.humanize import intcomma
 from django.db.models import (
     Count, IntegerField, Max, Min, OuterRef, Prefetch, Q, Subquery, Sum,
 )
@@ -47,11 +48,10 @@ from django.http import JsonResponse
 from django.shortcuts import render
 from django.template.loader import get_template
 from django.urls import reverse
-from django.utils import formats
 from django.utils.formats import date_format
 from django.utils.html import escape
 from django.utils.timezone import now
-from django.utils.translation import gettext_lazy as _, pgettext, ungettext
+from django.utils.translation import gettext_lazy as _, ngettext, pgettext
 
 from pretix.base.decimal import round_decimal
 from pretix.base.models import (
@@ -60,13 +60,14 @@ from pretix.base.models import (
 )
 from pretix.base.services.quotas import QuotaAvailability
 from pretix.base.timeline import timeline_for_event
-from pretix.control.forms.event import CommentForm
 from pretix.control.signals import (
     event_dashboard_widgets, user_dashboard_widgets,
 )
 from pretix.helpers.daterange import daterange
 
 from ...base.models.orders import CancellationRequest
+from ...base.models.organizer import TeamQuerySet
+from ...base.templatetags.money import money_filter
 from ..logdisplay import OVERVIEW_BANLIST
 
 NUM_WIDGET = '<div class="numwidget"><span class="num">{num}</span><span class="text">{text}</span></div>'
@@ -111,7 +112,7 @@ def base_widgets(sender, subevent=None, lazy=False, **kwargs):
 
     return [
         {
-            'content': None if lazy else NUM_WIDGET.format(num=tickc, text=_('Attendees (ordered)')),
+            'content': None if lazy else NUM_WIDGET.format(num=intcomma(tickc), text=_('Attendees (ordered)')),
             'lazy': 'attendees-ordered',
             'display_size': 'small',
             'priority': 100,
@@ -121,7 +122,7 @@ def base_widgets(sender, subevent=None, lazy=False, **kwargs):
             }) + ('?subevent={}'.format(subevent.pk) if subevent else '')
         },
         {
-            'content': None if lazy else NUM_WIDGET.format(num=paidc, text=_('Attendees (paid)')),
+            'content': None if lazy else NUM_WIDGET.format(num=intcomma(paidc), text=_('Attendees (paid)')),
             'lazy': 'attendees-paid',
             'display_size': 'small',
             'priority': 100,
@@ -132,7 +133,9 @@ def base_widgets(sender, subevent=None, lazy=False, **kwargs):
         },
         {
             'content': None if lazy else NUM_WIDGET.format(
-                num=formats.localize(round_decimal(rev, sender.currency)), text=_('Total revenue ({currency})').format(currency=sender.currency)),
+                num=money_filter(round_decimal(rev, sender.currency), sender.currency, hide_currency=True),
+                text=_('Total revenue ({currency})').format(currency=sender.currency)
+            ),
             'lazy': 'total-revenue',
             'display_size': 'small',
             'priority': 100,
@@ -198,16 +201,16 @@ def waitinglist_widgets(sender, subevent=None, lazy=False, **kwargs):
                     else item.check_quotas(subevent=subevent, count_waitinglist=False, _cache=quota_cache)
                 )
                 if row[1] is None:
-                    happy += 1
+                    happy += wlt['cnt']
                 elif row[1] > 0:
-                    happy += 1
+                    happy += min(wlt['cnt'], row[1])
                     for q in quotas:
                         if q.size is not None:
-                            quota_cache[q.pk] = (quota_cache[q.pk][0], quota_cache[q.pk][1] - 1)
+                            quota_cache[q.pk] = (quota_cache[q.pk][0], quota_cache[q.pk][1] - min(wlt['cnt'], row[1]))
 
         widgets.append({
             'content': None if lazy else NUM_WIDGET.format(
-                num=str(happy), text=_('available to give to people on waiting list')
+                num=intcomma(happy), text=_('available to give to people on waiting list')
             ),
             'lazy': 'waitinglist-avail',
             'priority': 50,
@@ -217,7 +220,7 @@ def waitinglist_widgets(sender, subevent=None, lazy=False, **kwargs):
             })
         })
         widgets.append({
-            'content': None if lazy else NUM_WIDGET.format(num=str(wles.count()), text=_('total waiting list length')),
+            'content': None if lazy else NUM_WIDGET.format(num=intcomma(wles.count()), text=_('total waiting list length')),
             'lazy': 'waitinglist-length',
             'display_size': 'small',
             'priority': 50,
@@ -245,7 +248,7 @@ def quota_widgets(sender, subevent=None, lazy=False, **kwargs):
             status, left = qa.results[q] if q in qa.results else q.availability(allow_cache=True)
         widgets.append({
             'content': None if lazy else NUM_WIDGET.format(
-                num='{}/{}'.format(left, q.size) if q.size is not None else '\u221e',
+                num='{}/{}'.format(intcomma(left), intcomma(q.size)) if q.size is not None else '\u221e',
                 text=_('{quota} left').format(quota=escape(q.name))
             ),
             'lazy': 'quota-{}'.format(q.pk),
@@ -297,7 +300,7 @@ def checkin_widget(sender, subevent=None, lazy=False, **kwargs):
     for cl in qs:
         widgets.append({
             'content': None if lazy else NUM_WIDGET.format(
-                num='{}/{}'.format(cl.inside_count, cl.position_count),
+                num='{}/{}'.format(intcomma(cl.inside_count), intcomma(cl.position_count)),
                 text=_('Present – {list}').format(list=escape(cl.name))
             ),
             'lazy': 'checkin-{}'.format(cl.pk),
@@ -338,6 +341,8 @@ def welcome_wizard_widget(sender, **kwargs):
 
 
 def event_index(request, organizer, event):
+    from pretix.control.forms.event import CommentForm
+
     subevent = None
     if request.GET.get("subevent", "") != "" and request.event.has_subevents:
         i = request.GET.get("subevent", "")
@@ -346,10 +351,10 @@ def event_index(request, organizer, event):
         except SubEvent.DoesNotExist:
             pass
 
-    can_view_orders = request.user.has_event_permission(request.organizer, request.event, 'can_view_orders',
+    can_view_orders = request.user.has_event_permission(request.organizer, request.event, 'event.orders:read',
                                                         request=request)
     can_change_event_settings = request.user.has_event_permission(request.organizer, request.event,
-                                                                  'can_change_event_settings', request=request)
+                                                                  'event.settings.general:write', request=request)
 
     widgets = []
     if can_view_orders:
@@ -379,6 +384,10 @@ def event_index(request, organizer, event):
     ).exists()
     ctx['has_cancellation_requests'] = can_view_orders and CancellationRequest.objects.filter(
         order__event=request.event
+    ).exists()
+    ctx['has_sync_problems'] = can_change_event_settings and request.event.queued_sync_jobs.filter(
+        Q(need_manual_retry__isnull=False)
+        | Q(failed_attempts__gt=0)
     ).exists()
 
     ctx['timeline'] = [
@@ -417,11 +426,11 @@ def event_index_log_lazy(request, organizer, event):
                                                          'device').order_by('-datetime')
     qs = qs.exclude(action_type__in=OVERVIEW_BANLIST)
 
-    can_view_orders = request.user.has_event_permission(request.organizer, request.event, 'can_view_orders',
+    can_view_orders = request.user.has_event_permission(request.organizer, request.event, 'event.orders:read',
                                                         request=request)
     can_change_event_settings = request.user.has_event_permission(request.organizer, request.event,
-                                                                  'can_change_event_settings', request=request)
-    can_view_vouchers = request.user.has_event_permission(request.organizer, request.event, 'can_view_vouchers',
+                                                                  'event.settings.general:write', request=request)
+    can_view_vouchers = request.user.has_event_permission(request.organizer, request.event, 'event.vouchers:read',
                                                           request=request)
 
     if not can_view_orders:
@@ -433,7 +442,7 @@ def event_index_log_lazy(request, organizer, event):
             ContentType.objects.get_for_model(Voucher),
             ContentType.objects.get_for_model(Order)
         ]
-        if request.user.has_event_permission(request.organizer, request.event, 'can_change_items', request=request):
+        if request.user.has_event_permission(request.organizer, request.event, 'event.items:write', request=request):
             allowed_types += [
                 ContentType.objects.get_for_model(Item),
                 ContentType.objects.get_for_model(ItemCategory),
@@ -483,8 +492,13 @@ def widgets_for_event_qs(request, qs, user, nmax, lazy=False):
     # Get set of events where we have the permission to show the # of orders
     if not lazy:
         events_with_orders = set(qs.filter(
-            Q(organizer_id__in=user.teams.filter(all_events=True, can_view_orders=True).values_list('organizer', flat=True))
-            | Q(id__in=user.teams.filter(can_view_orders=True).values_list('limit_events__id', flat=True))
+            Q(organizer_id__in=user.teams.filter(
+                TeamQuerySet.event_permission_q("event.orders:read"),
+                all_events=True,
+            ).values_list('organizer', flat=True))
+            | Q(id__in=user.teams.filter(
+                TeamQuerySet.event_permission_q("event.orders:read"),
+            ).values_list('limit_events__id', flat=True))
         ).values_list('id', flat=True))
 
     tpl = """
@@ -510,7 +524,7 @@ def widgets_for_event_qs(request, qs, user, nmax, lazy=False):
     for event in events:
         if not lazy:
             tzname = event.cache.get_or_set('timezone', lambda: event.settings.timezone)
-            tz = pytz.timezone(tzname)
+            tz = ZoneInfo(tzname)
             if event.has_subevents:
                 if event.min_from is None:
                     dr = pgettext("subevent", "No dates")
@@ -555,7 +569,7 @@ def widgets_for_event_qs(request, qs, user, nmax, lazy=False):
                             'event': event.slug,
                             'organizer': event.organizer.slug
                         }),
-                        orders_text=ungettext('{num} order', '{num} orders', event.order_count or 0).format(
+                        orders_text=ngettext('{num} order', '{num} orders', event.order_count or 0).format(
                             num=event.order_count or 0
                         )
                     ) if user.has_active_staff_session(request.session.session_key) or event.pk in events_with_orders else ''
@@ -627,7 +641,7 @@ def user_index(request):
 
     ctx = {
         'widgets': rearrange(widgets),
-        'can_create_event': request.user.teams.filter(can_create_events=True).exists(),
+        'can_create_event': request.user.teams.with_organizer_permission("organizer.events:create").exists() or request.user.is_staff,
         'upcoming': widgets_for_event_qs(
             request,
             annotated_event_query(request, lazy=True).filter(

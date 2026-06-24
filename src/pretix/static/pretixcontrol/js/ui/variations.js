@@ -6,7 +6,18 @@ $(function () {
     }
 
     function update_variation_summary($el) {
-        var var_name = $el.find("input[name*=-value_]").filter(function () {return !!this.value}).first().val();
+        var var_names = Object.fromEntries(
+          $el
+            .find("input[name*=-value_]")
+            .filter(function () {
+              return !!this.value;
+            })
+            .map(function () {
+              return [[this.getAttribute("lang"), this.value]];
+            })
+            .get()
+        );
+        var var_name = i18nToString(var_names);
         var price = $el.find("input[name*=-default_price]").val();
         if (price) {
             var currency = $el.find("[name*=-default_price] + .input-group-addon").text();
@@ -34,9 +45,15 @@ $(function () {
         $el.find(".variation-error").toggleClass("hidden", !(
             $el.find(".alert-danger, .has-error").length
         ));
-        $el.find("input[name$=-sales_channels]").each(function () {
+        $el.find("input[name$=-limit_sales_channels]").each(function () {
             $el.find(".variation-channel-" + $(this).val()).toggleClass("variation-icon-hidden", !(
-                $(this).prop("checked") && $("input[name=sales_channels][value=" + $(this).val() + "]").prop("checked")
+                (
+                    $(this).closest("[data-formset-form]").find("input[name$=-all_sales_channels]").prop("checked") ||
+                    $(this).prop("checked")
+                ) && (
+                    $("input[name=all_sales_channels]").prop("checked") ||
+                    $("input[name=limit_sales_channels][value=" + $(this).val() + "]").prop("checked")
+                )
             ));
         })
     }
@@ -46,13 +63,12 @@ $(function () {
         update_variation_summary($el);
         $(this).on("change dp.change", "input", function () {update_variation_summary($el)});
     });
-    $("input[name=sales_channels]").on("change", function() {
+    $("input[name=limit_sales_channels] input[name=all_sales_channels]").on("change", function() {
         $("#item_variations [data-formset-form]").each(function () {
             update_variation_summary($(this));
         });
     });
     $("#item_variations").on("formAdded", "details", function (event) {
-        console.log("added", event.target)
         var $el = $(event.target);
         update_variation_summary($el);
         $(this).on("change dp.change", "input", function () {update_variation_summary($el)});

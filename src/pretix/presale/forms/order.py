@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -42,6 +42,7 @@ class OrderPositionChangeForm(forms.Form):
         invoice_address = kwargs.pop('invoice_address')
         initial = kwargs.get('initial', {})
         event = kwargs.pop('event')
+        hide_prices = kwargs.pop('hide_prices')
         quota_cache = kwargs.pop('quota_cache')
         kwargs['initial'] = initial
         if instance.variation_id:
@@ -72,10 +73,15 @@ class OrderPositionChangeForm(forms.Form):
             quota_cache.update(qa.results)
 
             for v in variations:
-
                 label = f'{i.name} – {v.value}'
                 if instance.variation_id == v.id:
                     choices.append((f'{i.pk}-{v.pk}', label))
+                    continue
+
+                if instance.voucher and not instance.voucher.applies_to(i, v):
+                    continue
+
+                if v.hide_without_voucher and not (instance.voucher and instance.voucher.show_hidden_items):
                     continue
 
                 if not v.active:
@@ -92,7 +98,8 @@ class OrderPositionChangeForm(forms.Form):
                 new_price = get_price(i, v, voucher=instance.voucher, subevent=instance.subevent,
                                       invoice_address=invoice_address)
                 current_price = TaxedPrice(tax=instance.tax_value, gross=instance.price, net=instance.price - instance.tax_value,
-                                           name=instance.tax_rule.name if instance.tax_rule else '', rate=instance.tax_rate)
+                                           name=instance.tax_rule.name if instance.tax_rule else '', rate=instance.tax_rate,
+                                           code=instance.tax_code)
                 if new_price.gross < current_price.gross and event.settings.change_allow_user_price == 'gte':
                     continue
                 if new_price.gross <= current_price.gross and event.settings.change_allow_user_price == 'gt':
@@ -100,23 +107,24 @@ class OrderPositionChangeForm(forms.Form):
                 if new_price.gross != current_price.gross and event.settings.change_allow_user_price == 'eq':
                     continue
 
-                if new_price.gross < current_price.gross:
-                    if event.settings.display_net_prices:
-                        label += ' (- {} {})'.format(money_filter(current_price.gross - new_price.gross, event.currency), _('plus taxes'))
-                    else:
-                        label += ' (- {})'.format(money_filter(current_price.gross - new_price.gross, event.currency))
-                elif current_price.gross < new_price.gross:
-                    if event.settings.display_net_prices:
-                        label += ' ({}{} {})'.format(
-                            '+ ' if current_price.gross != Decimal('0.00') else '',
-                            money_filter(new_price.gross - current_price.gross, event.currency),
-                            _('plus taxes')
-                        )
-                    else:
-                        label += ' ({}{})'.format(
-                            '+ ' if current_price.gross != Decimal('0.00') else '',
-                            money_filter(new_price.gross - current_price.gross, event.currency)
-                        )
+                if not hide_prices:
+                    if new_price.gross < current_price.gross:
+                        if event.settings.display_net_prices:
+                            label += ' (- {} {})'.format(money_filter(current_price.gross - new_price.gross, event.currency), _('plus taxes'))
+                        else:
+                            label += ' (- {})'.format(money_filter(current_price.gross - new_price.gross, event.currency))
+                    elif current_price.gross < new_price.gross:
+                        if event.settings.display_net_prices:
+                            label += ' ({}{} {})'.format(
+                                '+ ' if current_price.gross != Decimal('0.00') else '',
+                                money_filter(new_price.gross - current_price.gross, event.currency),
+                                _('plus taxes')
+                            )
+                        else:
+                            label += ' ({}{})'.format(
+                                '+ ' if current_price.gross != Decimal('0.00') else '',
+                                money_filter(new_price.gross - current_price.gross, event.currency)
+                            )
 
                 choices.append((f'{i.pk}-{v.pk}', label))
 

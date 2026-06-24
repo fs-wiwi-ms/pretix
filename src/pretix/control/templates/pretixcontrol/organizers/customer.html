@@ -1,7 +1,9 @@
 {% extends "pretixcontrol/organizers/base.html" %}
 {% load i18n %}
 {% load bootstrap3 %}
+{% load icon %}
 {% load money %}
+{% load static %}
 {% block title %}
     {% blocktrans trimmed with id=customer.identifier %}
         Customer #{{ id }}
@@ -22,63 +24,87 @@
                     </h3>
                 </div>
                 <div class="panel-body">
-                    <form action="" method="post">
+                    <form action="" method="post" class="row">
                         {% csrf_token %}
-                        <dl class="dl-horizontal">
-                            <dt>{% trans "Customer ID" %}</dt>
-                            <dd>#{{ customer.identifier }}</dd>
-                        {% if customer.external_identifier %}
-                            <dt>{% trans "External identifier" %}</dt>
-                            <dd>{{ customer.external_identifier }}</dd>
-                        {% endif %}
-                            <dt>{% trans "Status" %}</dt>
-                            <dd>
-                                {% if not customer.is_active %}
-                                    {% trans "disabled" %}
-                                {% elif not customer.is_verified %}
-                                    {% trans "not yet activated" %}
-                                {% else %}
-                                    {% trans "active" %}
+                        <dl class="dl-horizontal col-lg-6 col-sm-12">
+                                <dt>{% trans "Customer ID" %}</dt>
+                                <dd>#{{ customer.identifier }}</dd>
+                                {% if customer.provider %}
+                                    <dt>{% trans "SSO provider" %}</dt>
+                                    <dd>{{ customer.provider.name }}</dd>
                                 {% endif %}
-                            </dd>
-                            <dt>{% trans "E-mail" %}</dt>
-                            <dd>
-                                {{ customer.email|default_if_none:"" }}
-                                {% if customer.email %}
-                                    <button type="submit" name="action" value="pwreset" class="btn btn-xs btn-default">
-                                    {% trans "Send password reset link" %}
-                                    </button>
+                                {% if customer.external_identifier %}
+                                    <dt>{% trans "External identifier" %}</dt>
+                                    <dd>{{ customer.external_identifier }}</dd>
                                 {% endif %}
-                            </dd>
-                            <dt>{% trans "Name" %}</dt>
-                            <dd>{{ customer.name }}</dd>
-                        {% if customer.phone %}
-                            <dt>{% trans "Phone" %}</dt>
-                            <dd>{{ customer.phone }}</dd>
-                        {% endif %}
-                            <dt>{% trans "Locale" %}</dt>
-                            <dd>{{ display_locale }}</dd>
-                            <dt>{% trans "Registration date" %}</dt>
-                            <dd>{{ customer.date_joined|date:"SHORT_DATETIME_FORMAT" }}</dd>
-                            <dt>{% trans "Last login" %}</dt>
-                            <dd>{% if customer.last_login %}{{ customer.last_login|date:"SHORT_DATETIME_FORMAT" }}{% else %}
-                                –{% endif %}</dd>
-                        {% if customer.notes %}
-                            <dt>{% trans "Notes" %}</dt>
-                            <dd>{{ customer.notes|linebreaks }}</dd>
+                                <dt>{% trans "Status" %}</dt>
+                                <dd>
+                                    {% if not customer.is_active %}
+                                        {% trans "disabled" %}
+                                    {% elif not customer.is_verified %}
+                                        {% trans "not yet activated" %}
+                                    {% else %}
+                                        {% trans "active" %}
+                                    {% endif %}
+                                </dd>
+                                <dt>{% trans "Email" %}</dt>
+                                <dd>
+                                    {{ customer.email|default_if_none:"" }}
+                                    {% if customer.email and not customer.provider %}
+                                        <button type="submit" name="action" value="pwreset" class="btn btn-xs btn-default">
+                                        {% trans "Send password reset link" %}
+                                        </button>
+                                    {% endif %}
+                                </dd>
+                                <dt>{% trans "Name" %}</dt>
+                                <dd>{{ customer.name }}</dd>
+                            {% if customer.phone %}
+                                <dt>{% trans "Phone" %}</dt>
+                                <dd>{{ customer.phone }}</dd>
+                            {% endif %}
+                                <dt>{% trans "Locale" %}</dt>
+                                <dd>{{ display_locale }}</dd>
+                                <dt>{% trans "Registration date" %}</dt>
+                                <dd>{{ customer.date_joined|date:"SHORT_DATETIME_FORMAT" }}</dd>
+                                <dt>{% trans "Last login" %}</dt>
+                                <dd>{% if customer.last_login %}{{ customer.last_login|date:"SHORT_DATETIME_FORMAT" }}{% else %}
+                                    –{% endif %}</dd>
+                            {% if customer.notes %}
+                                <dt>{% trans "Notes" %}</dt>
+                                <dd>{{ customer.notes|linebreaks }}</dd>
+                            {% endif %}
+                        </dl>
+                        <dl class="col-lg-6 col-sm-12 text-right">
+                            <dt class="text-muted"
+                                data-toggle="tooltip"
+                                title="{% trans "This includes all paid orders by this customer across all your events." %}">
+                                {% trans "Lifetime spending" %}
+                            </dt>
+                        {% if lifetime_spending %}
+                            {% for s in lifetime_spending %}
+                                {% if s.spending >= 0 %}
+                                    <dd class="text-success text-h3">{{ s.spending|money:s.currency }}</dd>
+                                {% elif s.spending < 0 %}
+                                    <dd class="text-error text-h3">{{ s.spending|money:s.currency }}</dd>
+                                {% endif %}
+                            {% endfor %}
+                        {% else %}
+                            <dd class="text-muted text-h3">{{ 0|floatformat:2 }}</dd>
                         {% endif %}
                         </dl>
                     </form>
-                    <div class="text-right">
-                        <a href="{% url "control:organizer.customer.edit" organizer=request.organizer.slug customer=customer.identifier %}"
-                                class="btn btn-default">
-                            <i class="fa fa-edit"></i> {% trans "Edit" %}
-                        </a>
-                        <a href="{% url "control:organizer.customer.anonymize" organizer=request.organizer.slug customer=customer.identifier %}"
-                                class="btn btn-danger">
-                            <i class="fa fa-trash"></i> {% trans "Anonymize" %}
-                        </a>
-                    </div>
+                    {% if "organizer.customers:write" in request.orgapermset %}
+                        <div class="text-right">
+                            <a href="{% url "control:organizer.customer.edit" organizer=request.organizer.slug customer=customer.identifier %}"
+                                    class="btn btn-default">
+                                <i class="fa fa-edit"></i> {% trans "Edit" %}
+                            </a>
+                            <a href="{% url "control:organizer.customer.anonymize" organizer=request.organizer.slug customer=customer.identifier %}"
+                                    class="btn btn-danger">
+                                <i class="fa fa-trash"></i> {% trans "Anonymize" %}
+                            </a>
+                        </div>
+                    {% endif %}
                 </div>
             </div>
             <div class="panel panel-default items">
@@ -138,35 +164,39 @@
                                 </div>
                             </td>
                             <td class="text-right flip">
-                                <a href="{% url "control:organizer.customer.membership.edit" organizer=request.organizer.slug customer=customer.identifier id=m.pk %}"
-                                        data-toggle="tooltip"
-                                        title="{% trans "Edit" %}"
-                                        class="btn btn-default">
-                                    <i class="fa fa-edit"></i>
-                                </a>
-                                {% if m.testmode %}
-                                    <a href="{% url "control:organizer.customer.membership.delete" organizer=request.organizer.slug customer=customer.identifier id=m.pk %}"
+                                {% if "organizer.customers:write" in request.orgapermset %}
+                                    <a href="{% url "control:organizer.customer.membership.edit" organizer=request.organizer.slug customer=customer.identifier id=m.pk %}"
                                             data-toggle="tooltip"
-                                            title="{% trans "Delete" %}"
-                                            class="btn btn-danger">
-                                        <i class="fa fa-trash"></i>
+                                            title="{% trans "Edit" %}"
+                                            class="btn btn-default">
+                                        <i class="fa fa-edit"></i>
                                     </a>
+                                    {% if m.testmode %}
+                                        <a href="{% url "control:organizer.customer.membership.delete" organizer=request.organizer.slug customer=customer.identifier id=m.pk %}"
+                                                data-toggle="tooltip"
+                                                title="{% trans "Delete" %}"
+                                                class="btn btn-danger">
+                                            <i class="fa fa-trash"></i>
+                                        </a>
+                                    {% endif %}
                                 {% endif %}
                             </td>
                         </tr>
                     {% endfor %}
                     </tbody>
-                    <tfoot>
-                    <tr>
-                        <td colspan="7">
-                            <a href="{% url "control:organizer.customer.membership.add" organizer=request.organizer.slug customer=customer.identifier %}"
-                                    class="btn btn-default">
-                                <i class="fa fa-plus"></i>
-                                {% trans "Add membership" %}
-                            </a>
-                        </td>
-                    </tr>
-                    </tfoot>
+                    {% if "organizer.customers:write" in request.orgapermset %}
+                        <tfoot>
+                        <tr>
+                            <td colspan="7">
+                                <a href="{% url "control:organizer.customer.membership.add" organizer=request.organizer.slug customer=customer.identifier %}"
+                                        class="btn btn-default">
+                                    <i class="fa fa-plus"></i>
+                                    {% trans "Add membership" %}
+                                </a>
+                            </td>
+                        </tr>
+                        </tfoot>
+                    {% endif %}
                 </table>
             </div>
             <div class="panel panel-default items">
@@ -203,8 +233,13 @@
                                 {{ o.event }}
                             </td>
                             <td>
-                            <span class="fa fa-{{ o.sales_channel_obj.icon }} text-muted"
-                                    data-toggle="tooltip" title="{% trans o.sales_channel_obj.verbose_name %}"></span>
+                                {% if "." in o.sales_channel.icon %}
+                                    <img src="{% static o.sales_channel.icon %}" class="fa-like-image"
+                                          data-toggle="tooltip" title="{{ o.sales_channel.label }}">
+                                {% else %}
+                                    <span class="fa fa-{{ o.sales_channel.icon }} text-muted"
+                                          data-toggle="tooltip" title="{{ o.sales_channel.label }}"></span>
+                                {% endif %}
                                 {{ o.datetime|date:"SHORT_DATETIME_FORMAT" }}
                                 {% if o.customer_id != customer.pk %}
                                     <span class="fa fa-link text-muted"
@@ -250,6 +285,59 @@
                 </table>
                 {% include "pretixcontrol/pagination.html" %}
             </div>
+            <div class="panel panel-default items">
+                    <div class="panel-heading">
+                        <h3 class="panel-title">
+                            {% trans "Gift cards" %}
+                        </h3>
+                    </div>
+                    <table class="panel-body table">
+                        <thead>
+                        <tr>
+                            <th>{% trans "Gift card code" %}
+                            <th>{% trans "Creation date" %}
+                            <th>{% trans "Expiry date" %}
+                            <th>{% trans "Last transaction" %}
+                            <th class="text-right">{% trans "Current value" %}
+                            <th></th>
+                        </tr>
+                        </thead>
+                        <tbody>
+                        {% for gc in gift_cards %}
+                            <tr>
+                                <td>
+                                    {% if "organizer.giftcards:read" in request.orgapermset %}
+                                        <a href="{% url "control:organizer.giftcard" organizer=organizer.slug giftcard=gc.id %}">
+                                            <strong>{{ gc.secret }}</strong></a>
+                                    {% else %}
+                                        <strong>{{ gc.secret|slice:":3" }}…</strong>
+                                    {% endif %}
+                                    {% if gc.testmode %}
+                                        <span class="label label-warning">{% trans "TEST MODE" %}</span>
+                                    {% endif %}
+                                    {% if gc.expired %}
+                                        <span class="label label-danger">{% trans "Expired" %}</span>
+                                    {% endif %}
+                                </td>
+                                <td>{{ gc.issuance|date:"SHORT_DATETIME_FORMAT" }}</td>
+                                <td>{% if gc.expires %}{{ gc.expires|date:"SHORT_DATETIME_FORMAT" }}{% endif %}</td>
+                                <td>{% if gc.last_tx %}{{ gc.last_tx|date:"SHORT_DATETIME_FORMAT" }}{% endif %}</td>
+                                <td class="text-right flip">
+                                    <p class="text-right">{{ gc.value|money:gc.currency }}</p>
+                                </td>
+                                <td class="text-right">
+                                    {% if "organizer.giftcards:read" in request.orgapermset %}
+                                        <a href="{% url "control:organizer.giftcard" organizer=organizer.slug giftcard=gc.id %}"
+                                                class="btn btn-default btn-sm" data-toggle="tooltip" title="{% trans "Details" %}">
+                                            <i class="fa fa-eye"></i>
+                                        </a>
+                                    {% endif %}
+                                </td>
+                            </tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
         </div>
         <div class="col-md-2 col-xs-12">
             <div class="panel panel-default">

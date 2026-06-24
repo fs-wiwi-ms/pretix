@@ -16,6 +16,21 @@
             {% endif %}
         </small>
     </h1>
+    <div class="helper-space-below">
+        {% trans "Shop URL:" %}
+        <span id="shop_url" class="text-muted">{% abseventurl request.event "presale:event.index" %}</span>
+        <button type="button" class="btn btn-default btn-xs btn-clipboard js-only" data-clipboard-target="#shop_url">
+            <i class="fa fa-clipboard" aria-hidden="true"></i>
+            <span class="sr-only">{% trans "Copy to clipboard" %}</span>
+        </button>
+        <div class="btn-group helper-display-inline-block">
+            <button type="button" class="btn btn-default btn-xs dropdown-toggle" data-toggle="dropdown" title="{% trans "Create QR code" %}" aria-haspopup="true" aria-expanded="false">
+                <i class="fa fa-qrcode" aria-hidden="true"></i>
+            </button>
+            {% include "pretixcontrol/event/fragment_qr_dropdown.html" with url=0 %}
+        </div>
+        <div class="clearfix"></div>
+    </div>
     {% if has_overpaid_orders %}
         <div class="alert alert-warning">
             {% blocktrans trimmed %}
@@ -62,6 +77,15 @@
             {% endblocktrans %}
             <a href="{% url "control:event.orders" event=request.event.slug organizer=request.event.organizer.slug %}?status=pendingpaid"
                     class="btn btn-primary">{% trans "Show affected orders" %}</a>
+        </div>
+    {% endif %}
+    {% if has_sync_problems %}
+        <div class="alert alert-warning">
+            {% blocktrans trimmed %}
+                Orders in this event could not be <strong>synced to an external system</strong> as configured.
+            {% endblocktrans %}
+            <a href="{% url "control:event.datasync.failedjobs" event=request.event.slug organizer=request.event.organizer.slug %}"
+                    class="btn btn-primary">{% trans "Show sync problems" %}</a>
         </div>
     {% endif %}
     {% eventsignal request.event "pretix.control.signals.event_dashboard_top" request=request %}
@@ -131,22 +155,24 @@
             </form>
         </div>
     </div>
-    <div class="panel panel-default">
-        <div class="panel-heading">
-            <h3 class="panel-title">
-                {% trans "Event logs" %}
-            </h3>
-        </div>
-        <ul class="list-group" id="logs_target">
-            <div class="logs-lazy-loading">
-                <span class="fa fa-cog fa-4x"></span>
+    {% if "event.orders:read" in request.eventpermset or "event.orders:write" in request.eventpermset or "event.settings.general:write" in request.eventpermset or "event.items:write" in request.eventpermset %}
+        <div class="panel panel-default">
+            <div class="panel-heading">
+                <h3 class="panel-title">
+                    {% trans "Event logs" %}
+                </h3>
             </div>
-        </ul>
-        <div class="panel-footer">
-            <a href="{% url "control:event.log" event=request.event.slug organizer=request.event.organizer.slug %}">
-                {% trans "Show more logs" %}
-            </a>
+            <ul class="list-group" id="logs_target">
+                <div class="logs-lazy-loading">
+                    <span class="fa fa-cog fa-4x"></span>
+                </div>
+            </ul>
+            <div class="panel-footer">
+                <a href="{% url "control:event.log" event=request.event.slug organizer=request.event.organizer.slug %}">
+                    {% trans "Show more logs" %}
+                </a>
+            </div>
         </div>
-    </div>
+    {% endif %}
 
 {% endblock %}

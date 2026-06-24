@@ -20,8 +20,12 @@ id                                       integer                    Internal ID 
 active                                   boolean                    The discount will be ignored if this is ``false``
 internal_name                            string                     A name for the rule used in the backend
 position                                 integer                    An integer, used for sorting the rules which are applied in order
-sales_channels                           list of strings            Sales channels this discount is available on, such as
-                                                                    ``"web"`` or ``"resellers"``. Defaults to ``["web"]``.
+all_sales_channels                       boolean                    If ``true`` (default), the discount is available on all sales channels
+                                                                    that support discounts.
+limit_sales_channels                     list of strings            List of sales channel identifiers the discount is available on
+                                                                    if ``all_sales_channels`` is ``false``.
+sales_channels                           list of strings            **DEPRECATED.** Legacy interface, use ``all_sales_channels``
+                                                                    and ``limit_sales_channels`` instead.
 available_from                           datetime                   The first date time at which this discount can be applied
                                                                     (or ``null``).
 available_until                          datetime                   The last date time at which this discount can be applied
@@ -31,9 +35,13 @@ subevent_mode                            strings                    Determines h
                                                                     ``"same"`` (discount is only applied for groups within
                                                                     the same date), or ``"distinct"`` (discount is only applied
                                                                     for groups with no two same dates).
-condition_all_products                   boolean                    If ``true``, the discount applies to all items.
+subevent_date_from                       datetime                   The first date time of a subevent to which this discount can be applied
+                                                                    (or ``null``). Ignored in non-series events.
+subevent_date_until                      datetime                   The last date time of a subevent to which this discount can be applied
+                                                                    (or ``null``). Ignored in non-series events.
+condition_all_products                   boolean                    If ``true``, the discount condition applies to all items.
 condition_limit_products                 list of integers           If ``condition_all_products`` is not set, this is a list
-                                                                    of internal item IDs that the discount applies to.
+                                                                    of internal item IDs that the discount condition applies to.
 condition_apply_to_addons                boolean                    If ``true``, the discount applies to add-on products as well,
                                                                     otherwise it only applies to top-level items. The discount never
                                                                     applies to bundled products.
@@ -48,6 +56,17 @@ benefit_discount_matching_percent        decimal (string)           The percenta
 benefit_only_apply_to_cheapest_n_matches integer                    If set higher than 0, the discount will only be applied to
                                                                     the cheapest matches. Useful for a "3 for 2"-style discount.
                                                                     Cannot be combined with ``condition_min_value``.
+benefit_same_products                    boolean                    If ``true``, the discount benefit applies to the same set of items
+                                                                    as the condition (see above).
+benefit_limit_products                   list of integers           If ``benefit_same_products`` is not set, this is a list
+                                                                    of internal item IDs that the discount benefit applies to.
+benefit_apply_to_addons                  boolean                    (Only used if ``benefit_same_products`` is ``false``.)
+                                                                    If ``true``, the discount applies to add-on products as well,
+                                                                    otherwise it only applies to top-level items. The discount never
+                                                                    applies to bundled products.
+benefit_ignore_voucher_discounted        boolean                    (Only used if ``benefit_same_products`` is ``false``.)
+                                                                    If ``true``, the discount does not apply to products which have
+                                                                    been discounted by a voucher.
 ======================================== ========================== =======================================================
 
 
@@ -84,16 +103,24 @@ Endpoints
             "active": true,
             "internal_name": "3 for 2",
             "position": 1,
+            "all_sales_channels": false,
+            "limit_sales_channels": ["web"],
             "sales_channels": ["web"],
             "available_from": null,
             "available_until": null,
             "subevent_mode": "mixed",
+            "subevent_date_from": null,
+            "subevent_date_until": null,
             "condition_all_products": true,
             "condition_limit_products": [],
             "condition_apply_to_addons": true,
             "condition_ignore_voucher_discounted": false,
             "condition_min_count": 3,
             "condition_min_value": "0.00",
+            "benefit_same_products": true,
+            "benefit_limit_products": [],
+            "benefit_apply_to_addons": true,
+            "benefit_ignore_voucher_discounted": false,
             "benefit_discount_matching_percent": "100.00",
             "benefit_only_apply_to_cheapest_n_matches": 1
           }
@@ -136,16 +163,24 @@ Endpoints
         "active": true,
         "internal_name": "3 for 2",
         "position": 1,
+        "all_sales_channels": false,
+        "limit_sales_channels": ["web"],
         "sales_channels": ["web"],
         "available_from": null,
         "available_until": null,
         "subevent_mode": "mixed",
+        "subevent_date_from": null,
+        "subevent_date_until": null,
         "condition_all_products": true,
         "condition_limit_products": [],
         "condition_apply_to_addons": true,
         "condition_ignore_voucher_discounted": false,
         "condition_min_count": 3,
         "condition_min_value": "0.00",
+        "benefit_same_products": true,
+        "benefit_limit_products": [],
+        "benefit_apply_to_addons": true,
+        "benefit_ignore_voucher_discounted": false,
         "benefit_discount_matching_percent": "100.00",
         "benefit_only_apply_to_cheapest_n_matches": 1
       }
@@ -174,16 +209,24 @@ Endpoints
         "active": true,
         "internal_name": "3 for 2",
         "position": 1,
+        "all_sales_channels": false,
+        "limit_sales_channels": ["web"],
         "sales_channels": ["web"],
         "available_from": null,
         "available_until": null,
         "subevent_mode": "mixed",
+        "subevent_date_from": null,
+        "subevent_date_until": null,
         "condition_all_products": true,
         "condition_limit_products": [],
         "condition_apply_to_addons": true,
         "condition_ignore_voucher_discounted": false,
         "condition_min_count": 3,
         "condition_min_value": "0.00",
+        "benefit_same_products": true,
+        "benefit_limit_products": [],
+        "benefit_apply_to_addons": true,
+        "benefit_ignore_voucher_discounted": false,
         "benefit_discount_matching_percent": "100.00",
         "benefit_only_apply_to_cheapest_n_matches": 1
       }
@@ -201,16 +244,24 @@ Endpoints
         "active": true,
         "internal_name": "3 for 2",
         "position": 1,
+        "all_sales_channels": false,
+        "limit_sales_channels": ["web"],
         "sales_channels": ["web"],
         "available_from": null,
         "available_until": null,
         "subevent_mode": "mixed",
+        "subevent_date_from": null,
+        "subevent_date_until": null,
         "condition_all_products": true,
         "condition_limit_products": [],
         "condition_apply_to_addons": true,
         "condition_ignore_voucher_discounted": false,
         "condition_min_count": 3,
         "condition_min_value": "0.00",
+        "benefit_same_products": true,
+        "benefit_limit_products": [],
+        "benefit_apply_to_addons": true,
+        "benefit_ignore_voucher_discounted": false,
         "benefit_discount_matching_percent": "100.00",
         "benefit_only_apply_to_cheapest_n_matches": 1
       }
@@ -257,16 +308,24 @@ Endpoints
         "active": false,
         "internal_name": "3 for 2",
         "position": 1,
+        "all_sales_channels": false,
+        "limit_sales_channels": ["web"],
         "sales_channels": ["web"],
         "available_from": null,
         "available_until": null,
         "subevent_mode": "mixed",
+        "subevent_date_from": null,
+        "subevent_date_until": null,
         "condition_all_products": true,
         "condition_limit_products": [],
         "condition_apply_to_addons": true,
         "condition_ignore_voucher_discounted": false,
         "condition_min_count": 3,
         "condition_min_value": "0.00",
+        "benefit_same_products": true,
+        "benefit_limit_products": [],
+        "benefit_apply_to_addons": true,
+        "benefit_ignore_voucher_discounted": false,
         "benefit_discount_matching_percent": "100.00",
         "benefit_only_apply_to_cheapest_n_matches": 1
       }

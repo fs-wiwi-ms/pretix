@@ -1,4 +1,4 @@
-.. spelling::
+.. spelling:word-list::
 
    checkin
    datetime
@@ -44,6 +44,8 @@ identifier                            string                     An arbitrary st
 ask_during_checkin                    boolean                    If ``true``, this question will not be asked while
                                                                  buying the ticket, but will show up when redeeming
                                                                  the ticket instead.
+show_during_checkin                   boolean                    If ``true``, the answer to the question will be shown
+                                                                 during check-in (if the check-in client supports it).
 hidden                                boolean                    If ``true``, the question will only be shown in the
                                                                  backend.
 print_on_invoice                      boolean                    If ``true``, the question will only be shown on
@@ -63,6 +65,7 @@ valid_date_max                        date                       Maximum value f
 valid_datetime_min                    datetime                   Minimum value for date and time questions (optional)
 valid_datetime_max                    datetime                   Maximum value for date and time questions (optional)
 valid_file_portrait                   boolean                    Turn on file validation for portrait photos
+valid_string_length_max               integer                    Maximum length for string questions (optional)
 dependency_question                   integer                    Internal ID of a different question. The current
                                                                  question will only be shown if the question given in
                                                                  this attribute is set to the value given in
@@ -76,25 +79,12 @@ dependency_value                      string                     An old version 
                                                                  for one value. **Deprecated.**
 ===================================== ========================== =======================================================
 
-.. versionchanged:: 3.5
+.. versionchanged:: 2023.8
 
-  The attribute ``help_text`` has been added.
-
-.. versionchanged:: 3.14
-
-  The attributes ``valid_*`` have been added.
-
-.. versionchanged:: 3.18
-
-  The attribute ``valid_file_portrait`` have been added.
+   The ``show_during_checkin`` attribute has been added.
 
 Endpoints
 ---------
-
-.. versionchanged:: 1.15
-
-   The questions endpoint has been extended by the filter queries ``ask_during_checkin``, ``requred``, and
-   ``identifier``.
 
 .. http:get:: /api/v1/organizers/(organizer)/events/(event)/questions/
 
@@ -131,6 +121,7 @@ Endpoints
             "position": 1,
             "identifier": "WY3TP9SL",
             "ask_during_checkin": false,
+            "show_during_checkin": false,
             "hidden": false,
             "print_on_invoice": false,
             "valid_number_min": null,
@@ -139,6 +130,7 @@ Endpoints
             "valid_date_max": null,
             "valid_datetime_min": null,
             "valid_datetime_max": null,
+            "valid_string_length_max": null,
             "valid_file_portrait": false,
             "dependency_question": null,
             "dependency_value": null,
@@ -209,6 +201,7 @@ Endpoints
         "position": 1,
         "identifier": "WY3TP9SL",
         "ask_during_checkin": false,
+        "show_during_checkin": false,
         "hidden": false,
         "print_on_invoice": false,
         "valid_number_min": null,
@@ -218,6 +211,7 @@ Endpoints
         "valid_datetime_min": null,
         "valid_datetime_max": null,
         "valid_file_portrait": false,
+        "valid_string_length_max": null,
         "dependency_question": null,
         "dependency_value": null,
         "dependency_values": [],
@@ -271,6 +265,7 @@ Endpoints
         "items": [1, 2],
         "position": 1,
         "ask_during_checkin": false,
+        "show_during_checkin": false,
         "hidden": false,
         "print_on_invoice": false,
         "dependency_question": null,
@@ -307,6 +302,7 @@ Endpoints
         "position": 1,
         "identifier": "WY3TP9SL",
         "ask_during_checkin": false,
+        "show_during_checkin": false,
         "hidden": false,
         "print_on_invoice": false,
         "dependency_question": null,
@@ -319,6 +315,7 @@ Endpoints
         "valid_datetime_min": null,
         "valid_datetime_max": null,
         "valid_file_portrait": false,
+        "valid_string_length_max": null,
         "options": [
           {
             "id": 1,
@@ -361,7 +358,7 @@ Endpoints
 
    .. sourcecode:: http
 
-      PATCH /api/v1/organizers/bigevents/events/sampleconf/items/1/ HTTP/1.1
+      PATCH /api/v1/organizers/bigevents/events/sampleconf/questions/1/ HTTP/1.1
       Host: pretix.eu
       Accept: application/json, text/javascript
       Content-Type: application/json
@@ -389,6 +386,7 @@ Endpoints
         "position": 2,
         "identifier": "WY3TP9SL",
         "ask_during_checkin": false,
+        "show_during_checkin": false,
         "hidden": false,
         "print_on_invoice": false,
         "dependency_question": null,
@@ -401,6 +399,7 @@ Endpoints
         "valid_datetime_min": null,
         "valid_datetime_max": null,
         "valid_file_portrait": false,
+        "valid_string_length_max": null,
         "options": [
           {
             "id": 1,
@@ -427,7 +426,7 @@ Endpoints
    :param event: The ``slug`` field of the event to modify
    :param id: The ``id`` field of the question to modify
    :statuscode 200: no error
-   :statuscode 400: The item could not be modified due to invalid submitted data
+   :statuscode 400: The question could not be modified due to invalid submitted data
    :statuscode 401: Authentication failure
    :statuscode 403: The requested organizer/event does not exist **or** you have no permission to change this resource.
 
@@ -439,7 +438,7 @@ Endpoints
 
    .. sourcecode:: http
 
-      DELETE /api/v1/organizers/bigevents/events/sampleconf/items/1/ HTTP/1.1
+      DELETE /api/v1/organizers/bigevents/events/sampleconf/questions/1/ HTTP/1.1
       Host: pretix.eu
       Accept: application/json, text/javascript
 
@@ -452,7 +451,7 @@ Endpoints
 
    :param organizer: The ``slug`` field of the organizer to modify
    :param event: The ``slug`` field of the event to modify
-   :param id: The ``id`` field of the item to delete
+   :param id: The ``id`` field of the question to delete
    :statuscode 204: no error
    :statuscode 401: Authentication failure
    :statuscode 403: The requested organizer/event does not exist **or** you have no permission to delete this resource.

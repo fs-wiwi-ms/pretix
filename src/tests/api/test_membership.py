@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -19,10 +19,9 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
-import pytz
 from django_scopes import scopes_disabled
 from i18nfield.strings import LazyI18nString
 
@@ -54,8 +53,8 @@ def customer(organizer):
 def membership(organizer, customer, membershiptype):
     return customer.memberships.create(
         membership_type=membershiptype,
-        date_start=datetime(2021, 4, 1, 0, 0, 0, 0, tzinfo=pytz.UTC),
-        date_end=datetime(2021, 4, 8, 23, 59, 59, 999999, tzinfo=pytz.UTC),
+        date_start=datetime(2021, 4, 1, 0, 0, 0, 0, tzinfo=timezone.utc),
+        date_end=datetime(2021, 4, 8, 23, 59, 59, 999999, tzinfo=timezone.utc),
         attendee_name_parts={
             "_scheme": "given_family",
             'given_name': 'John',
@@ -93,7 +92,7 @@ def test_membership_detail(token_client, organizer, membershiptype, membership):
     res = dict(TEST_MEMBERSHIP_RES)
     res['membership_type'] = membershiptype.pk
     res['id'] = membership.pk
-    resp = token_client.get('/api/v1/organizers/{}/memberships/{}/'.format(organizer.slug, membershiptype.pk))
+    resp = token_client.get('/api/v1/organizers/{}/memberships/{}/'.format(organizer.slug, membership.pk))
     assert resp.status_code == 200
     assert res == resp.data
 

@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -49,7 +49,7 @@ class OrderSearch(PaginationMixin, ListView):
             self.filter_form[k] for k in self.filter_form.fields if k.startswith('meta_')
         ]
 
-        # Only compute this annotations for this page (query optimization)
+        # Only compute these annotations for this page (query optimization)
         s = OrderPosition.objects.filter(
             order=OuterRef('pk')
         ).order_by().values('order').annotate(k=Count('id')).values('k')
@@ -85,23 +85,29 @@ class OrderSearch(PaginationMixin, ListView):
 
         if not self.request.user.has_active_staff_session(self.request.session.session_key):
             qs = qs.filter(
-                Q(event_id__in=self.request.user.get_events_with_permission('can_view_orders').values_list('id', flat=True))
+                Q(event_id__in=self.request.user.get_events_with_permission('event.orders:read').values_list('id', flat=True))
             )
 
         if self.filter_form.is_valid():
             qs = self.filter_form.filter_qs(qs)
 
-            if self.filter_form.cleaned_data.get('query'):
+            if self.filter_form.use_query_hack():
                 """
-                We need to work around a bug in PostgreSQL's (and likely MySQL's) query plan optimizer here.
+                We need to work around a bug in PostgreSQL's query plan optimizer here.
                 The database lacks statistical data to predict how common our search filter is and therefore
                 assumes that it is cheaper to first ORDER *all* orders in the system (since we got an index on
                 datetime), then filter out with a full scan until OFFSET/LIMIT condition is fulfilled. If we
                 look for something rare (such as an email address used once within hundreds of thousands of
                 orders, this ends up to be pathologically slow.
 
+                Generally, PostgreSQL tries to make these decisions on statistical data and generally, they *can*
+                only be made on statistical data, so it's a little bit of a stretch that we try to do it better
+                than PostgreSQL here. However, experience suggests applying this tricks works specifically in the
+                cases where the WHERE part of the statement is very hard to compute, e.g. uses a complicated
+                condition that can't utilize indices well.
+
                 For some search queries on pretix.eu, we see search times of >30s, just due to the ORDER BY and
-                LIMIT clause. Without them. the query runs in roughly 0.6s. This heuristical approach tries to
+                LIMIT clause. Without them. the query runs in roughly 0.6s. This heuristic approach tries to
                 detect these cases and rewrite the query as a nested subquery that strongly suggests sorting
                 before filtering. However, since even that fails in some cases because PostgreSQL thinks it knows
                 better, we literally force it by evaluating the subquery explicitly. We only do this for n<=200,
@@ -111,15 +117,8 @@ class OrderSearch(PaginationMixin, ListView):
 
                 Phew.
                 """
-
-                page = self.kwargs.get(self.page_kwarg) or self.request.GET.get(self.page_kwarg) or 1
-                limit = self.get_paginate_by(None)
-                try:
-                    offset = (int(page) - 1) * limit
-                except ValueError:
-                    offset = 0
                 resultids = list(qs.order_by().values_list('id', flat=True)[:201])
-                if len(resultids) <= 200 and len(resultids) <= offset + limit:
+                if len(resultids) <= 200:
                     qs = Order.objects.using(settings.DATABASE_REPLICA).filter(
                         id__in=resultids
                     )
@@ -134,7 +133,7 @@ class OrderSearch(PaginationMixin, ListView):
         """
         return qs.only(
             'id', 'invoice_address__name_cached', 'invoice_address__name_parts', 'code', 'event', 'email',
-            'datetime', 'total', 'status', 'require_approval', 'testmode'
+            'datetime', 'total', 'status', 'require_approval', 'testmode', 'custom_followup_at', 'expires'
         ).prefetch_related(
             'event', 'event__organizer'
         ).select_related('invoice_address')
@@ -160,7 +159,7 @@ class PaymentSearch(PaginationMixin, ListView):
 
         if not self.request.user.has_active_staff_session(self.request.session.session_key):
             qs = qs.filter(
-                Q(order__event_id__in=self.request.user.get_events_with_permission('can_view_orders').values_list('id', flat=True))
+                Q(order__event_id__in=self.request.user.get_events_with_permission('event.orders:read').values_list('id', flat=True))
             )
 
         if self.filter_form.is_valid():
@@ -168,7 +167,7 @@ class PaymentSearch(PaginationMixin, ListView):
 
             if self.filter_form.cleaned_data.get('query'):
                 """
-                We need to work around a bug in PostgreSQL's (and likely MySQL's) query plan optimizer here.
+                We need to work around a bug in PostgreSQL's query plan optimizer here.
                 The database lacks statistical data to predict how common our search filter is and therefore
                 assumes that it is cheaper to first ORDER *all* orders in the system (since we got an index on
                 datetime), then filter out with a full scan until OFFSET/LIMIT condition is fulfilled. If we

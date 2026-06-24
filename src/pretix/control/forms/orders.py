@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -33,6 +33,7 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under the License.
 
+import os.path
 from datetime import date, datetime, time
 from decimal import Decimal
 
@@ -47,33 +48,32 @@ from django.utils.translation import (
     gettext_lazy as _, gettext_noop, pgettext_lazy,
 )
 from django_scopes.forms import SafeModelChoiceField
-from i18nfield.forms import I18nFormField, I18nTextarea, I18nTextInput
+from i18nfield.forms import I18nFormField, I18nTextInput
 from i18nfield.strings import LazyI18nString
 
 from pretix.base.email import get_available_placeholders
-from pretix.base.forms import I18nModelForm, PlaceholderValidator
+from pretix.base.forms import (
+    I18nMarkdownTextarea, I18nModelForm, MarkdownTextarea,
+    PlaceholderValidator,
+)
 from pretix.base.forms.questions import WrappedPhoneNumberPrefixWidget
 from pretix.base.forms.widgets import (
-    DatePickerWidget, SplitDateTimePickerWidget,
+    DatePickerWidget, SplitDateTimePickerWidget, format_placeholders_help_text,
 )
 from pretix.base.models import (
     Invoice, InvoiceAddress, ItemAddOn, Order, OrderFee, OrderPosition,
     TaxRule,
 )
 from pretix.base.models.event import SubEvent
+from pretix.base.services.placeholders import FormPlaceholderMixin
 from pretix.base.services.pricing import get_price
 from pretix.control.forms import SplitDateTimeField
 from pretix.control.forms.widgets import Select2
+from pretix.helpers.hierarkey import clean_filename
 from pretix.helpers.money import change_decimal_field
 
 
 class ExtendForm(I18nModelForm):
-    quota_ignore = forms.BooleanField(
-        label=_('Overbook quota'),
-        help_text=_('If you check this box, this operation will be performed even if it leads to an overbooked quota '
-                    'and you having sold more tickets than you planned!'),
-        required=False
-    )
     expires = forms.DateField(
         label=_("Expiration date"),
         widget=forms.DateInput(attrs={
@@ -81,16 +81,35 @@ class ExtendForm(I18nModelForm):
             'data-is-payment-date': 'true'
         }),
     )
+    valid_if_pending = forms.BooleanField(
+        label=_('Confirm order regardless of payment'),
+        help_text=_('If you check this box, this order will behave like a paid order for most purposes, even though it '
+                    'is not yet paid. This means that the customer can already download and use tickets regardless '
+                    'of your event settings, and the order might be treated as paid by some plugins. If you check '
+                    'this, this order will not be marked as "expired" automatically if the payment deadline arrives, '
+                    'since we expect that you want to collect the amount somehow and not auto-cancel the order.'),
+        required=False
+    )
+    quota_ignore = forms.BooleanField(
+        label=_('Overbook quota'),
+        help_text=_('If you check this box, this operation will be performed even if it leads to an overbooked quota '
+                    'and you having sold more tickets than you planned!'),
+        required=False
+    )
 
     class Meta:
         model = Order
         fields = []
 
     def __init__(self, *args, **kwargs):
+        kwargs.setdefault('initial', {})
+        kwargs['initial'].setdefault('valid_if_pending', kwargs['instance'].valid_if_pending)
+        kwargs['initial'].setdefault('expires', kwargs['instance'].expires)
         super().__init__(*args, **kwargs)
-        if self.instance.status == Order.STATUS_PENDING or self.instance._is_still_available(now(),
-                                                                                             count_waitinglist=False)\
-                is True:
+        if (
+            self.instance.status == Order.STATUS_PENDING or
+            self.instance._is_still_available(now(), count_waitinglist=False) is True
+        ):
             del self.fields['quota_ignore']
 
     def clean(self):
@@ -138,15 +157,11 @@ class ForceQuotaConfirmationForm(forms.Form):
             del self.fields['force']
 
 
-class ConfirmPaymentForm(ForceQuotaConfirmationForm):
-    pass
-
-
 class ReactivateOrderForm(ForceQuotaConfirmationForm):
     pass
 
 
-class CancelForm(ForceQuotaConfirmationForm):
+class CancelForm(forms.Form):
     send_email = forms.BooleanField(
         required=False,
         label=_('Notify customer by email'),
@@ -154,13 +169,12 @@ class CancelForm(ForceQuotaConfirmationForm):
     )
     cancellation_fee = forms.DecimalField(
         required=False,
-        max_digits=10, decimal_places=2,
+        max_digits=13, decimal_places=2,
         localize=True,
         label=_('Keep a cancellation fee of'),
         help_text=_('If you keep a fee, all positions within this order will be canceled and the order will be reduced '
-                    'to a paid cancellation fee. Payment and shipping fees will be canceled as well, so include them '
-                    'in your cancellation fee if you want to keep them. Please always enter a gross value, '
-                    'tax will be calculated automatically.'),
+                    'to a cancellation fee. Payment and shipping fees will be canceled as well, so include them '
+                    'in your cancellation fee if you want to keep them.'),
     )
     cancel_invoice = forms.BooleanField(
         label=_('Generate cancellation for invoice'),
@@ -175,36 +189,61 @@ class CancelForm(ForceQuotaConfirmationForm):
     )
 
     def __init__(self, *args, **kwargs):
+        self.instance = kwargs.pop("instance")
         super().__init__(*args, **kwargs)
-        prs = self.instance.payment_refund_sum
-        if prs > 0:
-            change_decimal_field(self.fields['cancellation_fee'], self.instance.event.currency)
-            self.fields['cancellation_fee'].widget.attrs['placeholder'] = floatformat(
-                Decimal('0.00'),
-                settings.CURRENCY_PLACES.get(self.instance.event.currency, 2)
-            )
-            self.fields['cancellation_fee'].max_value = prs
-        else:
-            del self.fields['cancellation_fee']
+        change_decimal_field(self.fields['cancellation_fee'], self.instance.event.currency)
+        self.fields['cancellation_fee'].widget.attrs['placeholder'] = floatformat(
+            Decimal('0.00'),
+            settings.CURRENCY_PLACES.get(self.instance.event.currency, 2)
+        )
+        self.fields['cancellation_fee'].max_value = self.instance.total
         if not self.instance.invoices.exists():
             del self.fields['cancel_invoice']
+        if self.instance.event.settings.tax_rule_cancellation == 'split':
+            self.fields['cancellation_fee'].help_text = str(self.fields['cancellation_fee'].help_text) + ' ' + _(
+                'Please enter a gross amount. As per your event settings, the taxes will be split the same way as the '
+                'order positions.'
+            )
+        elif self.instance.event.settings.tax_rule_cancellation == 'default':
+            self.fields['cancellation_fee'].help_text = str(self.fields['cancellation_fee'].help_text) + ' ' + _(
+                'Please enter a gross amount. As per your event settings, the default tax rate will be charged.'
+            )
+        elif self.instance.event.settings.tax_rule_cancellation == 'none':
+            self.fields['cancellation_fee'].help_text = str(self.fields['cancellation_fee'].help_text) + ' ' + _(
+                'As per your event settings, no tax will be charged.'
+            )
 
     def clean_cancellation_fee(self):
         val = self.cleaned_data['cancellation_fee'] or Decimal('0.00')
-        if val > self.instance.payment_refund_sum:
-            raise ValidationError(_('The cancellation fee cannot be higher than the payment credit of this order.'))
+        if val > self.instance.total:
+            raise ValidationError(_('The cancellation fee cannot be higher than the total amount of this order.'))
         return val
 
 
-class MarkPaidForm(ConfirmPaymentForm):
+class DenyForm(forms.Form):
     send_email = forms.BooleanField(
         required=False,
         label=_('Notify customer by email'),
         initial=True
     )
+    comment = forms.CharField(
+        label=_('Comment (will be sent to the user)'),
+        help_text=_('Will be included in the notification email when the respective placeholder is present in the '
+                    'configured email text.'),
+        required=False,
+    )
+
+
+class MarkPaidForm(ForceQuotaConfirmationForm):
+    send_email = forms.BooleanField(
+        required=False,
+        label=_('Notify customer by email'),
+        help_text=_('A mail will only be sent if the order is fully paid after this.'),
+        initial=True
+    )
     amount = forms.DecimalField(
         required=True,
-        max_digits=10, decimal_places=2,
+        max_digits=13, decimal_places=2,
         localize=True,
         label=_('Payment amount'),
     )
@@ -216,9 +255,10 @@ class MarkPaidForm(ConfirmPaymentForm):
     )
 
     def __init__(self, *args, **kwargs):
+        payment = kwargs.pop('payment', None)
         super().__init__(*args, **kwargs)
         change_decimal_field(self.fields['amount'], self.instance.event.currency)
-        self.fields['amount'].initial = max(Decimal('0.00'), self.instance.pending_sum)
+        self.fields['amount'].initial = max(Decimal('0.00'), payment.amount if payment else self.instance.pending_sum)
 
 
 class ExporterForm(forms.Form):
@@ -231,18 +271,23 @@ class ExporterForm(forms.Form):
             elif isinstance(v, models.QuerySet):
                 data[k] = [m.pk for m in v]
 
+        if 'all_events' in self.fields and 'events' in self.fields:
+            if not data.get('all_events') and not data.get('events'):
+                raise ValidationError(_('Please select some events.'))
+
         return data
 
 
 class CommentForm(I18nModelForm):
     class Meta:
         model = Order
-        fields = ['comment', 'checkin_attention', 'custom_followup_at']
+        fields = ['comment', 'checkin_attention', 'checkin_text', 'custom_followup_at']
         widgets = {
             'comment': forms.Textarea(attrs={
                 'rows': 3,
                 'class': 'helper-width-100',
             }),
+            'checkin_text': forms.TextInput(),
             'custom_followup_at': DatePickerWidget(),
         }
 
@@ -270,7 +315,7 @@ class OtherOperationsForm(forms.Form):
     notify = forms.BooleanField(
         label=_('Notify user'),
         required=False,
-        initial=True,
+        initial=False,
         help_text=_(
             'Send an email to the customer notifying that their order has been changed.'
         )
@@ -286,6 +331,10 @@ class OtherOperationsForm(forms.Form):
 
 
 class OrderPositionAddForm(forms.Form):
+    count = forms.IntegerField(
+        label=_('Number of products to add'),
+        initial=1,
+    )
     itemvar = forms.ChoiceField(
         label=_('Product')
     )
@@ -305,7 +354,7 @@ class OrderPositionAddForm(forms.Form):
     )
     price = forms.DecimalField(
         required=False,
-        max_digits=10, decimal_places=2,
+        max_digits=13, decimal_places=2,
         localize=True,
         label=_('Gross price'),
         help_text=_("Including taxes, if any. Keep empty for the product's default price")
@@ -364,7 +413,6 @@ class OrderPositionAddForm(forms.Form):
                         'event': order.event.slug,
                         'organizer': order.event.organizer.slug,
                     }),
-                    'data-placeholder': pgettext_lazy('subevent', 'Date')
                 }
             )
             self.fields['subevent'].widget.choices = self.fields['subevent'].choices
@@ -388,6 +436,10 @@ class OrderPositionAddForm(forms.Form):
             d['used_membership'] = [m for m in self.memberships if str(m.pk) == d['used_membership']][0]
         else:
             d['used_membership'] = None
+        if d.get("count", 1) > 1 and d.get("seat"):
+            raise ValidationError({
+                "seat": _("You can not choose a seat when adding multiple products at once.")
+            })
         return d
 
 
@@ -431,9 +483,23 @@ class OrderPositionChangeForm(forms.Form):
     )
     price = forms.DecimalField(
         required=False,
-        max_digits=10, decimal_places=2,
+        max_digits=13, decimal_places=2,
         localize=True,
         label=_('New price (gross)')
+    )
+    blocked = forms.BooleanField(
+        required=False,
+        label=_('Ticket is blocked')
+    )
+    valid_from = SplitDateTimeField(
+        required=False,
+        widget=SplitDateTimePickerWidget,
+        label=_('Validity start')
+    )
+    valid_until = SplitDateTimeField(
+        required=False,
+        widget=SplitDateTimePickerWidget,
+        label=_('Validity end')
     )
     used_membership = forms.ChoiceField(
         required=False,
@@ -445,7 +511,9 @@ class OrderPositionChangeForm(forms.Form):
     )
     operation_secret = forms.BooleanField(
         required=False,
-        label=_('Generate a new secret')
+        label=_('Generate a new secret'),
+        help_text=_('This affects both the ticket secret (often used as a QR code) as well as the link used to '
+                    'individually access the ticket.')
     )
     operation_cancel = forms.BooleanField(
         required=False,
@@ -466,6 +534,9 @@ class OrderPositionChangeForm(forms.Form):
         initial = kwargs.get('initial', {})
 
         initial['price'] = instance.price
+        initial['blocked'] = instance.blocked and "admin" in instance.blocked
+        initial['valid_from'] = instance.valid_from
+        initial['valid_until'] = instance.valid_until
 
         kwargs['initial'] = initial
         super().__init__(*args, **kwargs)
@@ -536,7 +607,7 @@ class OrderPositionChangeForm(forms.Form):
 class OrderFeeChangeForm(forms.Form):
     value = forms.DecimalField(
         required=False,
-        max_digits=10, decimal_places=2,
+        max_digits=13, decimal_places=2,
         localize=True,
         label=_('New price (gross)')
     )
@@ -559,6 +630,55 @@ class OrderFeeChangeForm(forms.Form):
         super().__init__(*args, **kwargs)
         self.fields['tax_rule'].queryset = instance.order.event.tax_rules.all()
         change_decimal_field(self.fields['value'], instance.order.event.currency)
+
+
+class OrderFeeAddForm(forms.Form):
+    fee_type = forms.ChoiceField(
+        choices=[("", ""), *OrderFee.FEE_TYPES],
+        help_text=_(
+            "Note that payment fees have a special semantic and might automatically be changed if the "
+            "payment method of the order is changed."
+        )
+    )
+    value = forms.DecimalField(
+        max_digits=13, decimal_places=2,
+        localize=True,
+        label=_('Price'),
+        help_text=_("including all taxes"),
+    )
+    tax_rule = forms.ModelChoiceField(
+        TaxRule.objects.none(),
+        required=False,
+    )
+    description = forms.CharField(required=False)
+
+    def __init__(self, *args, **kwargs):
+        order = kwargs.pop('order')
+        super().__init__(*args, **kwargs)
+        self.fields['tax_rule'].queryset = order.event.tax_rules.all()
+        change_decimal_field(self.fields['value'], order.event.currency)
+
+
+class OrderFeeAddFormset(forms.BaseFormSet):
+    def __init__(self, *args, **kwargs):
+        self.order = kwargs.pop('order', None)
+        super().__init__(*args, **kwargs)
+
+    def _construct_form(self, i, **kwargs):
+        kwargs['order'] = self.order
+        return super()._construct_form(i, **kwargs)
+
+    @property
+    def empty_form(self):
+        form = self.form(
+            auto_id=self.auto_id,
+            prefix=self.add_prefix('__prefix__'),
+            empty_permitted=True,
+            use_required_attribute=False,
+            order=self.order,
+        )
+        self.add_fields(form, None)
+        return form
 
 
 class OrderContactForm(forms.ModelForm):
@@ -592,7 +712,6 @@ class OrderContactForm(forms.ModelForm):
                     'data-select2-url': reverse('control:organizer.customers.select2', kwargs={
                         'organizer': self.instance.event.organizer.slug,
                     }),
-                    'data-placeholder': _('Customer')
                 }
             )
             self.fields['customer'].widget.choices = self.fields['customer'].choices
@@ -624,6 +743,9 @@ class OrderMailForm(forms.Form):
         help_text=_("Will be ignored if tickets exceed a given size limit to ensure email deliverability."),
         required=False
     )
+    attach_new_order = forms.BooleanField(
+        required=False
+    )
     attach_invoices = forms.ModelMultipleChoiceField(
         label=_("Attach invoices"),
         widget=forms.CheckboxSelectMultiple,
@@ -632,19 +754,14 @@ class OrderMailForm(forms.Form):
     )
 
     def _set_field_placeholders(self, fn, base_parameters):
-        phs = [
-            '{%s}' % p
-            for p in sorted(get_available_placeholders(self.order.event, base_parameters).keys())
-        ]
-        ht = _('Available placeholders: {list}').format(
-            list=', '.join(phs)
-        )
+        placeholders = get_available_placeholders(self.order.event, base_parameters)
+        ht = format_placeholders_help_text(placeholders, self.order.event)
         if self.fields[fn].help_text:
             self.fields[fn].help_text += ' ' + str(ht)
         else:
             self.fields[fn].help_text = ht
         self.fields[fn].validators.append(
-            PlaceholderValidator(phs)
+            PlaceholderValidator(['{%s}' % p for p in placeholders.keys()])
         )
 
     def __init__(self, *args, **kwargs):
@@ -659,11 +776,18 @@ class OrderMailForm(forms.Form):
         self.fields['message'] = forms.CharField(
             label=_("Message"),
             required=True,
-            widget=forms.Textarea,
+            widget=MarkdownTextarea,
             initial=order.event.settings.mail_text_order_custom_mail.localize(order.locale),
         )
         self.fields['attach_invoices'].queryset = order.invoices.all()
         self._set_field_placeholders('message', ['event', 'order'])
+        self._set_field_placeholders('subject', ['event', 'order'])
+        if order.event.settings.mail_attachment_new_order:
+            self.fields['attach_new_order'].label = _('Attach {file}').format(
+                file=clean_filename(os.path.basename(order.event.settings.mail_attachment_new_order.name))
+            )
+        else:
+            del self.fields['attach_new_order']
 
 
 class OrderPositionMailForm(OrderMailForm):
@@ -675,10 +799,11 @@ class OrderPositionMailForm(OrderMailForm):
         self.fields['message'] = forms.CharField(
             label=_("Message"),
             required=True,
-            widget=forms.Textarea,
+            widget=MarkdownTextarea,
             initial=self.order.event.settings.mail_text_order_custom_mail.localize(self.order.locale),
         )
         self._set_field_placeholders('message', ['event', 'order', 'position'])
+        self._set_field_placeholders('subject', ['event', 'order'])
 
 
 class OrderRefundForm(forms.Form):
@@ -701,7 +826,7 @@ class OrderRefundForm(forms.Form):
         )
     )
     partial_amount = forms.DecimalField(
-        required=False, max_digits=10, decimal_places=2,
+        required=False, max_digits=13, decimal_places=2,
         localize=True
     )
 
@@ -726,7 +851,7 @@ class OrderRefundForm(forms.Form):
         return data
 
 
-class EventCancelForm(forms.Form):
+class EventCancelForm(FormPlaceholderMixin, forms.Form):
     subevent = forms.ModelChoiceField(
         SubEvent.objects.none(),
         label=pgettext_lazy('subevent', 'Date'),
@@ -756,7 +881,8 @@ class EventCancelForm(forms.Form):
         label=_('Automatically refund money if possible'),
         initial=True,
         required=False,
-        help_text=_('Only available for payment method that support automatic refunds.')
+        help_text=_('Only available for payment method that support automatic refunds. Tickets that have been blocked '
+                    '(manually or by a plugin) are not auto-canceled and you will need to deal with them manually.')
     )
     manual_refund = forms.BooleanField(
         label=_('Create refund in the manual refund to-do list'),
@@ -789,18 +915,18 @@ class EventCancelForm(forms.Form):
     )
     keep_fee_fixed = forms.DecimalField(
         label=_("Keep a fixed cancellation fee"),
-        max_digits=10, decimal_places=2,
+        max_digits=13, decimal_places=2,
         required=False
     )
     keep_fee_per_ticket = forms.DecimalField(
         label=_("Keep a fixed cancellation fee per ticket"),
         help_text=_("Free tickets and add-on products are not counted"),
-        max_digits=10, decimal_places=2,
+        max_digits=13, decimal_places=2,
         required=False
     )
     keep_fee_percentage = forms.DecimalField(
         label=_("Keep a percentual cancellation fee"),
-        max_digits=10, decimal_places=2,
+        max_digits=13, decimal_places=2,
         required=False
     )
     keep_fees = forms.MultipleChoiceField(
@@ -825,22 +951,6 @@ class EventCancelForm(forms.Form):
     send_waitinglist_subject = forms.CharField()
     send_waitinglist_message = forms.CharField()
 
-    def _set_field_placeholders(self, fn, base_parameters):
-        phs = [
-            '{%s}' % p
-            for p in sorted(get_available_placeholders(self.event, base_parameters).keys())
-        ]
-        ht = _('Available placeholders: {list}').format(
-            list=', '.join(phs)
-        )
-        if self.fields[fn].help_text:
-            self.fields[fn].help_text += ' ' + str(ht)
-        else:
-            self.fields[fn].help_text = ht
-        self.fields[fn].validators.append(
-            PlaceholderValidator(phs)
-        )
-
     def __init__(self, *args, **kwargs):
         self.event = kwargs.pop('event')
         kwargs.setdefault('initial', {})
@@ -856,7 +966,7 @@ class EventCancelForm(forms.Form):
         )
         self.fields['send_message'] = I18nFormField(
             label=_('Message'),
-            widget=I18nTextarea,
+            widget=I18nMarkdownTextarea,
             required=True,
             widget_kwargs={'attrs': {'data-display-dependency': '#id_send'}},
             locales=self.event.settings.get('locales'),
@@ -864,7 +974,7 @@ class EventCancelForm(forms.Form):
                 'Hello,\n\n'
                 'with this email, we regret to inform you that {event} has been canceled.\n\n'
                 'We will refund you {refund_amount} to your original payment method.\n\n'
-                'You can view the current state of your order here:\n\n{url}\n\nBest regards,\n\n'
+                'You can view the current state of your order here:\n\n{url}\n\nBest regards,  \n\n'
                 'Your {event} team'
             ))
         )
@@ -872,7 +982,7 @@ class EventCancelForm(forms.Form):
         self._set_field_placeholders('send_subject', ['event_or_subevent', 'refund_amount', 'position_or_address',
                                                       'order', 'event'])
         self._set_field_placeholders('send_message', ['event_or_subevent', 'refund_amount', 'position_or_address',
-                                                      'order', 'event'])
+                                                      'order', 'event'], rich=True)
         self.fields['send_waitinglist_subject'] = I18nFormField(
             label=_("Subject"),
             required=True,
@@ -883,7 +993,7 @@ class EventCancelForm(forms.Form):
         )
         self.fields['send_waitinglist_message'] = I18nFormField(
             label=_('Message'),
-            widget=I18nTextarea,
+            widget=I18nMarkdownTextarea,
             required=True,
             locales=self.event.settings.get('locales'),
             widget_kwargs={'attrs': {'data-display-dependency': '#id_send_waitinglist'}},
@@ -891,12 +1001,12 @@ class EventCancelForm(forms.Form):
                 'Hello,\n\n'
                 'with this email, we regret to inform you that {event} has been canceled.\n\n'
                 'You will therefore not receive a ticket from the waiting list.\n\n'
-                'Best regards,\n\n'
+                'Best regards,  \n\n'
                 'Your {event} team'
             ))
         )
         self._set_field_placeholders('send_waitinglist_subject', ['event_or_subevent', 'event'])
-        self._set_field_placeholders('send_waitinglist_message', ['event_or_subevent', 'event'])
+        self._set_field_placeholders('send_waitinglist_message', ['event_or_subevent', 'event'], rich=True)
 
         if self.event.has_subevents:
             self.fields['subevent'].queryset = self.event.subevents.all()
@@ -928,3 +1038,27 @@ class EventCancelForm(forms.Form):
         if self.event.has_subevents and not d['subevent'] and not d['all_subevents'] and not d.get('subevents_from'):
             raise ValidationError(_('Please confirm that you want to cancel ALL dates in this event series.'))
         return d
+
+
+class EventCancelConfirmForm(forms.Form):
+    confirm = forms.BooleanField(
+        label=_("I understand that this is not reversible and want to continue"),
+        required=True,
+    )
+    confirmation_code = forms.CharField(
+        label=_("Confirmation code"),
+        help_text=_("We have just emailed you a confirmation code to enter to confirm this action"),
+        required=True,
+    )
+
+    def __init__(self, *args, **kwargs):
+        self.code = kwargs.pop("confirmation_code")
+        super().__init__(*args, **kwargs)
+        if not self.code:
+            del self.fields["confirmation_code"]
+
+    def clean_confirmation_code(self):
+        val = self.cleaned_data['confirmation_code']
+        if val != self.code:
+            raise ValidationError(_('The confirmation code is incorrect.'))
+        return val

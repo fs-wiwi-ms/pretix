@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -33,7 +33,7 @@ def event():
     o = Organizer.objects.create(name='Dummy', slug='dummy')
     event = Event.objects.create(
         organizer=o, name='Dummy', slug='dummy',
-        date_from=now(),
+        date_from=now(), live=True,
         plugins='pretix.plugins.sendmail,tests.testdummy',
     )
     return event
@@ -57,11 +57,12 @@ def checkin_list(event):
 
 
 @pytest.fixture
-def order(item):
+def order(event, item):
     """Returns an order instance"""
     o = Order.objects.create(event=item.event, status=Order.STATUS_PENDING,
                              expires=now() + datetime.timedelta(hours=1),
                              total=13, code='DUMMY', email='dummy@dummy.test',
+                             sales_channel=event.organizer.sales_channels.get(identifier="web"),
                              datetime=now(), locale='en')
     return o
 

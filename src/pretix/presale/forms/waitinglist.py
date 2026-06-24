@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -25,11 +25,11 @@ from django.utils.translation import gettext_lazy as _
 from phonenumber_field.formfields import PhoneNumberField
 
 from pretix.base.forms.questions import (
-    NamePartsFormField, WrappedPhoneNumberPrefixWidget, guess_phone_prefix,
+    NamePartsFormField, WrappedPhoneNumberPrefixWidget,
+    guess_phone_prefix_from_request,
 )
-from pretix.base.models import Quota, WaitingListEntry
+from pretix.base.models import WaitingListEntry
 from pretix.base.templatetags.rich_text import rich_text
-from pretix.presale.views.event import get_grouped_items
 
 
 class WaitingListForm(forms.ModelForm):
@@ -40,38 +40,15 @@ class WaitingListForm(forms.ModelForm):
         fields = ('name_parts', 'email', 'phone')
 
     def __init__(self, *args, **kwargs):
+        request = kwargs.pop('request')
         self.event = kwargs.pop('event')
-        self.channel = kwargs.pop('channel')
-        customer = kwargs.pop('customer')
+        itemvars = kwargs.pop('itemvars')
         super().__init__(*args, **kwargs)
 
         choices = [
-            ('', '')
+            ('', ''),
+            *itemvars,
         ]
-        items, display_add_to_cart = get_grouped_items(
-            self.event, self.instance.subevent, require_seat=None,
-            memberships=(
-                customer.usable_memberships(
-                    for_event=self.instance.subevent or self.event,
-                    testmode=self.event.testmode
-                )
-                if customer else None
-            ),
-        )
-        for i in items:
-            if not i.allow_waitinglist:
-                continue
-
-            if i.has_variations:
-                for v in i.available_variations:
-                    if v.cached_availability[0] == Quota.AVAILABILITY_OK:
-                        continue
-                    choices.append((f'{i.pk}-{v.pk}', f'{i.name} – {v.value}'))
-
-            else:
-                if i.cached_availability[0] == Quota.AVAILABILITY_OK:
-                    continue
-                choices.append((f'{i.pk}', f'{i.name}'))
 
         self.fields['itemvar'] = forms.ChoiceField(
             label=_('Product'),
@@ -79,6 +56,8 @@ class WaitingListForm(forms.ModelForm):
         )
 
         event = self.event
+
+        self.fields['email'].widget.attrs['autocomplete'] = 'email'
 
         if event.settings.waiting_list_names_asked:
             self.fields['name_parts'] = NamePartsFormField(
@@ -93,7 +72,7 @@ class WaitingListForm(forms.ModelForm):
 
         if event.settings.waiting_list_phones_asked:
             if not self.initial.get('phone'):
-                phone_prefix = guess_phone_prefix(event)
+                phone_prefix = guess_phone_prefix_from_request(request, event)
                 if phone_prefix:
                     self.initial['phone'] = "+{}.".format(phone_prefix)
 
@@ -120,7 +99,7 @@ class WaitingListForm(forms.ModelForm):
             else:
                 self.instance.variation = None
 
-        except ObjectDoesNotExist:
+        except (ObjectDoesNotExist, ValueError):
             raise ValidationError(_("Invalid product selected."))
 
         data = super().clean()

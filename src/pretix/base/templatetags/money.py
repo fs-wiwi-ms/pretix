@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -21,11 +21,13 @@
 #
 from decimal import ROUND_HALF_UP, Decimal
 
+from babel import Locale, UnknownLocaleError
 from babel.numbers import format_currency
 from django import template
 from django.conf import settings
 from django.template.defaultfilters import floatformat
-from django.utils import translation
+
+from pretix.base.i18n import get_babel_locale
 
 register = template.Library()
 
@@ -47,25 +49,26 @@ def money_filter(value: Decimal, arg='', hide_currency=False):
     places = settings.CURRENCY_PLACES.get(arg, 2)
     rounded = value.quantize(Decimal('1') / 10 ** places, ROUND_HALF_UP)
     if places < 2 and rounded != value:
-        places = 2
+        # We display decimal places even if we shouldn't for this currency if rounding
+        # would make the numbers incorrect. If this branch executes, it's likely a bug in
+        # pretix, but we won't show wrong numbers!
+        if hide_currency:
+            return floatformat(value, "2g")
+        else:
+            return '{} {}'.format(arg, floatformat(value, "2g"))
+
     if hide_currency:
-        return floatformat(value, places)
+        return floatformat(value, f"{places}g")
 
     try:
-        if rounded != value:
-            # We display decimal places even if we shouldn't for this currency if rounding
-            # would make the numbers incorrect. If this branch executes, it's likely a bug in
-            # pretix, but we won't show wrong numbers!
-            return '{} {}'.format(
-                arg,
-                floatformat(value, 2)
-            )
-        return format_currency(value, arg, locale=translation.get_language()[:2])
+        locale = Locale(get_babel_locale())
+    except UnknownLocaleError:
+        locale = "en"
+
+    try:
+        return format_currency(value, arg, locale=locale)
     except:
-        return '{} {}'.format(
-            arg,
-            floatformat(value, places)
-        )
+        return '{} {}'.format(arg, floatformat(value, f"{places}g"))
 
 
 @register.filter("money_numberfield")

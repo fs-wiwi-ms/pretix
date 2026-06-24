@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -19,6 +19,8 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
+import hashlib
+import re
 from importlib import import_module
 from urllib.parse import (
     parse_qs, quote, urlencode, urljoin, urlparse, urlsplit, urlunparse,
@@ -26,11 +28,15 @@ from urllib.parse import (
 
 from django.conf import settings
 from django.contrib import messages
+from django.core.exceptions import ValidationError
 from django.core.signing import BadSignature, dumps, loads
-from django.db import transaction
-from django.db.models import Count, IntegerField, OuterRef, Q, Subquery
+from django.db import IntegrityError, transaction
+from django.db.models import (
+    Count, IntegerField, OuterRef, Prefetch, Q, Subquery,
+)
 from django.http import Http404, HttpResponseRedirect
-from django.shortcuts import get_object_or_404, redirect
+from django.shortcuts import get_object_or_404, render
+from django.utils.crypto import get_random_string
 from django.utils.decorators import method_decorator
 from django.utils.functional import cached_property
 from django.utils.http import url_has_allowed_host_and_scheme
@@ -38,12 +44,19 @@ from django.utils.translation import gettext_lazy as _
 from django.views.decorators.cache import never_cache
 from django.views.decorators.csrf import csrf_protect
 from django.views.decorators.debug import sensitive_post_parameters
-from django.views.generic import DeleteView, FormView, ListView, View
+from django.views.generic import FormView, ListView, View
 
+from pretix.base.customersso.oidc import (
+    oidc_authorize_url, oidc_validate_authorization,
+)
 from pretix.base.models import Customer, InvoiceAddress, Order, OrderPosition
 from pretix.base.services.mail import mail
+from pretix.base.settings import PERSON_NAME_SCHEMES
+from pretix.base.signals import customer_created, customer_signed_in
+from pretix.helpers.compat import CompatDeleteView
+from pretix.helpers.http import redirect_to_url
 from pretix.multidomain.models import KnownDomain
-from pretix.multidomain.urlreverse import build_absolute_uri, eventreverse
+from pretix.multidomain.urlreverse import eventreverse, eventreverse_absolute
 from pretix.presale.forms.customer import (
     AuthenticationForm, ChangeInfoForm, ChangePasswordForm, RegistrationForm,
     ResetPasswordForm, SetPasswordForm, TokenGenerator,
@@ -58,13 +71,13 @@ SessionStore = import_module(settings.SESSION_ENGINE).SessionStore
 class RedirectBackMixin:
     redirect_field_name = 'next'
 
-    def get_redirect_url(self):
+    def get_redirect_url(self, redirect_to=None):
         """Return the user-originating redirect URL if it's safe."""
-        redirect_to = self.request.POST.get(
+        redirect_to = redirect_to or self.request.POST.get(
             self.redirect_field_name,
             self.request.GET.get(self.redirect_field_name, '')
         )
-        hosts = list(KnownDomain.objects.filter(event__organizer=self.request.organizer).values_list('domainname', flat=True))
+        hosts = list(KnownDomain.objects.filter(organizer=self.request.organizer).values_list('domainname', flat=True))
         siteurlsplit = urlsplit(settings.SITE_URL)
         if siteurlsplit.port and siteurlsplit.port not in (80, 443):
             hosts = ['%s:%d' % (h, siteurlsplit.port) for h in hosts]
@@ -101,6 +114,17 @@ class LoginView(RedirectBackMixin, FormView):
             return HttpResponseRedirect(redirect_to)
         return super().dispatch(request, *args, **kwargs)
 
+    def post(self, request, *args, **kwargs):
+        if not request.organizer.settings.customer_accounts_native:
+            raise Http404('Feature not enabled')
+        return super().post(request, *args, **kwargs)
+
+    def get_context_data(self, **kwargs):
+        return super().get_context_data(
+            **kwargs,
+            providers=self.request.organizer.sso_providers.filter(is_active=True)
+        )
+
     def get_form_kwargs(self):
         kwargs = super().get_form_kwargs()
         kwargs['request'] = self.request
@@ -110,7 +134,7 @@ class LoginView(RedirectBackMixin, FormView):
         url = self.get_redirect_url()
 
         if not url:
-            return eventreverse(self.request.organizer, 'presale:organizer.customer.profile', kwargs={})
+            return eventreverse(self.request.organizer, 'presale:organizer.customer.index', kwargs={})
 
         if self.request.GET.get("request_cross_domain_customer_auth") == "true":
             otpstore = SessionStore()
@@ -128,7 +152,9 @@ class LoginView(RedirectBackMixin, FormView):
 
     def form_valid(self, form):
         """Security check complete. Log the user in."""
-        customer_login(self.request, form.get_customer())
+        customer = form.get_customer()
+        customer_login(self.request, customer)
+        customer_signed_in.send(customer.organizer, customer=customer)
         return HttpResponseRedirect(self.get_success_url())
 
 
@@ -142,7 +168,7 @@ class LogoutView(View):
         return HttpResponseRedirect(next_page)
 
     def get_next_page(self):
-        if getattr(self.request, 'event_domain', False):
+        if getattr(self.request, 'domain_mode', 'system') in (KnownDomain.MODE_ORG_ALT_DOMAIN, KnownDomain.MODE_EVENT_DOMAIN):
             # After we cleared the cookies on this domain, redirect to the parent domain to clear cookies as well
             next_page = eventreverse(self.request.organizer, 'presale:organizer.customer.logout', kwargs={})
             if self.redirect_field_name in self.request.POST or self.redirect_field_name in self.request.GET:
@@ -162,7 +188,7 @@ class LogoutView(View):
                     self.redirect_field_name,
                     self.request.GET.get(self.redirect_field_name)
                 )
-                hosts = list(KnownDomain.objects.filter(event__organizer=self.request.organizer).values_list('domainname', flat=True))
+                hosts = list(KnownDomain.objects.filter(organizer=self.request.organizer).values_list('domainname', flat=True))
                 siteurlsplit = urlsplit(settings.SITE_URL)
                 if siteurlsplit.port and siteurlsplit.port not in (80, 443):
                     hosts = ['%s:%d' % (h, siteurlsplit.port) for h in hosts]
@@ -190,6 +216,8 @@ class RegistrationView(RedirectBackMixin, FormView):
     def dispatch(self, request, *args, **kwargs):
         if not request.organizer.settings.customer_accounts:
             raise Http404('Feature not enabled')
+        if not request.organizer.settings.customer_accounts_native:
+            raise Http404('Feature not enabled')
         if self.redirect_authenticated_user and self.request.customer:
             redirect_to = self.get_success_url()
             if redirect_to == self.request.path:
@@ -212,7 +240,8 @@ class RegistrationView(RedirectBackMixin, FormView):
 
     def form_valid(self, form):
         with transaction.atomic():
-            form.create()
+            customer = form.create()
+            customer_created.send(customer.organizer, customer=customer)
         messages.success(
             self.request,
             _('Your account has been created. Please follow the link in the email we sent you to activate your '
@@ -231,8 +260,10 @@ class SetPasswordView(FormView):
     def dispatch(self, request, *args, **kwargs):
         if not request.organizer.settings.customer_accounts:
             raise Http404('Feature not enabled')
+        if not request.organizer.settings.customer_accounts_native:
+            raise Http404('Feature not enabled')
         try:
-            self.customer = request.organizer.customers.get(identifier=self.request.GET.get('id'))
+            self.customer = request.organizer.customers.get(identifier=self.request.GET.get('id'), provider__isnull=True)
         except Customer.DoesNotExist:
             messages.error(request, _('You clicked an invalid link.'))
             return HttpResponseRedirect(self.get_success_url())
@@ -255,6 +286,7 @@ class SetPasswordView(FormView):
             self.customer.is_verified = True
             self.customer.save()
             self.customer.log_action('pretix.customer.password.set', {})
+        self.customer.send_security_notice(_("Your password has been changed."))
         messages.success(
             self.request,
             _('Your new password has been set! You can now use it to log in.'),
@@ -272,6 +304,8 @@ class ResetPasswordView(FormView):
     def dispatch(self, request, *args, **kwargs):
         if not request.organizer.settings.customer_accounts:
             raise Http404('Feature not enabled')
+        if not request.organizer.settings.customer_accounts_native:
+            raise Http404('Feature not enabled')
         return super().dispatch(request, *args, **kwargs)
 
     def get_success_url(self):
@@ -282,16 +316,19 @@ class ResetPasswordView(FormView):
         customer.log_action('pretix.customer.password.resetrequested', {})
         ctx = customer.get_email_context()
         token = TokenGenerator().make_token(customer)
-        ctx['url'] = build_absolute_uri(self.request.organizer,
-                                        'presale:organizer.customer.recoverpw') + '?id=' + customer.identifier + '&token=' + token
+        ctx['url'] = eventreverse_absolute(
+            self.request.organizer,
+            'presale:organizer.customer.recoverpw'
+        ) + '?id=' + customer.identifier + '&token=' + token
         mail(
             customer.email,
-            _('Set a new password for your account at {organizer}').format(organizer=self.request.organizer.name),
+            self.request.organizer.settings.mail_subject_customer_reset,
             self.request.organizer.settings.mail_text_customer_reset,
             ctx,
             locale=customer.locale,
             customer=customer,
             organizer=self.request.organizer,
+            sensitive=True,
         )
         messages.success(
             self.request,
@@ -310,42 +347,72 @@ class CustomerRequiredMixin:
         if not request.organizer.settings.customer_accounts:
             raise Http404('Feature not enabled')
         if not getattr(request, 'customer', None):
-            return redirect(
+            return redirect_to_url(
                 eventreverse(self.request.organizer, 'presale:organizer.customer.login', kwargs={}) +
                 '?next=' + quote(self.request.path_info + '?' + self.request.GET.urlencode())
             )
         return super().dispatch(request, *args, **kwargs)
 
 
-class ProfileView(CustomerRequiredMixin, ListView):
-    template_name = 'pretixpresale/organizers/customer_profile.html'
+class CustomerAccountBaseMixin(CustomerRequiredMixin):
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        ctx['customer'] = self.request.customer
+        url_name = self.request.resolver_match.url_name
+        ctx['sub_nav'] = [
+            {
+                'label': _('Orders'),
+                'url': eventreverse(self.request.organizer, 'presale:organizer.customer.index', kwargs={}),
+                'active': url_name == 'organizer.customer.index',
+                'icon': 'shopping-cart',
+            },
+            {
+                'label': _('Memberships'),
+                'url': eventreverse(self.request.organizer, 'presale:organizer.customer.memberships', kwargs={}),
+                'active': url_name.startswith('organizer.customer.membership'),
+                'icon': 'id-badge',
+            },
+            {
+                'label': _('Gift cards'),
+                'url': eventreverse(self.request.organizer, 'presale:organizer.customer.giftcards', kwargs={}),
+                'active': url_name.startswith('organizer.customer.giftcard'),
+                'icon': 'gift',
+            },
+            {
+                'label': _('Addresses'),
+                'url': eventreverse(self.request.organizer, 'presale:organizer.customer.addresses', kwargs={}),
+                'active': url_name.startswith('organizer.customer.address'),
+                'icon': 'address-card-o',
+            },
+            {
+                'label': _('Attendee profiles'),
+                'url': eventreverse(self.request.organizer, 'presale:organizer.customer.profiles', kwargs={}),
+                'active': url_name.startswith('organizer.customer.profile'),
+                'icon': 'user',
+            },
+        ]
+        return ctx
+
+
+class OrderView(CustomerAccountBaseMixin, ListView):
+    template_name = 'pretixpresale/organizers/customer_orders.html'
     context_object_name = 'orders'
     paginate_by = 20
 
     def get_queryset(self):
         q = Q(customer=self.request.customer)
-        if self.request.organizer.settings.customer_accounts_link_by_email:
+        if self.request.organizer.settings.customer_accounts_link_by_email and self.request.customer.email:
             # This is safe because we only let customers with verified emails log in
             q |= Q(email__iexact=self.request.customer.email)
         qs = Order.objects.filter(
             q
-        ).select_related('event').order_by('-datetime')
+        ).prefetch_related(
+            Prefetch('event', queryset=self.request.organizer.events.prefetch_related('_settings_objects'))
+        ).order_by('-datetime')
         return qs
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        ctx['customer'] = self.request.customer
-        ctx['memberships'] = self.request.customer.memberships.with_usages().select_related(
-            'membership_type', 'granted_in', 'granted_in__order', 'granted_in__order__event'
-        )
-        ctx['invoice_addresses'] = InvoiceAddress.profiles.filter(customer=self.request.customer)
-        ctx['is_paginated'] = True
-
-        for m in ctx['memberships']:
-            if m.membership_type.max_usages:
-                m.percent = int(m.usages / m.membership_type.max_usages * 100)
-            else:
-                m.percent = 0
 
         s = OrderPosition.objects.filter(
             order=OuterRef('pk')
@@ -365,11 +432,22 @@ class ProfileView(CustomerRequiredMixin, ListView):
         for o in ctx['orders']:
             if o.pk not in annotated:
                 continue
-            o.count_positions = annotated.get(o.pk)['pcnt']
+            o.pcnt = annotated.get(o.pk)['pcnt']
         return ctx
 
 
-class MembershipUsageView(CustomerRequiredMixin, ListView):
+class MembershipView(CustomerAccountBaseMixin, ListView):
+    template_name = 'pretixpresale/organizers/customer_memberships.html'
+    context_object_name = 'memberships'
+    paginate_by = 20
+
+    def get_queryset(self):
+        return self.request.customer.memberships.with_usages().select_related(
+            'membership_type', 'granted_in', 'granted_in__order', 'granted_in__order__event'
+        )
+
+
+class MembershipUsageView(CustomerAccountBaseMixin, ListView):
     template_name = 'pretixpresale/organizers/customer_membership.html'
     context_object_name = 'usages'
     paginate_by = 20
@@ -393,7 +471,25 @@ class MembershipUsageView(CustomerRequiredMixin, ListView):
         return ctx
 
 
-class AddressDeleteView(CustomerRequiredMixin, DeleteView):
+class GiftcardView(CustomerAccountBaseMixin, ListView):
+    template_name = 'pretixpresale/organizers/customer_giftcards.html'
+    context_object_name = 'gift_cards'
+    paginate_by = 20
+
+    def get_queryset(self):
+        return self.request.customer.customer_gift_cards.all()
+
+
+class AddressView(CustomerAccountBaseMixin, ListView):
+    template_name = 'pretixpresale/organizers/customer_addresses.html'
+    context_object_name = 'invoice_addresses'
+    paginate_by = 20
+
+    def get_queryset(self):
+        return InvoiceAddress.profiles.filter(customer=self.request.customer)
+
+
+class AddressDeleteView(CustomerAccountBaseMixin, CompatDeleteView):
     template_name = 'pretixpresale/organizers/customer_address_delete.html'
     context_object_name = 'address'
 
@@ -401,10 +497,19 @@ class AddressDeleteView(CustomerRequiredMixin, DeleteView):
         return get_object_or_404(InvoiceAddress.profiles, customer=self.request.customer, pk=self.kwargs.get('id'))
 
     def get_success_url(self):
-        return eventreverse(self.request.organizer, 'presale:organizer.customer.profile', kwargs={})
+        return eventreverse(self.request.organizer, 'presale:organizer.customer.addresses', kwargs={})
 
 
-class ProfileDeleteView(CustomerRequiredMixin, DeleteView):
+class ProfileView(CustomerAccountBaseMixin, ListView):
+    template_name = 'pretixpresale/organizers/customer_profiles.html'
+    context_object_name = 'attendee_profiles'
+    paginate_by = 20
+
+    def get_queryset(self):
+        return self.request.customer.attendee_profiles.all()
+
+
+class ProfileDeleteView(CustomerAccountBaseMixin, CompatDeleteView):
     template_name = 'pretixpresale/organizers/customer_profile_delete.html'
     context_object_name = 'profile'
 
@@ -412,10 +517,10 @@ class ProfileDeleteView(CustomerRequiredMixin, DeleteView):
         return get_object_or_404(self.request.customer.attendee_profiles, pk=self.kwargs.get('id'))
 
     def get_success_url(self):
-        return eventreverse(self.request.organizer, 'presale:organizer.customer.profile', kwargs={})
+        return eventreverse(self.request.organizer, 'presale:organizer.customer.profiles', kwargs={})
 
 
-class ChangePasswordView(CustomerRequiredMixin, FormView):
+class ChangePasswordView(CustomerAccountBaseMixin, FormView):
     template_name = 'pretixpresale/organizers/customer_password.html'
     form_class = ChangePasswordForm
 
@@ -425,10 +530,12 @@ class ChangePasswordView(CustomerRequiredMixin, FormView):
     def dispatch(self, request, *args, **kwargs):
         if not request.organizer.settings.customer_accounts:
             raise Http404('Feature not enabled')
+        if self.request.customer and self.request.customer.provider_id:
+            raise Http404('Feature not enabled')
         return super().dispatch(request, *args, **kwargs)
 
     def get_success_url(self):
-        return eventreverse(self.request.organizer, 'presale:organizer.customer.profile', kwargs={})
+        return eventreverse(self.request.organizer, 'presale:organizer.customer.index', kwargs={})
 
     @transaction.atomic()
     def form_valid(self, form):
@@ -437,6 +544,7 @@ class ChangePasswordView(CustomerRequiredMixin, FormView):
         customer.set_password(form.cleaned_data['password'])
         customer.save()
         messages.success(self.request, _('Your changes have been saved.'))
+        customer.send_security_notice(_("Your password has been changed."))
         update_customer_session_auth_hash(self.request, customer)
         return HttpResponseRedirect(self.get_success_url())
 
@@ -446,7 +554,7 @@ class ChangePasswordView(CustomerRequiredMixin, FormView):
         return kwargs
 
 
-class ChangeInformationView(CustomerRequiredMixin, FormView):
+class ChangeInformationView(CustomerAccountBaseMixin, FormView):
     template_name = 'pretixpresale/organizers/customer_info.html'
     form_class = ChangeInfoForm
 
@@ -461,14 +569,14 @@ class ChangeInformationView(CustomerRequiredMixin, FormView):
         return super().dispatch(request, *args, **kwargs)
 
     def get_success_url(self):
-        return eventreverse(self.request.organizer, 'presale:organizer.customer.profile', kwargs={})
+        return eventreverse(self.request.organizer, 'presale:organizer.customer.index', kwargs={})
 
     def form_valid(self, form):
-        if form.cleaned_data['email'] != self.initial_email:
+        if form.cleaned_data['email'] != self.initial_email and not self.request.customer.provider:
             new_email = form.cleaned_data['email']
             form.cleaned_data['email'] = form.instance.email = self.initial_email
             ctx = form.instance.get_email_context()
-            ctx['url'] = build_absolute_uri(
+            ctx['url'] = eventreverse_absolute(
                 self.request.organizer,
                 'presale:organizer.customer.change.confirm'
             ) + '?token=' + dumps({
@@ -477,7 +585,7 @@ class ChangeInformationView(CustomerRequiredMixin, FormView):
             }, salt='pretix.presale.views.customer.ChangeInformationView')
             mail(
                 new_email,
-                _('Confirm email address for your account at {organizer}').format(organizer=self.request.organizer.name),
+                self.request.organizer.settings.mail_subject_customer_email_change,
                 self.request.organizer.settings.mail_text_customer_email_change,
                 ctx,
                 locale=form.instance.locale,
@@ -520,24 +628,333 @@ class ConfirmChangeView(View):
             return HttpResponseRedirect(self.get_success_url())
 
         try:
-            customer = request.organizer.customers.get(pk=data.get('customer'))
+            customer = request.organizer.customers.get(pk=data.get('customer'), provider__isnull=True)
         except Customer.DoesNotExist:
             messages.error(request, _('You clicked an invalid link.'))
             return HttpResponseRedirect(self.get_success_url())
 
-        with transaction.atomic():
-            customer.email = data['email']
-            customer.save()
-            customer.log_action('pretix.customer.changed', {
-                'email': data['email']
-            })
+        try:
+            with transaction.atomic():
+                old_email = customer.email
+                customer.email = data['email']
+                customer.save()
+                customer.log_action('pretix.customer.changed', {
+                    'email': data['email']
+                })
+                msg = _('Your email address has been changed from {old_email} to {email}.').format(old_email=old_email, email=customer.email)
+                customer.send_security_notice(msg, email=old_email)
+                customer.send_security_notice(msg, email=customer.email)
+        except IntegrityError:
+            messages.success(request, _('Your email address has not been updated since the address is already in use '
+                                        'for another customer account.'))
+        else:
+            messages.success(request, _('Your email address has been updated.'))
 
-        messages.success(request, _('Your email address has been updated.'))
-
-        if customer == request.customer:
-            update_customer_session_auth_hash(self.request, customer)
+            if customer == request.customer:
+                update_customer_session_auth_hash(self.request, customer)
 
         return HttpResponseRedirect(self.get_success_url())
 
     def get_success_url(self):
-        return eventreverse(self.request.organizer, 'presale:organizer.customer.profile', kwargs={})
+        return eventreverse(self.request.organizer, 'presale:organizer.customer.index', kwargs={})
+
+
+class SSOLoginView(RedirectBackMixin, View):
+    """
+    Start logging in with a SSO provider.
+    """
+    form_class = AuthenticationForm
+    redirect_authenticated_user = True
+
+    @method_decorator(sensitive_post_parameters())
+    @method_decorator(csrf_protect)
+    @method_decorator(never_cache)
+    def dispatch(self, request, *args, **kwargs):
+        if not request.organizer.settings.customer_accounts:
+            raise Http404('Feature not enabled')
+        if self.redirect_authenticated_user and self.request.customer:
+            redirect_to = self.get_success_url()
+            if redirect_to == self.request.path:
+                raise ValueError(
+                    "Redirection loop for authenticated user detected. Check that "
+                    "your LOGIN_REDIRECT_URL doesn't point to a login page."
+                )
+            return HttpResponseRedirect(redirect_to)
+        return super().dispatch(request, *args, **kwargs)
+
+    @cached_property
+    def provider(self):
+        return get_object_or_404(self.request.organizer.sso_providers.filter(is_active=True), pk=self.kwargs['provider'])
+
+    def get(self, request, *args, **kwargs):
+        next_url = request.GET.get('next') or ''
+        popup_origin = request.GET.get('popup_origin', '')
+        if popup_origin:
+            popup_origin_parsed = urlparse(popup_origin)
+            untrusted = (
+                popup_origin_parsed.hostname != urlparse(settings.SITE_URL).hostname and
+                not KnownDomain.objects.filter(domainname=popup_origin_parsed.hostname, organizer=self.request.organizer.pk).exists()
+            )
+            if untrusted:
+                # Do not accept faked origins
+                popup_origin = None
+
+        nonce = get_random_string(32)
+        pkce_code_verifier = get_random_string(64)
+        request.session[f'pretix_customerauth_{self.provider.pk}_pkce_code_verifier'] = pkce_code_verifier
+        request.session[f'pretix_customerauth_{self.provider.pk}_nonce'] = nonce
+        request.session[f'pretix_customerauth_{self.provider.pk}_popup_origin'] = popup_origin
+        request.session[f'pretix_customerauth_{self.provider.pk}_cross_domain_requested'] = self.request.GET.get("request_cross_domain_customer_auth") == "true"
+        redirect_uri = eventreverse_absolute(self.request.organizer, 'presale:organizer.customer.login.return', kwargs={
+            'provider': self.provider.pk
+        })
+
+        if self.provider.method == "oidc":
+            return redirect_to_url(oidc_authorize_url(self.provider, f'{nonce}%{next_url}', redirect_uri, pkce_code_verifier))
+        else:
+            raise Http404("Unknown SSO method.")
+
+    def get_success_url(self):
+        url = self.get_redirect_url()
+
+        if not url:
+            return eventreverse(self.request.organizer, 'presale:organizer.customer.index', kwargs={})
+        return url
+
+
+class SSOLoginReturnView(RedirectBackMixin, View):
+    """
+    Start logging in with a SSO provider.
+    """
+    form_class = AuthenticationForm
+    redirect_authenticated_user = True
+
+    @method_decorator(sensitive_post_parameters())
+    @method_decorator(csrf_protect)
+    @method_decorator(never_cache)
+    def dispatch(self, request, *args, **kwargs):
+        if not request.organizer.settings.customer_accounts:
+            raise Http404('Feature not enabled')
+        if self.redirect_authenticated_user and self.request.customer:
+            redirect_to = self.get_success_url()
+            if redirect_to == self.request.path:
+                raise ValueError(
+                    "Redirection loop for authenticated user detected. Check that "
+                    "your LOGIN_REDIRECT_URL doesn't point to a login page."
+                )
+            return HttpResponseRedirect(redirect_to)
+        r = super().dispatch(request, *args, **kwargs)
+        request.session.pop(f'pretix_customerauth_{self.provider.pk}_pkce_code_verifier', None)
+        request.session.pop(f'pretix_customerauth_{self.provider.pk}_nonce', None)
+        request.session.pop(f'pretix_customerauth_{self.provider.pk}_popup_origin', None)
+        request.session.pop(f'pretix_customerauth_{self.provider.pk}_cross_domain_requested', None)
+        return r
+
+    @cached_property
+    def provider(self):
+        return get_object_or_404(self.request.organizer.sso_providers.filter(is_active=True), pk=self.kwargs['provider'])
+
+    def get(self, request, *args, **kwargs):
+        redirect_to = None
+        popup_origin = None
+
+        if request.session.get(f'pretix_customerauth_{self.provider.pk}_popup_origin'):
+            popup_origin = request.session[f'pretix_customerauth_{self.provider.pk}_popup_origin']
+
+        if self.provider.method == "oidc":
+            if not request.GET.get('state'):
+                return self._fail(
+                    _('Login was not successful. Error message: "{error}".').format(
+                        error='state parameter missing',
+                    ),
+                    popup_origin,
+                )
+
+            nonce, redirect_to = re.split("[%#§]", request.GET['state'], maxsplit=1)  # Allow § and # for backwards-compatibility for a while
+
+            if nonce != request.session.get(f'pretix_customerauth_{self.provider.pk}_nonce'):
+                return self._fail(
+                    _('Login was not successful. Error message: "{error}".').format(
+                        error='invalid one-time token',
+                    ),
+                    popup_origin,
+                )
+            redirect_uri = eventreverse_absolute(
+                self.request.organizer, 'presale:organizer.customer.login.return',
+                kwargs={
+                    'provider': self.provider.pk
+                }
+            )
+            try:
+                profile = oidc_validate_authorization(
+                    self.provider,
+                    request.GET.get('code'),
+                    redirect_uri,
+                    request.session.get(f'pretix_customerauth_{self.provider.pk}_pkce_code_verifier'),
+                )
+            except ValidationError as e:
+                for msg in e:
+                    return self._fail(msg, popup_origin)
+        else:
+            raise Http404("Unknown SSO method.")
+
+        identifier = hashlib.sha256(
+            str(profile['uid']).encode() + b'@' + str(self.provider.pk).encode()
+        ).hexdigest().upper()[:settings.ENTROPY['customer_identifier']]
+        if "1" not in identifier and "0" not in identifier:
+            # This is a hack to make sure the hash space does not overlap with the random identifiers generated by
+            # Customer.assign_identifier()
+            identifier = identifier[:4] + "1" + identifier[4:-1]
+
+        try:
+            customer = self.request.organizer.customers.get(
+                provider=self.provider,
+                identifier=identifier,
+            )
+        except Customer.MultipleObjectsReturned:
+            return self._fail(
+                _('Login was not successful. Error message: "{error}".').format(
+                    error='identifier not unique',
+                ),
+                popup_origin,
+            )
+        except Customer.DoesNotExist:
+            name_scheme = self.request.organizer.settings.name_scheme
+            name_parts = {
+                '_scheme': name_scheme,
+            }
+            scheme = PERSON_NAME_SCHEMES.get(name_scheme)
+            for fname, label, size in scheme['fields']:
+                if fname in profile:
+                    name_parts[fname] = profile[fname] or ''
+            if len(name_parts) == 1 and profile.get('name'):
+                name_parts = {'_legacy': profile['name']}
+            customer = Customer(
+                organizer=self.request.organizer,
+                identifier=identifier,
+                external_identifier=str(profile['uid']),
+                provider=self.provider,
+                email=profile['email'],
+                phone=profile.get('phone') or None,
+                name_parts=name_parts,
+                is_active=True,
+                is_verified=True,  # todo: always?
+                locale=request.LANGUAGE_CODE,
+            )
+            try:
+                customer.save(force_insert=True)
+                customer_created.send(customer.organizer, customer=customer)
+                customer.log_action('pretix.customer.created', user=self.request.user, data=dict(
+                    identifier=identifier,
+                    external_identifier=str(profile['uid']),
+                    provider=self.provider.pk,
+                    email=profile['email'],
+                    phone=profile.get('phone') or None,
+                    name_parts=name_parts,
+                    is_active=True,
+                    is_verified=True,
+                    locale=request.LANGUAGE_CODE,
+                ))
+            except IntegrityError:
+                # This might either be a race condition or the email address is taken
+                # by a different customer account
+                try:
+                    customer = self.request.organizer.customers.get(
+                        provider=self.provider,
+                        identifier=identifier,
+                    )
+                except Customer.DoesNotExist:
+                    return self._fail(
+                        _('We were unable to use your login since the email address {email} is already used for a '
+                          'different account in this system.').format(email=profile['email']),
+                        popup_origin,
+                    )
+        else:
+            if customer.is_active and customer.email != profile['email']:
+                customer.email = profile['email']
+                try:
+                    customer.save(update_fields=['email'])
+                except IntegrityError:
+                    return self._fail(
+                        _('We were unable to use your login since the email address {email} is already used for a '
+                          'different account in this system.').format(email=profile['email']),
+                        popup_origin,
+                    )
+                customer.log_action('pretix.customer.changed', {
+                    'email': profile['email'],
+                    '_source': 'provider'
+                })
+
+        if customer.external_identifier != str(profile['uid']):
+            return self._fail(
+                _('Login was not successful. Error message: "{error}".').format(
+                    error='identifier not unique',
+                ),
+                popup_origin,
+            )
+
+        if not customer.is_active:
+            self._fail(
+                AuthenticationForm.error_messages['inactive'],
+                popup_origin,
+            )
+
+        if not customer.is_verified:
+            return self._fail(
+                AuthenticationForm.error_messages['unverified'],
+                popup_origin
+            )
+
+        customer_signed_in.send(customer.organizer, customer=customer)
+
+        if popup_origin:
+            return render(self.request, 'pretixpresale/postmessage.html', {
+                'message': {
+                    '__process': 'customer_sso_popup',
+                    'status': 'ok',
+                    'value': dumps({
+                        'customer': customer.pk,
+                    }, salt=f'customer_sso_popup_{self.request.organizer.pk}')
+                },
+                'origin': popup_origin,
+            })
+        else:
+            customer_login(self.request, customer)
+            return redirect_to_url(self.get_success_url(redirect_to))
+
+    def _fail(self, message, popup_origin):
+        if not popup_origin:
+            messages.error(
+                self.request,
+                message,
+            )
+            return redirect_to_url(eventreverse(self.request.organizer, 'presale:organizer.customer.login', kwargs={}))
+        else:
+            return render(self.request, 'pretixpresale/postmessage.html', {
+                'message': {
+                    '__process': 'customer_sso_popup',
+                    'status': 'error',
+                    'value': str(message)
+                },
+                'origin': popup_origin,
+            })
+
+    def get_success_url(self, redirect_to=None):
+        url = self.get_redirect_url(redirect_to)
+
+        if not url:
+            return eventreverse(self.request.organizer, 'presale:organizer.customer.index', kwargs={})
+        else:
+            if self.request.session.get(f'pretix_customerauth_{self.provider.pk}_cross_domain_requested'):
+                otpstore = SessionStore()
+                otpstore[f'customer_cross_domain_auth_{self.request.organizer.pk}'] = self.request.session.session_key
+                otpstore.set_expiry(60)
+                otpstore.save(must_create=True)
+                otp = otpstore.session_key
+
+                u = urlparse(url)
+                qsl = parse_qs(u.query)
+                qsl['cross_domain_customer_auth'] = otp
+                url = urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(qsl, doseq=True), u.fragment))
+
+        return url

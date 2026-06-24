@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -30,6 +30,7 @@ if os.path.exists('test/sqlite.cfg'):
 
 from pretix.settings import *  # NOQA
 
+LANGUAGE_CODE = 'en'
 DATA_DIR = tmpdir.name
 LOG_DIR = os.path.join(DATA_DIR, 'logs')
 MEDIA_ROOT = os.path.join(DATA_DIR, 'media')
@@ -41,7 +42,7 @@ EMAIL_BACKEND = EMAIL_CUSTOM_SMTP_BACKEND = 'django.core.mail.backends.locmem.Em
 
 COMPRESS_ENABLED = COMPRESS_OFFLINE = False
 COMPRESS_CACHE_BACKEND = 'testcache'
-STATICFILES_STORAGE = 'django.contrib.staticfiles.storage.StaticFilesStorage'
+STORAGES["staticfiles"]["BACKEND"] = 'django.contrib.staticfiles.storage.StaticFilesStorage'
 PRETIX_INSTANCE_NAME = 'pretix.eu'
 
 COMPRESS_PRECOMPILERS_ORIGINAL = COMPRESS_PRECOMPILERS
@@ -69,16 +70,22 @@ CELERY_TASK_ALWAYS_EAGER = True
 # Don't use redis
 SESSION_ENGINE = "django.contrib.sessions.backends.db"
 HAS_REDIS = False
+ORIGINAL_CACHES = CACHES
 CACHES = {
     'default': {
         'BACKEND': 'django.core.cache.backends.dummy.DummyCache',
     }
 }
+
+# Set databases
 DATABASE_REPLICA = 'default'
+DATABASES['default']['CONN_MAX_AGE'] = 0
+DATABASES.pop('replica', None)
+
+MIDDLEWARE.insert(0, 'pretix.testutils.middleware.DebugFlagMiddleware')
+
 
 # Don't run migrations
-
-
 class DisableMigrations(object):
 
     def __contains__(self, item):
@@ -87,6 +94,9 @@ class DisableMigrations(object):
     def __getitem__(self, item):
         return None
 
+    def setdefault(self, key, default=None):
+        return
 
-if not os.environ.get("TRAVIS", "") and not os.environ.get("GITHUB_WORKFLOW", ""):
+
+if not os.environ.get("GITHUB_WORKFLOW", ""):
     MIGRATION_MODULES = DisableMigrations()

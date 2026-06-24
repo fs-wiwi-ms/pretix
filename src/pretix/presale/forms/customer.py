@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -19,6 +19,7 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
+import functools
 import hashlib
 import ipaddress
 import random
@@ -27,11 +28,12 @@ from django import forms
 from django.conf import settings
 from django.contrib.auth.hashers import check_password
 from django.contrib.auth.password_validation import (
-    password_validators_help_texts, validate_password,
+    MinimumLengthValidator, get_password_validators, validate_password,
 )
 from django.contrib.auth.tokens import PasswordResetTokenGenerator
 from django.core import signing
 from django.utils.functional import cached_property
+from django.utils.html import escape
 from django.utils.translation import gettext_lazy as _
 from phonenumber_field.formfields import PhoneNumberField
 
@@ -41,9 +43,8 @@ from pretix.base.forms.questions import (
 )
 from pretix.base.i18n import get_language_without_region
 from pretix.base.models import Customer
-from pretix.base.services.mail import mail
 from pretix.helpers.http import get_client_ip
-from pretix.multidomain.urlreverse import build_absolute_uri
+from pretix.multidomain.urlreverse import eventreverse_absolute
 
 
 class TokenGenerator(PasswordResetTokenGenerator):
@@ -53,8 +54,8 @@ class TokenGenerator(PasswordResetTokenGenerator):
 class AuthenticationForm(forms.Form):
     required_css_class = 'required'
     email = forms.EmailField(
-        label=_("E-mail"),
-        widget=forms.EmailInput(attrs={'autofocus': True})
+        label=_("Email"),
+        widget=forms.EmailInput(attrs={'autocomplete': 'email'})
     )
     password = forms.CharField(
         label=_("Password"),
@@ -65,19 +66,29 @@ class AuthenticationForm(forms.Form):
 
     error_messages = {
         'incomplete': _('You need to fill out all fields.'),
+        'empty_email': _('You need to enter an email address.'),
+        'empty_password': _('You need to enter a password.'),
         'invalid_login': _(
             "We have not found an account with this email address and password."
         ),
+        'invalid_login_email': _('Please verify that you entered the correct email address.'),
+        'invalid_login_password': _('Please enter the correct password.'),
         'inactive': _("This account is disabled."),
         'unverified': _("You have not yet activated your account and set a password. Please click the link in the "
-                        "email we sent you. Click \"Reset password\" to receive a new email in case you cannot find "
-                        "it again."),
+                        "email we sent you. In case you cannot find it, click \"Forgot your password?\" to receive "
+                        "a new email."),
     }
 
     def __init__(self, request=None, *args, **kwargs):
         self.request = request
         self.customer_cache = None
         super().__init__(*args, **kwargs)
+        self.fields['password'].help_text = "<a target='_blank' href='{}'>{}</a>".format(
+            eventreverse_absolute(False, 'presale:organizer.customer.resetpw', kwargs={
+                'organizer': request.organizer.slug,
+            }),
+            _('Forgot your password?')
+        )
 
     def clean(self):
         email = self.cleaned_data.get('email')
@@ -85,7 +96,7 @@ class AuthenticationForm(forms.Form):
 
         if email is not None and password:
             try:
-                u = self.request.organizer.customers.get(email=email.lower())
+                u = self.request.organizer.customers.get(email=email.lower(), provider__isnull=True)
             except Customer.DoesNotExist:
                 # Run the default password hasher once to reduce the timing
                 # difference between an existing and a nonexistent user (django #20760).
@@ -94,6 +105,8 @@ class AuthenticationForm(forms.Form):
                 if u.check_password(password):
                     self.customer_cache = u
             if self.customer_cache is None:
+                self.add_error("email", self.error_messages['invalid_login_email'])
+                self.add_error("password", self.error_messages['invalid_login_password'])
                 raise forms.ValidationError(
                     self.error_messages['invalid_login'],
                     code='invalid_login',
@@ -101,6 +114,10 @@ class AuthenticationForm(forms.Form):
             else:
                 self.confirm_login_allowed(self.customer_cache)
         else:
+            if not email:
+                self.add_error("email", self.error_messages['empty_email'])
+            if not password:
+                self.add_error("password", self.error_messages['empty_password'])
             raise forms.ValidationError(
                 self.error_messages['incomplete'],
                 code='incomplete'
@@ -110,15 +127,9 @@ class AuthenticationForm(forms.Form):
 
     def confirm_login_allowed(self, user):
         if not user.is_active:
-            raise forms.ValidationError(
-                self.error_messages['inactive'],
-                code='inactive',
-            )
-        if not user.is_verified:
-            raise forms.ValidationError(
-                self.error_messages['unverified'],
-                code='unverified',
-            )
+            self.add_error("email", self.error_messages['inactive'])
+        elif not user.is_verified:
+            self.add_error("password", self.error_messages['unverified'])
 
     def get_customer(self):
         return self.customer_cache
@@ -128,7 +139,8 @@ class RegistrationForm(forms.Form):
     required_css_class = 'required'
     name_parts = forms.CharField()
     email = forms.EmailField(
-        label=_("E-mail"),
+        label=_("Email"),
+        widget=forms.EmailInput(attrs={'autocomplete': 'email'})
     )
 
     error_messages = {
@@ -160,7 +172,7 @@ class RegistrationForm(forms.Form):
             )
 
         self.fields['name_parts'] = NamePartsFormField(
-            max_length=255,
+            max_length=70,
             required=True,
             scheme=request.organizer.settings.name_scheme,
             titles=request.organizer.settings.name_scheme_titles,
@@ -268,20 +280,13 @@ class RegistrationForm(forms.Form):
         customer.set_unusable_password()
         customer.save()
         customer.log_action('pretix.customer.created', {})
-        ctx = customer.get_email_context()
-        token = TokenGenerator().make_token(customer)
-        ctx['url'] = build_absolute_uri(self.request.organizer,
-                                        'presale:organizer.customer.activate') + '?id=' + customer.identifier + '&token=' + token
-        mail(
-            customer.email,
-            _('Activate your account at {organizer}').format(organizer=self.request.organizer.name),
-            self.request.organizer.settings.mail_text_customer_registration,
-            ctx,
-            locale=customer.locale,
-            customer=customer,
-            organizer=self.request.organizer,
-        )
+        customer.send_activation_mail()
         return customer
+
+
+@functools.lru_cache(maxsize=None)
+def get_customer_password_validators():
+    return get_password_validators(settings.CUSTOMER_AUTH_PASSWORD_VALIDATORS)
 
 
 class SetPasswordForm(forms.Form):
@@ -290,18 +295,18 @@ class SetPasswordForm(forms.Form):
         'pw_mismatch': _("Please enter the same password twice"),
     }
     email = forms.EmailField(
-        label=_('E-mail'),
-        disabled=True
+        label=_('Email'),
+        widget=forms.EmailInput(attrs={'autocomplete': 'username', 'readonly': 'readonly'}),
+        required=False,
     )
     password = forms.CharField(
         label=_('Password'),
-        widget=forms.PasswordInput(attrs={'minlength': '8', 'autocomplete': 'new-password'}),
+        widget=forms.PasswordInput(attrs={'autocomplete': 'new-password'}),
         max_length=4096,
-        required=True
     )
     password_repeat = forms.CharField(
         label=_('Repeat password'),
-        widget=forms.PasswordInput(attrs={'minlength': '8', 'autocomplete': 'new-password'}),
+        widget=forms.PasswordInput(attrs={'autocomplete': 'new-password'}),
         max_length=4096,
     )
 
@@ -310,6 +315,14 @@ class SetPasswordForm(forms.Form):
         kwargs.setdefault('initial', {})
         kwargs['initial']['email'] = self.customer.email
         super().__init__(*args, **kwargs)
+
+        pw_min_len_validators = [v for v in get_customer_password_validators() if isinstance(v, MinimumLengthValidator)]
+        if pw_min_len_validators:
+            self.fields['password'].widget.attrs['minlength'] = max(v.min_length for v in pw_min_len_validators)
+            self.fields['password_repeat'].widget.attrs['minlength'] = max(v.min_length for v in pw_min_len_validators)
+
+        if 'password' not in self.data:
+            self.fields['password'].help_text = ' '.join(v.get_help_text() for v in pw_min_len_validators)
 
     def clean(self):
         password1 = self.cleaned_data.get('password', '')
@@ -324,8 +337,7 @@ class SetPasswordForm(forms.Form):
 
     def clean_password(self):
         password1 = self.cleaned_data.get('password', '')
-        if validate_password(password1, user=self.customer) is not None:
-            raise forms.ValidationError(_(password_validators_help_texts()), code='pw_invalid')
+        validate_password(password1, user=self.customer, password_validators=get_customer_password_validators())
         return password1
 
 
@@ -336,7 +348,8 @@ class ResetPasswordForm(forms.Form):
         'unknown': _("A user with this email address is not known in our system."),
     }
     email = forms.EmailField(
-        label=_('E-mail'),
+        label=_('Email'),
+        widget=forms.EmailInput(attrs={'autocomplete': 'email'}),
     )
 
     def __init__(self, request=None, *args, **kwargs):
@@ -347,7 +360,7 @@ class ResetPasswordForm(forms.Form):
         if 'email' not in self.cleaned_data:
             return
         try:
-            self.customer = self.request.organizer.customers.get(email=self.cleaned_data['email'].lower())
+            self.customer = self.request.organizer.customers.get(email=self.cleaned_data['email'].lower(), provider__isnull=True)
             return self.customer.email
         except Customer.DoesNotExist:
             # Yup, this is an information leak. But it prevents dozens of support requests – and even if we didn't
@@ -379,23 +392,23 @@ class ChangePasswordForm(forms.Form):
         'rate_limit': _("For security reasons, please wait 5 minutes before you try again."),
     }
     email = forms.EmailField(
-        label=_('E-mail'),
+        label=_('Email'),
         disabled=True
     )
     password_current = forms.CharField(
         label=_('Your current password'),
-        widget=forms.PasswordInput,
+        widget=forms.PasswordInput(attrs={'autocomplete': 'current-password'}),
         required=True
     )
     password = forms.CharField(
         label=_('New password'),
-        widget=forms.PasswordInput,
+        widget=forms.PasswordInput(attrs={'autocomplete': 'new-password'}),
         max_length=4096,
         required=True
     )
     password_repeat = forms.CharField(
         label=_('Repeat password'),
-        widget=forms.PasswordInput(attrs={'minlength': '8', 'autocomplete': 'new-password'}),
+        widget=forms.PasswordInput(attrs={'autocomplete': 'new-password'}),
         max_length=4096,
     )
 
@@ -404,6 +417,14 @@ class ChangePasswordForm(forms.Form):
         kwargs.setdefault('initial', {})
         kwargs['initial']['email'] = self.customer.email
         super().__init__(*args, **kwargs)
+
+        pw_min_len_validators = [v for v in get_customer_password_validators() if isinstance(v, MinimumLengthValidator)]
+        if pw_min_len_validators:
+            self.fields['password'].widget.attrs['minlength'] = max(v.min_length for v in pw_min_len_validators)
+            self.fields['password_repeat'].widget.attrs['minlength'] = max(v.min_length for v in pw_min_len_validators)
+
+        if 'password' not in self.data:
+            self.fields['password'].help_text = ' '.join(v.get_help_text() for v in pw_min_len_validators)
 
     def clean(self):
         password1 = self.cleaned_data.get('password', '')
@@ -418,8 +439,7 @@ class ChangePasswordForm(forms.Form):
 
     def clean_password(self):
         password1 = self.cleaned_data.get('password', '')
-        if validate_password(password1, user=self.customer) is not None:
-            raise forms.ValidationError(_(password_validators_help_texts()), code='pw_invalid')
+        validate_password(password1, user=self.customer, password_validators=get_customer_password_validators())
         return password1
 
     def clean_password_current(self):
@@ -453,7 +473,7 @@ class ChangeInfoForm(forms.ModelForm):
     }
     password_current = forms.CharField(
         label=_('Your current password'),
-        widget=forms.PasswordInput,
+        widget=forms.PasswordInput(attrs={'autocomplete': 'current-password'}),
         help_text=_('Only required if you change your email address'),
         max_length=4096,
         required=False
@@ -466,6 +486,8 @@ class ChangeInfoForm(forms.ModelForm):
     def __init__(self, request=None, *args, **kwargs):
         self.request = request
         super().__init__(*args, **kwargs)
+
+        self.fields['email'].widget.attrs['autocomplete'] = 'email'
 
         self.fields['name_parts'] = NamePartsFormField(
             max_length=255,
@@ -486,6 +508,14 @@ class ChangeInfoForm(forms.ModelForm):
             required=False,
             widget=WrappedPhoneNumberPrefixWidget()
         )
+
+        if self.instance.provider_id is not None:
+            self.fields['email'].disabled = True
+            self.fields['email'].help_text = _(
+                'To change your email address, change it in your {provider} account and then log out and log in '
+                'again.'
+            ).format(provider=escape(self.instance.provider.name))
+            del self.fields['password_current']
 
     def clean_password_current(self):
         old_pw = self.cleaned_data.get('password_current')
@@ -515,13 +545,13 @@ class ChangeInfoForm(forms.ModelForm):
         email = self.cleaned_data.get('email')
         password_current = self.cleaned_data.get('password_current')
 
-        if email != self.instance.email and not password_current:
+        if email != self.instance.email and not password_current and self.instance.provider_id is None:
             raise forms.ValidationError(
                 self.error_messages['pw_current_wrong'],
                 code='pw_current_wrong',
             )
 
-        if email is not None:
+        if email is not None and self.instance.provider_id is not None:
             try:
                 self.request.organizer.customers.exclude(pk=self.instance.pk).get(email=email.lower())
             except Customer.DoesNotExist:

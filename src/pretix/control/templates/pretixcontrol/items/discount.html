@@ -15,7 +15,8 @@
                     {% bootstrap_field form.internal_name layout="control" %}
                     {% bootstrap_field form.available_from layout="control" %}
                     {% bootstrap_field form.available_until layout="control" %}
-                    {% bootstrap_field form.sales_channels layout="control" %}
+                    {% bootstrap_field form.all_sales_channels layout="control" %}
+                    {% bootstrap_field form.limit_sales_channels layout="control" %}
                 </fieldset>
                 <fieldset>
                     <legend>{% trans "Condition" context "discount" %}</legend>
@@ -25,6 +26,8 @@
                     {% bootstrap_field form.condition_ignore_voucher_discounted layout="control" %}
                     {% if form.subevent_mode %}
                         {% bootstrap_field form.subevent_mode layout="control" %}
+                        {% bootstrap_field form.subevent_date_from layout="control" %}
+                        {% bootstrap_field form.subevent_date_until layout="control" %}
                     {% endif %}
                     <div class="form-group form-alternatives">
                         <label class="col-md-3 control-label">
@@ -48,6 +51,12 @@
                 </fieldset>
                 <fieldset>
                     <legend>{% trans "Benefit" context "discount" %}</legend>
+                    {% bootstrap_field form.benefit_same_products layout="control" %}
+                    <div data-display-dependency="#id_benefit_same_products" data-inverse>
+                        {% bootstrap_field form.benefit_limit_products layout="control" %}
+                        {% bootstrap_field form.benefit_apply_to_addons layout="control" %}
+                        {% bootstrap_field form.benefit_ignore_voucher_discounted layout="control" %}
+                    </div>
                     {% bootstrap_field form.benefit_discount_matching_percent layout="control" addon_after="%" %}
                     {% bootstrap_field form.benefit_only_apply_to_cheapest_n_matches layout="control" %}
                 </fieldset>
